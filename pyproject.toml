@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "imresearchutils"
+version = "0.1.0"
+description = "Internet Measurement Research Utilities"
+authors = ["Sulyab Thottungal Valapu <sulyabtv@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+dnspython = "^2.7.0"
+pyasn = "^1.6.2"
+requests = "^2.32.3"
+pandas = "^2.2.3"
+pyarrow = "^19.0.1"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
