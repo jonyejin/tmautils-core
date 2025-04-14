@@ -1,19 +1,40 @@
 from pathlib import Path
+import importlib
 from datetime import datetime
 import logging
+
+
+def import_module_attr(module_path: str, attr_name: str):
+    try:
+        module = importlib.import_module(module_path)
+        attr = getattr(module, attr_name)
+    except ModuleNotFoundError as e:
+        raise ImportError(
+            f"Module '{module_path}' not found."
+        ) from e
+    except AttributeError as e:
+        raise ImportError(
+            f"Attribute '{attr_name}' not found in module '{module_path}'"
+        ) from e
+    return attr
 
 
 class IOHelper:
     def __init__(self,
                  module_name: str,
+                 instance_name: str | None = None,
                  data_dir: Path | None = None,
                  setup_logging: bool = True,
                  **kwargs):
+        # Directory structure: data_dir/module_name/[instance_name/]
         self.module_name = module_name
+        self.instance_name = instance_name
 
         if data_dir is None:
             data_dir = Path.cwd()
         self.module_dir = data_dir / module_name
+        if instance_name is not None:
+            self.module_dir = self.module_dir / instance_name
         self.module_dir.mkdir(parents=True, exist_ok=True)
 
         if setup_logging:

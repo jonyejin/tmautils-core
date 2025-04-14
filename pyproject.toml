@@ -12,6 +12,9 @@ pyasn = "^1.6.2"
 requests = "^2.32.3"
 pandas = "^2.2.3"
 pyarrow = "^19.0.1"
+tranco = "^0.8.1"
+dataclasses-json = "^0.6.7"
+tldextract = "^5.2.0"
 
 
 [build-system]
