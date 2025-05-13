@@ -13,8 +13,6 @@ class IPApiUtil:
         self.io_helper = IOHelper(self.__class__.__name__, data_dir=data_dir)
 
         saved_file = IOHelper(module_name="", data_dir=Path("/home/yejin/ssd-shared/PyASN")).module_dir / "ip_cache_asn_info.csv"
-        print(saved_file)
-        
         if not saved_file.exists():
             raise FileNotFoundError(f"{saved_file} not found.")
         
