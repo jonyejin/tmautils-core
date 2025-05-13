@@ -43,6 +43,8 @@ class IPApiUtil:
 
     def get_asn_info(self, asn: int) -> dict:
         return self.db.get(asn, {})
+    def get_asn_name(self, asn: int) -> dict:
+        return self.db.get(asn, {}).get("asname", "")
 
     def is_mobile_proxy_hosting(self, asn: int):
         info = self.get_asn_info(asn)
