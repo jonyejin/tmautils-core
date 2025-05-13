@@ -32,7 +32,7 @@ class PyasnUtil:
             )
             db_path = self.download_and_process_rib(year, month, day)
 
-        self.as_db = pyasn(str(db_path.resolve(strict=True)))
+        self.as_db = pyasn(str(db_path))
 
         self.io_helper.logger.info(
             f"Loaded pyasn database from {str(db_path)}"

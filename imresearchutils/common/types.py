@@ -21,7 +21,7 @@ class L4Proto(Enum):
     ICMPv6 = 58
 
 
-@dataclass
+@dataclass(frozen=True)
 class FQDN:
     name: str
 

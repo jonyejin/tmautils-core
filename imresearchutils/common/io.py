@@ -1,10 +1,9 @@
 from pathlib import Path
-import importlib
-from datetime import datetime
-import logging
 
 
 def import_module_attr(module_path: str, attr_name: str):
+    import importlib
+
     try:
         module = importlib.import_module(module_path)
         attr = getattr(module, attr_name)
@@ -32,9 +31,9 @@ class IOHelper:
 
         if data_dir is None:
             data_dir = Path.cwd()
-        self.module_dir = data_dir / module_name
-        if instance_name is not None:
-            self.module_dir = self.module_dir / instance_name
+        self.module_dir = data_dir.expanduser().resolve(strict=True) / self.module_name
+        if self.instance_name is not None:
+            self.module_dir = self.module_dir / self.instance_name
         self.module_dir.mkdir(parents=True, exist_ok=True)
 
         if setup_logging:
@@ -65,13 +64,21 @@ class IOHelper:
         return results
 
     def setup_logging(self, **kwargs):
-        logger = logging.getLogger(self.module_name)
+        from datetime import datetime
+        import logging
+
+        logger_name = (
+            f"{self.module_name}/{self.instance_name}" if self.instance_name is not None
+            else self.module_name
+        )
+        logger = logging.getLogger(logger_name)
+
         logger.propagate = False
         # Set top-level logging level to DEBUG to capture all logs
         logger.setLevel(logging.DEBUG)
         if not logger.handlers:
             formatter = logging.Formatter(
-                "%(asctime)s %(levelname)s {%(module)s} [%(funcName)s] %(message)s",
+                "%(asctime)s %(levelname)s {%(name)s} [%(funcName)s] %(message)s",
                 datefmt='%Y-%m-%d %H:%M:%S'
             )
 
@@ -94,3 +101,17 @@ class IOHelper:
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
         return logger
+
+    def write_result_pickle(self, filename: str, data: object):
+        import pickle
+
+        self.results.joinpath(filename).write_bytes(
+            pickle.dumps(data)
+        )
+
+    def read_result_pickle(self, filename: str) -> object:
+        import pickle
+
+        return pickle.loads(
+            self.results.joinpath(filename).read_bytes()
+        )

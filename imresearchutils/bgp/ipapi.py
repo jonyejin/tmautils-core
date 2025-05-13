@@ -1,37 +1,53 @@
-from ipaddress import ip_address
-import requests
-import pandas
-
 from imresearchutils.common import *
 
 
 class IPApiUtil:
-    def __init__(self,
-                 year: int = 2024,
-                 month: int = 1,
-                 data_dir: Path | None = None):
+    def __init__(
+        self,
+        ipapi_data_dir: Path,
+        data_dir: Path | None = None
+    ):
         self.io_helper = IOHelper(self.__class__.__name__, data_dir=data_dir)
 
-        saved_file = IOHelper(module_name="", data_dir=Path("/home/yejin/ssd-shared/PyASN")).module_dir / "ip_cache_asn_info.csv"
-        if not saved_file.exists():
-            raise FileNotFoundError(f"{saved_file} not found.")
-        
+
+        # Symbolic link to the ipapi_data_dir inside self.io_helper.raw
+        symlink_path = self.io_helper.raw / "ipapi_data"
+        # Remove the old symlink if it exists
+        if symlink_path.exists():
+            if symlink_path.is_symlink():
+                symlink_path.unlink()
+            else:
+                raise FileExistsError(
+                    f"{symlink_path} exists and is not a symlink."
+                )
+        # Create the new symlink
+        symlink_path.symlink_to(ipapi_data_dir, target_is_directory=True)
+        self.io_helper.logger.info(
+            f"Created symlink to {ipapi_data_dir} at {symlink_path}"
+        )
+
+        # TODO: Add logic to process the ipapi_data_dir and create a CSV file
+        # For now, we will just read the CSV file directly from the raw dir
+        db_csv_pathsaved_file = symlink_path / "ip_cache_asn_info.csv"
+        if not db_csv_pathsaved_file.exists():
+            raise FileNotFoundError(f"{db_csv_pathsaved_file} not found.")
+        import pandas
         self.db = pandas.read_csv(
-            saved_file,
+            db_csv_pathsaved_file,
             index_col=0,
             low_memory=False,
         ).to_dict(orient='index')
         self.io_helper.logger.info(
-            f"Loaded IPApiUtil dataset from {saved_file}"
+            f"Loaded ipapi dataset from {db_csv_pathsaved_file}"
         )
-    def get_asn_info(self, asn:int):
+
+    def get_asn_info(self, asn: int) -> dict:
         return self.db.get(asn, {})
-    
-    def is_mobile_proxy_hosting(self, asn):
+
+    def is_mobile_proxy_hosting(self, asn: int):
         info = self.get_asn_info(asn)
         return (
             bool(info.get("mobile", False)),
             bool(info.get("proxy", False)),
             bool(info.get("hosting", False)),
         )
-    

@@ -1,6 +1,6 @@
 from enum import StrEnum
 from dataclasses import dataclass, field
-from tldextract import extract
+from urllib.parse import urlparse
 
 from imresearchutils.common import *
 
@@ -81,7 +81,7 @@ class FirefoxCrawlFailureReason(StrEnum):
 
 
 @dataclass(frozen=True)
-class CrawlDnsRecord:
+class UsedDnsRecord:
     hostname: FQDN
     cname: FQDN
     addresses: list[IPv4Address | IPv6Address]
@@ -106,6 +106,17 @@ class CrawlDnsRecord:
     @property
     def used_aaaa(self):
         return self.used_address.version == 6
+    
+    @property
+    def af_support(self):
+        if self.has_a and self.has_aaaa:
+            return DomainAFSupport.DUAL_STACK
+        elif self.has_a:
+            return DomainAFSupport.A_ONLY
+        elif self.has_aaaa:
+            return DomainAFSupport.AAAA_ONLY
+        else:
+            raise ValueError("No A or AAAA records found")
 
     @property
     def happy_eyeballs_result(self):
@@ -126,7 +137,7 @@ class CompletedHttpRequest:
     request_id: int
     url: str
     resource_type: FirefoxWebResource
-    dns_record: CrawlDnsRecord
+    dns_record: UsedDnsRecord
 
 
 @dataclass
@@ -147,7 +158,7 @@ class TrancoSiteCrawlResult:
 
     @property
     def fqdn(self):
-        return FQDN(extract(self.url).fqdn)
+        return FQDN(urlparse(self.url).hostname)
 
     @property
     def root_happy_eyeballs_result(self):
@@ -166,13 +177,13 @@ class TrancoSiteCrawlResult:
 
     @property
     def third_party_domains(self):
-        set_3p_domains: set[FQDN] = set()
+        third_party_domains: dict[FQDN, DomainAFSupport] = {}
         for req in self.http_requests:
             if req.dns_record.hostname.registered_domain == self.fqdn.registered_domain:
                 # This is a first-party resource
                 continue
-            set_3p_domains.add(req.dns_record.hostname)
-        return set_3p_domains
+            third_party_domains[req.dns_record.hostname] = req.dns_record.af_support
+        return third_party_domains
 
     @property
     def all_domains_have_aaaa(self):
