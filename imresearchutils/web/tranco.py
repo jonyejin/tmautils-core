@@ -21,6 +21,55 @@ class CrawlProgress(DataClassJsonMixin):
 
 
 class TrancoCrawlUtil:
+    """
+    A utility class for crawling a Tranco list using OpenWPM.
+
+    Args:
+        openwpm_path (Path):
+            Path to the OpenWPM installation directory.
+
+        tranco_list_id (str | None):
+            ID of the Tranco list to crawl.
+            If None, the latest list will be used.
+
+        data_dir (Path | None):
+            Base directory for data files.
+            If None, the current working directory will be used.
+
+        repeat (int):
+            Repetition number for the crawl.
+            Used to create a unique instance name for the IOHelper.
+            Default is 1.
+
+        n_top_sites (int):
+            Number of top sites to crawl from the Tranco list.
+            Default is 100000.
+
+        n_browsers (int):
+            Number of browsers to use for crawling.
+            Default is 10.
+
+        n_click_internal_links (int):
+            Number of internal links to click on main page.
+            Default is 5.
+
+        browser_sleep_dur (int):
+            Sleep duration (in seconds) passed to BrowseCommand.
+            Default is 3.
+
+        n_sites_chunk (int):
+            Number of sites to crawl in each chunk.
+            Default is 100.
+
+        max_retry_per_chunk (int):
+            Maximum number of retries for each chunk.
+            Default is 3.
+
+        **kwargs (dict):
+            Additional arguments for IOHelper.
+            See the IOHelper class for more details.
+    """
+
     def __init__(
         self,
         openwpm_path: Path,
@@ -33,6 +82,7 @@ class TrancoCrawlUtil:
         browser_sleep_dur: int = 3,
         n_sites_chunk: int = 100,
         max_retry_per_chunk: int = 3,
+        **kwargs,
     ):
         import sys
         import tranco
@@ -86,7 +136,8 @@ class TrancoCrawlUtil:
         self.io_helper = IOHelper(
             module_name=self.__class__.__name__,
             instance_name=instance_name,
-            data_dir=data_dir
+            data_dir=data_dir,
+            **kwargs,
         )
         self.io_helper.logger.info(
             f"Using Tranco list with id {self.tranco_list.list_id} "
@@ -123,6 +174,14 @@ class TrancoCrawlUtil:
         self,
         chunknum: int,
     ):
+        """
+        Crawl a chunk of sites from the Tranco list.
+
+        Args:
+            chunknum (int):
+                Chunk number to crawl.
+        """
+
         site_ranks = range(
             chunknum*self.n_sites_chunk,
             (chunknum+1)*self.n_sites_chunk
@@ -230,6 +289,10 @@ class TrancoCrawlUtil:
                 break
 
     def crawl(self):
+        """
+        Crawl the Tranco list in chunks.
+        """
+
         for chunknum in range(self.progress.chunks_done, self.n_chunks):
             self.io_helper.logger.info(
                 f"Starting crawl for chunk {chunknum}"
@@ -246,11 +309,33 @@ class TrancoCrawlUtil:
 
 
 class TrancoProcessUtil:
+    """
+    A utility class for processing the results of a Tranco crawl.
+
+    Args:
+        tranco_list_id (str):
+            ID of the Tranco list to process.
+
+        data_dir (Path | None):
+            Base directory for data files.
+            If None, the current working directory will be used.
+
+        repeat (int):
+            Repetition number for the crawl.
+            Used to create a unique instance name for the IOHelper.
+            Default is 1.
+
+        **kwargs (dict):
+            Additional arguments for IOHelper.
+            See the IOHelper class for more details.
+    """
+
     def __init__(
         self,
         tranco_list_id: str,
         data_dir: Path | None = None,
         repeat: int = 1,
+        **kwargs,
     ):
         self.tranco_list_id = tranco_list_id
 
@@ -261,7 +346,8 @@ class TrancoProcessUtil:
         self.io_helper = IOHelper(
             module_name=TrancoCrawlUtil.__name__,
             instance_name=instance_name,
-            data_dir=data_dir
+            data_dir=data_dir,
+            **kwargs,
         )
 
         # Parse the log file for errors
@@ -282,6 +368,18 @@ class TrancoProcessUtil:
         chunk_num: int,
         use_cache: bool = True
     ):
+        """
+        Load the database for a specific chunk.
+
+        Args:
+            chunk_num (int):
+                Chunk number to load.
+
+            use_cache (bool):
+                Whether to use the cached version of the database, if available.
+                Default is True.
+        """
+
         import pickle
 
         # Check if chunk_num is valid

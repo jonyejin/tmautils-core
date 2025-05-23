@@ -10,12 +10,42 @@ ROUTEVIEWS_ARCHIVE_ROOT = "route-views4/bgpdata"  # IPv4 + IPv6
 
 
 class PyasnUtil:
-    def __init__(self,
-                 year: int,
-                 month: int,
-                 day: int = 1,
-                 data_dir: Path | None = None):
-        self.io_helper = IOHelper(self.__class__.__name__, data_dir=data_dir)
+    """
+    Utility class for interacting with the pyasn database.
+
+    Args:
+        year (int):
+            Year of the RIB database to download.
+
+        month (int):
+            Month of the RIB database to download.
+
+        day (int):
+            Day of the RIB database to download.
+            Default is 1.
+
+        data_dir (Path | None):
+            Base directory for data files.
+            If None, the current working directory will be used.
+
+        **kwargs (dict):
+            Additional arguments for IOHelper.
+            See the IOHelper class for more details.
+    """
+
+    def __init__(
+        self,
+        year: int,
+        month: int,
+        day: int = 1,
+        data_dir: Path | None = None,
+        **kwargs,
+    ):
+        self.io_helper = IOHelper(
+            self.__class__.__name__,
+            data_dir=data_dir,
+            **kwargs,
+        )
 
         # We don't know which hour we downloaded
         db_path = next(
@@ -30,7 +60,7 @@ class PyasnUtil:
                 f"pyasn database not found for {year}-{month:02d}-{day:02d}, "
                 f"attempting to download"
             )
-            db_path = self.download_and_process_rib(year, month, day)
+            db_path = self._download_and_process_rib(year, month, day)
 
         self.as_db = pyasn(str(db_path))
 
@@ -38,7 +68,12 @@ class PyasnUtil:
             f"Loaded pyasn database from {str(db_path)}"
         )
 
-    def download_and_process_rib(self, year: int, month: int, day: int):
+    def _download_and_process_rib(
+        self,
+        year: int,
+        month: int,
+        day: int,
+    ):
         # Set up the FTP connection
         ftp = FTP(ROUTEVIEWS_FTP_SERVER)
         ftp.login()
@@ -104,7 +139,23 @@ class PyasnUtil:
 
         return processed_path
 
-    def lookup(self, addr: IPv4Address | IPv6Address):
+    def lookup(
+        self,
+        addr: IPv4Address | IPv6Address | str,
+    ):
+        """
+        Lookup the ASN for a given IP address.
+
+        Args:
+            addr (IPv4Address | IPv6Address | str):
+                The IP address to look up.
+
+        Returns:
+            asn (int | None):
+                The ASN for the given IP address, or None if not found.
+        """
+        if isinstance(addr, str):
+            addr = ip_address(addr)
         if addr.is_private:
             return None
         (asn, _) = self.as_db.lookup(str(addr))

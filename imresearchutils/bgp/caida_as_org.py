@@ -6,14 +6,45 @@ from imresearchutils.common import *
 
 
 class CaidaAsOrgInfoUtil:
-    def __init__(self, date_str: str, data_dir: Path | None = None):
-        self.io_helper = IOHelper(self.__class__.__name__, data_dir=data_dir)
-        self.date_str = date_str
+    """
+    Utility class for interacting with the CAIDA AS-Organization dataset.
 
-        self.org_id_parquet = (self.io_helper.processed /
-                               f"{date_str}.as-org2info.v0.org_id.parquet")
-        self.aut_parquet = (self.io_helper.processed /
-                            f"{date_str}.as-org2info.v0.aut.parquet")
+    Args:
+        date_str (str):
+            Date string in the ISO format (YYYY-MM-DD)
+
+        data_dir (Path | None):
+            Base directory for data files.
+            If None, the current working directory will be used.
+
+        **kwargs (dict):
+            Additional arguments for IOHelper.
+            See the IOHelper class for more details.
+    """
+
+    def __init__(
+        self,
+        date_str: str,
+        data_dir: Path | None = None,
+        **kwargs,
+    ):
+        self.io_helper = IOHelper(
+            self.__class__.__name__,
+            data_dir=data_dir,
+            **kwargs,
+        )
+
+        # Convert date_str from YYYY-MM-DD to YYYYMMDD
+        self.date_str = date_str.replace('-', '')
+
+        self.org_id_parquet = (
+            self.io_helper.processed /
+            f"{date_str}.as-org2info.v0.org_id.parquet"
+        )
+        self.aut_parquet = (
+            self.io_helper.processed /
+            f"{date_str}.as-org2info.v0.aut.parquet"
+        )
 
         if (self.org_id_parquet.exists() and self.aut_parquet.exists()):
             self.df_org_id = pandas.read_parquet(self.org_id_parquet)
@@ -43,7 +74,7 @@ class CaidaAsOrgInfoUtil:
                 else:
                     gz_file.write_bytes(r.content)
 
-            self.df_org_id, self.df_aut = self.parse_tables(gz_file)
+            self.df_org_id, self.df_aut = self._parse_tables(gz_file)
             self.df_org_id.to_parquet(self.org_id_parquet)
             self.df_aut.to_parquet(self.aut_parquet)
             self.io_helper.logger.info(
@@ -53,7 +84,10 @@ class CaidaAsOrgInfoUtil:
         self.df_org_id.set_index('org_id', inplace=True)
         self.df_aut.set_index('aut', inplace=True)
 
-    def parse_tables(self, gz_file: Path):
+    def _parse_tables(
+        self,
+        gz_file: Path,
+    ):
         def flush_table():
             if current_cols and current_rows:
                 tables.append((current_cols, current_rows))
@@ -101,7 +135,23 @@ class CaidaAsOrgInfoUtil:
 
         return df_org_id, df_aut
 
-    def lookup(self, asn: int) -> tuple[str | None, str | None]:
+    def lookup(
+        self,
+        asn: int,
+    ) -> tuple[str | None, str | None]:
+        """
+        Lookup the organization name and autonomous system name for a given ASN.
+
+        Args:
+            asn (int):
+                ASN to query.
+
+        Returns:
+            (aut_name, org_name):
+                Tuple containing the autonomous system name and organization name.
+                One or both may be None if not found.
+        """
+
         aut_str = str(asn)
         if aut_str not in self.df_aut.index:
             return None, None

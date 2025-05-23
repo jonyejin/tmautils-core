@@ -5,11 +5,39 @@ from imresearchutils.common import *
 
 
 class ASdbCategoryUtil:
-    def __init__(self,
-                 year: int = 2024,
-                 month: int = 1,
-                 data_dir: Path | None = None):
-        self.io_helper = IOHelper(self.__class__.__name__, data_dir=data_dir)
+    """
+    Utility class for interacting with the ASdb dataset.
+
+    Args:
+        year (int):
+            Year of the ASdb dataset to download.
+            Default is 2024.
+
+        month (int):
+            Month of the ASdb dataset to download.
+            Default is 1.
+
+        data_dir (Path | None):
+            Base directory for data files.
+            If None, the current working directory will be used.
+
+        **kwargs (dict):
+            Additional arguments for IOHelper.
+            See the IOHelper class for more details.
+    """
+
+    def __init__(
+        self,
+        year: int = 2024,
+        month: int = 1,
+        data_dir: Path | None = None,
+        **kwargs,
+    ):
+        self.io_helper = IOHelper(
+            self.__class__.__name__,
+            data_dir=data_dir,
+            **kwargs,
+        )
 
         url = f"https://asdb.stanford.edu/data/{year}-{month:02d}_categorized_ases.csv"
         saved_file = self.io_helper.processed / url.split("/")[-1]
@@ -35,7 +63,22 @@ class ASdbCategoryUtil:
             f"Loaded ASdb dataset from {saved_file}"
         )
 
-    def get_full(self, asn: int):
+    def get_full(
+        self,
+        asn: int,
+    ):
+        """
+        Get the full ASdb category dictionary for a given ASN.
+
+        Args:
+            asn (int):
+                ASN to query.
+
+        Returns:
+            catdict (dict[str, dict[str, str]]):
+            Dictionary of categories and layers for the given ASN.
+        """
+
         catdict_flat: dict[str, str | Any] = self.db.get(f"AS{asn}", {})
 
         catdict: dict[str, dict[str, str]] = {}
@@ -56,7 +99,33 @@ class ASdbCategoryUtil:
 
         return catdict
 
-    def get(self, asn: int, category: str = "Category 1", layer: str = "Layer 1"):
+    def get(
+        self,
+        asn: int,
+        category: str = "Category 1",
+        layer: str = "Layer 1",
+    ):
+        """
+        Get the ASdb category for a given ASN, category, and layer.
+
+        Args:
+            asn (int):
+                ASN to query.
+
+            category (str):
+                Category to query.
+                Default is "Category 1".
+
+            layer (str):
+                Layer to query.
+                Default is "Layer 1".
+
+        Returns:
+            str | None:
+                The value of the specified category and layer for the given ASN.
+                Returns None if the ASN, category, or layer is not found.
+        """
+
         catdict = self.get_full(asn)
         if category not in catdict:
             return None
