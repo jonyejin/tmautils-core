@@ -10,6 +10,7 @@ RANDOM_WAIT_MIN = 15
 RANDOM_WAIT_MAX = 75
 JITTER_MIN = 2
 JITTER_MAX = 8
+CACHE_DAYS_FRESH = 7
 
 FIELDS = (
     "query",
@@ -44,6 +45,10 @@ class IPApiUtil:
     Utility class for interacting with ip-api.com
 
     Args:
+        cache_days_fresh (int):
+            Number of days to consider a cached result fresh.
+            Default is 7 days.
+
         data_dir (Path | None):
             Base directory for data files.
             If None, the current working directory will be used.
@@ -55,6 +60,7 @@ class IPApiUtil:
 
     def __init__(
         self,
+        cache_days_fresh: int = CACHE_DAYS_FRESH,
         data_dir: Path | None = None,
         **kwargs,
     ):
@@ -63,6 +69,8 @@ class IPApiUtil:
             data_dir=data_dir,
             **kwargs,
         )
+
+        self.cache_days_fresh = cache_days_fresh
 
         self.io_helper.logger.info(
             f"Initialized IPApiUtil with cache directory: {self.io_helper.processed}"
@@ -194,7 +202,7 @@ class IPApiUtil:
         self,
         results: pd.DataFrame,
     ):
-        from datetime import date
+        from datetime import date, timedelta
 
         date_str = date.today().isoformat()
         results["last_queried"] = date_str
@@ -211,12 +219,24 @@ class IPApiUtil:
             current = pd.read_csv(
                 snapshot_fp,
                 encoding="utf-8",
+                low_memory=False,
             )
             current = current.loc[:, ~current.columns.duplicated()]
         else:
             current = pd.DataFrame(columns=list(FIELDS) + ["last_queried"])
         if "last_queried" not in current.columns:
             current["last_queried"] = pd.NA
+
+        # Convert last_queried to date objects
+        current["last_queried"] = (
+            pd.to_datetime(current["last_queried"], errors="coerce")
+            .dt.date
+        )
+
+        # Drop rows that are no longer fresh
+        cutoff = date.today() - timedelta(days=self.cache_days_fresh)
+        stale = current["last_queried"] < cutoff
+        current = current.loc[~stale].reset_index(drop=True)
 
         def _row_changed(r):
             if pd.isna(r["last_queried_old"]):
@@ -266,7 +286,6 @@ class IPApiUtil:
     def get_batch(
         self,
         ips: list[str | IPv4Address | IPv6Address],
-        days_fresh: int = 7,
     ) -> pd.DataFrame:
         """
         Get a batch of IP addresses from the cache or API.
@@ -274,10 +293,6 @@ class IPApiUtil:
         Args:
             ips (list[str | IPv4Address | IPv6Address]):
                 List of IP addresses to query.
-
-            days_fresh (int):
-                Number of days to consider a cached result fresh.
-                Default is 7 days.
 
         Returns:
             df (pd.DataFrame):
@@ -291,7 +306,11 @@ class IPApiUtil:
         # Load snapshot if it exists
         snapshot_fp = self.io_helper.processed / "latest" / "current.csv"
         if snapshot_fp.exists():
-            current = pd.read_csv(snapshot_fp, encoding="utf-8")
+            current = pd.read_csv(
+                snapshot_fp,
+                encoding="utf-8",
+                low_memory=False,
+            )
             current = current.loc[:, ~current.columns.duplicated()]
             if "last_queried" not in current.columns:
                 current["last_queried"] = pd.NaT
@@ -306,7 +325,7 @@ class IPApiUtil:
             current["last_queried"] = pd.Series(dtype="datetime64[ns]")
 
         # If a result is fresh, use it
-        cutoff = date.today() - timedelta(days=days_fresh)
+        cutoff = date.today() - timedelta(days=self.cache_days_fresh)
         fresh_mask = (
             current["query"].isin(ips)
             & (current["last_queried"].dt.date >= cutoff)
