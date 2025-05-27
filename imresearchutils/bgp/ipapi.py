@@ -5,8 +5,11 @@ from imresearchutils.common import *
 
 IP_API_BATCH_URL = "http://ip-api.com/batch"
 MAX_IPS_PER_BATCH = 100
-MAX_CONCURRENT_REQUESTS = 15
-RANDOM_WAIT_MAX = 15
+MAX_CONCURRENT_REQUESTS = 8
+RANDOM_WAIT_MIN = 15
+RANDOM_WAIT_MAX = 75
+JITTER_MIN = 2
+JITTER_MAX = 8
 
 FIELDS = (
     "query",
@@ -61,8 +64,6 @@ class IPApiUtil:
             **kwargs,
         )
 
-        self.ipapi_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
-
         self.io_helper.logger.info(
             f"Initialized IPApiUtil with cache directory: {self.io_helper.processed}"
         )
@@ -70,11 +71,18 @@ class IPApiUtil:
     async def get_batch_api(
         self,
         ips: list[str | IPv4Address | IPv6Address],
-        max_retry: int = 5,
+        max_retry: int = 8,
         save_cache: bool = True,
     ):
         """
         Query ip-api.com's batch API for a list of IP addresses.
+
+        NOTE: This function instantiates its own `asyncio.Semaphore` internally
+        to throttle requests. If you invoke it multiple times concurrently
+        (or from separate event loops), each call will create its own semaphore
+        and you may exceed your intended global limit. Therefore, only call
+        `get_batch_api()` once at a time per loop to guarantee a true cap of
+        `max_concurrent_requests`.
 
         Args:
             ips (list[str | IPv4Address | IPv6Address]):
@@ -87,6 +95,10 @@ class IPApiUtil:
             save_cache (bool):
                 Whether to save the results to a cache file.
                 Default is True.
+
+        Returns:
+            df (pd.DataFrame):
+                DataFrame containing the results for the requested IPs.
         """
         import aiohttp
         from random import randint
@@ -100,12 +112,14 @@ class IPApiUtil:
             for i in range(0, len(ips), MAX_IPS_PER_BATCH)
         ]
 
+        ipapi_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
         results: dict[str, Any] = {}
 
         async with aiohttp.ClientSession() as session:
             async def _fetch_one_batch(batch: list[str]):
                 for attempt in range(1, max_retry + 1):
-                    async with self.ipapi_semaphore:
+                    async with ipapi_semaphore:
                         try:
                             resp = await session.post(
                                 f"{IP_API_BATCH_URL}?fields={','.join(FIELDS)}",
@@ -113,13 +127,14 @@ class IPApiUtil:
                             )
                         except aiohttp.ClientConnectionError as e:
                             # We do not know how long to wait
-                            wait = randint(1, RANDOM_WAIT_MAX)
+                            wait = randint(RANDOM_WAIT_MIN, RANDOM_WAIT_MAX)
                             self.io_helper.logger.warning(
                                 f"ConnErr on batch {batch[:3]}... "
                                 f"(attempt {attempt}/{max_retry}): {e}. "
                                 f"retrying in {wait:.0f}s"
                             )
-                            await asyncio.sleep(wait)
+                            if attempt < max_retry:
+                                await asyncio.sleep(wait)
                             continue
 
                         if resp.status != 200:
@@ -127,12 +142,15 @@ class IPApiUtil:
                             rl = int(resp.headers.get("X-Rl", "0"))
                             if ttl == 0 and rl == 0:
                                 # We don't know how long to wait
-                                ttl = randint(1, RANDOM_WAIT_MAX)
+                                ttl = randint(RANDOM_WAIT_MIN, RANDOM_WAIT_MAX)
+                            else:
+                                ttl += randint(JITTER_MIN, JITTER_MAX)
                             self.io_helper.logger.info(
                                 f"Got HTTP {resp.status} on batch {batch[:3]}... "
                                 f"(attempt {attempt}/{max_retry}), retrying in {ttl}s"
                             )
-                            await asyncio.sleep(ttl)
+                            if attempt < max_retry:
+                                await asyncio.sleep(ttl)
                             continue
 
                         data = await resp.json()
@@ -260,6 +278,10 @@ class IPApiUtil:
             days_fresh (int):
                 Number of days to consider a cached result fresh.
                 Default is 7 days.
+
+        Returns:
+            df (pd.DataFrame):
+                DataFrame containing the results for the requested IPs.
         """
 
         from datetime import date, timedelta
@@ -279,8 +301,9 @@ class IPApiUtil:
                 )
         else:
             current = pd.DataFrame(
-                columns=list(FIELDS) + ["last_queried"]
+                {c: pd.Series(dtype="object") for c in list(FIELDS)}
             )
+            current["last_queried"] = pd.Series(dtype="datetime64[ns]")
 
         # If a result is fresh, use it
         cutoff = date.today() - timedelta(days=days_fresh)
