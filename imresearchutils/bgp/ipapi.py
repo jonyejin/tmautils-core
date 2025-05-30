@@ -72,9 +72,76 @@ class IPApiUtil:
 
         self.cache_days_fresh = cache_days_fresh
 
+        # Set up snapshot directory if it doesn't exist
+        snapshot_dir = self.io_helper.processed / "latest"
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+        # Read existing snapshot if it exists
+        self._load_cache()
+
         self.io_helper.logger.info(
             f"Initialized IPApiUtil with cache directory: {self.io_helper.processed}"
         )
+
+    @staticmethod
+    def _normalize_ip(ip: str | IPv4Address | IPv6Address):
+        # parse & re‐stringify in a standardized way
+        if isinstance(ip, (IPv4Address, IPv6Address)):
+            return str(ip)
+        return str(ip_address(ip))
+
+    def _load_cache(self):
+        snapshot_path = self.io_helper.processed / "latest" / "current.csv"
+        if snapshot_path.exists():
+            self.current = pd.read_csv(
+                snapshot_path,
+                encoding="utf-8",
+                low_memory=False,
+            )
+            self.current = self.current.loc[
+                :, ~self.current.columns.duplicated()
+            ]
+
+            # Standardize the "query" column
+            self.current["query"] = self.current["query"].map(
+                self._normalize_ip
+            )
+
+            # Fix up "last_queried" column
+            if "last_queried" not in self.current.columns:
+                self.current["last_queried"] = pd.Series(
+                    pd.NaT, index=self.current.index, dtype="datetime64[ns]"
+                )
+            else:
+                self.current["last_queried"] = pd.to_datetime(
+                    self.current["last_queried"], format="%Y-%m-%d", errors="coerce"
+                )
+        else:
+            self.current = pd.DataFrame(
+                {c: pd.Series(dtype="object") for c in list(FIELDS)}
+            )
+            self.current["last_queried"] = pd.Series(dtype="datetime64[ns]")
+
+        # Drop stale rows
+        self._drop_stale_cache_rows()
+
+        self.io_helper.logger.info(
+            f"Loaded cache with {len(self.current)} fresh entries "
+            f"from {snapshot_path}"
+        )
+
+    def _drop_stale_cache_rows(self):
+        from datetime import date, timedelta
+
+        cutoff = date.today() - timedelta(days=self.cache_days_fresh)
+        stale = self.current["last_queried"].dt.date < cutoff
+        self.current = self.current.loc[~stale].reset_index(drop=True)
+
+        if stale.sum() > 0:
+            self.io_helper.logger.info(
+                f"Dropped {stale.sum()} stale rows from cache. "
+                f"Remaining entries: {len(self.current)}"
+            )
 
     async def get_batch_api(
         self,
@@ -111,13 +178,13 @@ class IPApiUtil:
         import aiohttp
         from random import randint
 
-        # Convert all IPs to strings
-        ips = [str(ip) for ip in ips]
+        # Standardize IPs
+        ips_str = [self._normalize_ip(ip) for ip in ips]
 
         # Split the list of IPs into batches of MAX_IPS_PER_BATCH
         batches = [
-            ips[i:i+MAX_IPS_PER_BATCH]
-            for i in range(0, len(ips), MAX_IPS_PER_BATCH)
+            ips_str[i:i+MAX_IPS_PER_BATCH]
+            for i in range(0, len(ips_str), MAX_IPS_PER_BATCH)
         ]
 
         ipapi_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
@@ -202,53 +269,49 @@ class IPApiUtil:
         self,
         results: pd.DataFrame,
     ):
-        from datetime import date, timedelta
+        from datetime import date
 
         date_str = date.today().isoformat()
-        results["last_queried"] = date_str
+        results["last_queried"] = pd.to_datetime(date_str, format="%Y-%m-%d")
 
-        # Set up snapshot and history directories
-        snapshot_dir = self.io_helper.processed / "latest"
+        # Set up history directory
         history_dir = self.io_helper.processed / "history" / date_str
-        for dir in (snapshot_dir, history_dir):
-            dir.mkdir(parents=True, exist_ok=True)
+        history_dir.mkdir(parents=True, exist_ok=True)
 
-        # Read existing snapshot if it exists
-        snapshot_fp = snapshot_dir / "current.csv"
-        if snapshot_fp.exists():
-            current = pd.read_csv(
-                snapshot_fp,
-                encoding="utf-8",
-                low_memory=False,
-            )
-            current = current.loc[:, ~current.columns.duplicated()]
-        else:
-            current = pd.DataFrame(columns=list(FIELDS) + ["last_queried"])
-        if "last_queried" not in current.columns:
-            current["last_queried"] = pd.NA
-
-        # Convert last_queried to date objects
-        current["last_queried"] = (
-            pd.to_datetime(current["last_queried"], errors="coerce")
-            .dt.date
-        )
-
-        # Drop rows that are no longer fresh
-        cutoff = date.today() - timedelta(days=self.cache_days_fresh)
-        stale = current["last_queried"] < cutoff
-        current = current.loc[~stale].reset_index(drop=True)
+        # Drop stale rows from the current cache
+        self._drop_stale_cache_rows()
 
         def _row_changed(r):
+            # If the row is new (no old data), return True
             if pd.isna(r["last_queried_old"]):
                 return True
+
             for f in FIELDS:
-                if r[f] != r[f + "_old"]:
+                # Skip the key field "query"
+                if f == "query":
+                    continue
+
+                # If this column did not exist before, return True
+                old_key = f + "_old"
+                if old_key not in r:
+                    return True
+
+                new_val, old_val = r[f], r[old_key]
+                # If both are NaN, they are considered unchanged
+                if pd.isna(new_val) and pd.isna(old_val):
+                    continue
+                # If one is NaN and the other is not, return True
+                if pd.isna(new_val) != pd.isna(old_val):
+                    return True
+
+                # If both are not NaN, check if they are different
+                if new_val != old_val:
                     return True
             return False
 
         # Identify rows that have changed
         merged = results.merge(
-            current, on="query", how="left", suffixes=("", "_old")
+            self.current, on="query", how="left", suffixes=("", "_old")
         )
         changed = merged[
             merged.apply(_row_changed, axis=1)
@@ -271,16 +334,23 @@ class IPApiUtil:
 
         # ensure both have exactly the same columns (in the same order)
         data_cols = [c for c in results.columns if c != "query"]
-        cur_idx = current.set_index("query").reindex(columns=data_cols)
+        cur_idx = self.current.set_index("query").reindex(columns=data_cols)
         new_idx = results.set_index("query").reindex(columns=data_cols)
         new_entries = new_idx.loc[~new_idx.index.isin(cur_idx.index)]
 
         # Save the current snapshot
-        combined = pd.concat([cur_idx, new_entries], sort=False).reset_index()
-        combined.to_csv(
-            snapshot_fp,
+        self.current = pd.concat(
+            [cur_idx, new_entries], sort=False
+        ).reset_index()
+        self.current.to_csv(
+            self.io_helper.processed / "latest" / "current.csv",
             index=False,
             encoding="utf-8",
+        )
+
+        self.io_helper.logger.info(
+            f"Cached {len(new_entries)} new entries to current snapshot. "
+            f"Total entries now: {len(self.current)}"
         )
 
     def get_batch(
@@ -298,43 +368,18 @@ class IPApiUtil:
             df (pd.DataFrame):
                 DataFrame containing the results for the requested IPs.
         """
-
-        from datetime import date, timedelta
-
-        ips = [str(ip) for ip in ips]
-
-        # Load snapshot if it exists
-        snapshot_fp = self.io_helper.processed / "latest" / "current.csv"
-        if snapshot_fp.exists():
-            current = pd.read_csv(
-                snapshot_fp,
-                encoding="utf-8",
-                low_memory=False,
-            )
-            current = current.loc[:, ~current.columns.duplicated()]
-            if "last_queried" not in current.columns:
-                current["last_queried"] = pd.NaT
-            else:
-                current["last_queried"] = pd.to_datetime(
-                    current["last_queried"], format="%Y-%m-%d", errors="coerce"
-                )
-        else:
-            current = pd.DataFrame(
-                {c: pd.Series(dtype="object") for c in list(FIELDS)}
-            )
-            current["last_queried"] = pd.Series(dtype="datetime64[ns]")
+        # Standardize IPs
+        ips_str = [self._normalize_ip(ip) for ip in ips]
 
         # If a result is fresh, use it
-        cutoff = date.today() - timedelta(days=self.cache_days_fresh)
-        fresh_mask = (
-            current["query"].isin(ips)
-            & (current["last_queried"].dt.date >= cutoff)
-        )
-        cached_df = current.loc[fresh_mask, list(FIELDS)]
+        self._drop_stale_cache_rows()
+        cached = self.current.loc[
+            self.current["query"].isin(ips_str), list(FIELDS)
+        ]
 
         # Determine which IPs need querying
-        cached_set = set(cached_df["query"])
-        to_query = [ip for ip in ips if ip not in cached_set]
+        cached_set = set(cached["query"])
+        to_query = [ip for ip in ips_str if ip not in cached_set]
 
         # Query the API for the remaining IPs
         new_df = pd.DataFrame(columns=list(FIELDS))
@@ -347,7 +392,7 @@ class IPApiUtil:
 
         # Combine and return
         if new_df.empty:
-            return cached_df.reset_index(drop=True)
-        cached_df = cached_df.reindex(columns=list(FIELDS))
+            return cached.reset_index(drop=True)
+        cached = cached.reindex(columns=list(FIELDS))
         new_df = new_df.reindex(columns=list(FIELDS))
-        return pd.concat([cached_df, new_df], ignore_index=True)
+        return pd.concat([cached, new_df], ignore_index=True)
