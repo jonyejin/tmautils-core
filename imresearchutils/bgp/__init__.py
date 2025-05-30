@@ -1,4 +1,5 @@
 from .asdb import ASdbCategoryUtil
 from .caida_as_org import CaidaAsOrgInfoUtil
 from .pyasn import PyasnUtil
-from .ipapi import IPApiUtil
+from .ipapi import IPApiBatchUtil
+from .ipapi_old import IPApiUtil

@@ -40,9 +40,9 @@ FIELDS = (
 )
 
 
-class IPApiUtil:
+class IPApiBatchUtil:
     """
-    Utility class for interacting with ip-api.com
+    Utility class for interacting with the ip-api.com batch API.
 
     Args:
         cache_days_fresh (int):
@@ -80,7 +80,7 @@ class IPApiUtil:
         self._load_cache()
 
         self.io_helper.logger.info(
-            f"Initialized IPApiUtil with cache directory: {self.io_helper.processed}"
+            f"Initialized IPApiBatchUtil with cache directory: {self.io_helper.processed}"
         )
 
     @staticmethod
@@ -187,14 +187,14 @@ class IPApiUtil:
             for i in range(0, len(ips_str), MAX_IPS_PER_BATCH)
         ]
 
-        ipapi_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+        ipapi_batch_semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
         results: dict[str, Any] = {}
 
         async with aiohttp.ClientSession() as session:
             async def _fetch_one_batch(batch: list[str]):
                 for attempt in range(1, max_retry + 1):
-                    async with ipapi_semaphore:
+                    async with ipapi_batch_semaphore:
                         try:
                             resp = await session.post(
                                 f"{IP_API_BATCH_URL}?fields={','.join(FIELDS)}",
