@@ -30,20 +30,20 @@ class VpnIpAz0:
             **kwargs,
         )
 
-        self._download_current()
+        self._download_current_file()
 
         self.io_helper.logger.info(
-            f"Initialized VpnIPAz0 with cache directory: {self.io_helper.processed}"
+            f"Initialized VpnIPAz0 with raw directory: {self.io_helper.raw}"
         )
 
-    def _download_current(self):
+    def _download_current_file(self):
         """
         Downloads the latest VPN IP and hostname data from the az0/vpn_ip repository.
-        This method retrieves the latest data files and saves them in the processed directory, and create dataframe and return.
+        This method retrieves the latest data files and saves them in the raw directory, and create dataframe and return.
         """
 
-        ip_file = self.io_helper.processed / "vpn_ip.txt"
-        hostname_file = self.io_helper.processed / "vpn_hostname.txt"
+        ip_file = self.io_helper.raw / "vpn_ip.txt"
+        hostname_file = self.io_helper.raw / "vpn_hostname.txt"
 
         try:
             self.io_helper.logger.info(
@@ -140,44 +140,144 @@ class VpnIpAz0:
 
         return False, None
 
-# TODO
-
 
 class ListsVpnX4BNet:
     """
-    Utility class for interacting with the x4b.net VPN lists.
+    Utility class for interacting with the X4BNet/lists_vpn VPN and datacenter lists.
+
+    Downloads and caches the IPv4 prefix lists for both VPN-only and
+    combined datacenter+VPN networks, and provides query methods.
+
+    Args:
+            data_dir (Path | None):
+                Base directory for data files.
+                If None, uses the current working directory.
+
+            **kwargs:
+                Additional arguments for IOHelper.
     """
+    URL_VPN_IPV4 = (
+        "https://raw.githubusercontent.com/X4BNet/lists_vpn/"
+        "main/output/vpn/ipv4.txt"
+    )
+    URL_DC_IPV4 = (
+        "https://raw.githubusercontent.com/X4BNet/lists_vpn/"
+        "main/output/datacenter/ipv4.txt"
+    )
 
-    def __init__(self):
-        pass
+    def __init__(
+        self,
+        data_dir: Path | None = None,
+        **kwargs,
+    ):
+        self.io_helper = IOHelper(
+            self.__class__.__name__,
+            data_dir=data_dir,
+            **kwargs
+        )
 
-    def _load_cache(self):
-        pass
+        # Download raw files and load into DataFrames
+        self._download_lists()
 
-    def download_current_file(self):
-        pass
+        # Load into DataFrames
+        self._load_dataframes()
 
-    def get_asns(self):
+        self.io_helper.logger.info(
+            f"Initialized ListsVpnX4BNet with raw directory: {self.io_helper.raw}"
+        )
+
+    def _download_lists(self) -> None:
         """
-        Returns a list of ASNs from the X4BNet/lists_vpn dataset.
+        Download the latest VPN-only and datacenter+VPN IPv4 lists
+        into the raw directory.
+        Load the downloaded text files into pandas DataFrames.
+        Each file is a one-column list of prefixes (CIDRs).
         """
-        pass
+        vpn_v4_file = self.io_helper.raw / "vpn_ipv4.txt"
+        dc_v4_file = self.io_helper.raw / "dc_ipv4.txt"
 
-    def get_vpn_ips(self):
-        """
-        Returns a list of VPN IPs from the X4BNet/lists_vpn dataset.
-        """
-        pass
+        try:
+            self.io_helper.logger.info(
+                "Downloading VPN and datacenter IPv4 lists..."
+            )
+            r_vpn = requests.get(self.URL_VPN_IPV4, timeout=5)
+            r_dc = requests.get(self.URL_DC_IPV4, timeout=5)
+        except requests.exceptions.Timeout:
+            self.io_helper.logger.error(
+                f"Could not download VPN IPv4 data from {self.URL_VPN_IPV4}, cannot proceed"
+            )
+            raise
+        else:
+            vpn_v4_file.write_text(r_vpn.text)
+            dc_v4_file.write_text(r_dc.text)
 
-    def is_ip_vpn(self, ip: IPv4Address | IPv6Address) -> tuple[bool, Optional[str]]:
+        self.df_vpn = pd.read_csv(
+            vpn_v4_file,
+            header=None,
+            names=["prefix"],
+            dtype={"prefix": str},
+            comment="#",
+        )
+
+        self.df_dc = pd.read_csv(
+            dc_v4_file,
+            header=None,
+            names=["prefix"],
+            dtype={"prefix": str},
+            comment="#",
+        )
+
+    def get_vpn_ips(self) -> pd.DataFrame:
         """
-        Checks if the given IP address is a VPN IP.
+        Returns:
+            pd.DataFrame: DataFrame of VPN-only prefixes (column: prefix).
+        """
+        return self.df_vpn.copy()
+
+    def get_datacenter_ips(self) -> pd.DataFrame:
+        """
+        Returns:
+            pd.DataFrame: DataFrame of datacenter+VPN prefixes (column: prefix).
+        """
+        return self.df_dc.copy()
+
+    def is_ip_vpn(
+        self,
+        ip: str | IPv4Address,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Checks if the given IPv4 address falls within any VPN-only prefix.
 
         Args:
-            ip (IPv4Address | IPv6Address): The IP address to check.
-
+            ip (str | IPv4Address):
+                The IP address to check.
         Returns:
-            tuple[bool, Optional[str]]: A tuple where the first element is True if the IP is a VPN IP,
-                                        and the second element is the hostname if available, otherwise None.
+            (is_vpn, prefix) (tuple(bool, Optional[str])):
+                True and matching prefix if VPN; else False, None.
         """
-        pass
+        ip_obj = ip_address(str(ip))
+        # Iterate over prefixes
+        for pref in self.df_vpn["prefix"]:
+            network = ip_network(pref)
+            if ip_obj in network:
+                return True, pref
+        return False, None
+
+    def is_ip_datacenter(
+        self,
+        ip: str | IPv4Address,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Checks if the given IPv4 address falls within any datacenter+VPN prefix.
+
+        Args:
+            ip (str | IPv4Address): The IP address to check.
+        Returns:
+            (bool, Optional[str]): True and matching prefix if datacenter/VPN; else False, None.
+        """
+        ip_obj = ip_address(str(ip))
+        for pref in self.df_dc["prefix"]:
+            network = ip_network(pref)
+            if ip_obj in network:
+                return True, pref
+        return False, None
