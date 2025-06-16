@@ -421,3 +421,29 @@ class IpInfoPrivacyUtil:
         except KeyError:
             return None
         return self.db.loc[idx] if idx is not None else None
+
+    def is_ip_vpn(
+        self,
+        addr: IPv4Address | IPv6Address | str,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Check if the given IP address is associated with a VPN.
+
+        Args:
+            addr (IPv4Address | IPv6Address | str):
+                The IP address to check.
+
+        Returns:
+            bool: True if the IP address is associated with a VPN, False otherwise.
+        """
+        ret = self.lookup(addr)
+        if ret is not None:
+            if ret["vpn"]:
+                # If 'service' is present, return it
+                if "service" in ret:
+                    return True, ret["service"]
+                return True, None
+        # If not found or not a VPN, return False
+        return False, None
+    
+    
