@@ -1,1 +1,5 @@
-from .is_vpn import VpnIpAz0, ListsVpnX4BNet
+from .is_vpn import (
+    VpnIpAz0,
+    ListsVpnX4BNet,
+    IpInfoPrivacyUtil,
+)

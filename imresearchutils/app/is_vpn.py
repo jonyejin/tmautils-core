@@ -1,6 +1,7 @@
 from imresearchutils.common import *
 import pandas as pd
 import requests
+from pytricia import PyTricia
 
 
 class VpnIpAz0:
@@ -281,3 +282,142 @@ class ListsVpnX4BNet:
             if ip_obj in network:
                 return True, pref
         return False, None
+
+
+class IpInfoPrivacyUtil:
+    """
+    Utility class for interacting with the ipinfo.io privacy dataset.
+
+    Args:
+        ipinfo_privacy_dir (Path):
+            Directory where the ipinfo privacy dataset is stored.
+
+        date (str | None):
+            Date of the dataset to use, in 'YYYY-MM-DD' format.
+            If None, the latest available dataset will be used.
+
+        data_dir (Path | None):
+            Base directory for data files.
+            If None, the current working directory will be used.
+
+        **kwargs (dict):
+            Additional arguments for IOHelper.
+            See the IOHelper class for more details.
+    """
+
+    def __init__(
+        self,
+        ipinfo_privacy_dir: Path,
+        date: str | None = None,
+        data_dir: Path | None = None,
+        **kwargs,
+    ):
+        self.io_helper = IOHelper(
+            self.__class__.__name__,
+            raw_dir_symlink_to=ipinfo_privacy_dir,
+            data_dir=data_dir,
+            **kwargs,
+        )
+
+        self._load_data(date)
+
+        self.io_helper.logger.info(
+            f"Initialized IpInfoPrivacyUtil with raw directory: {self.io_helper.raw}"
+        )
+
+    def _load_data(self, date: str | None = None):
+        if date is not None:
+            # Verify that the date is in the ISO format 'YYYY-MM-DD'
+            try:
+                pd.to_datetime(date, format='%Y-%m-%d', errors='raise')
+            except ValueError:
+                self.io_helper.logger.error(
+                    f"Invalid date format: {date}. Expected 'YYYY-MM-DD'."
+                )
+                raise
+
+            # Verify that the corresponding file exists
+            raw_path = self.io_helper.raw / f"ipinfo_privacy.{date}.csv"
+            if not raw_path.exists():
+                self.io_helper.logger.error(
+                    f"Data file for date {date} does not exist: {raw_path}"
+                )
+                raise FileNotFoundError(
+                    f"Data file for date {date} not found.")
+        else:
+            # List available data files
+            data_files = list(self.io_helper.raw.glob("ipinfo_privacy.*.csv"))
+            if not data_files:
+                self.io_helper.logger.error(
+                    "No ipinfo privacy data files found in the raw directory."
+                )
+                raise FileNotFoundError("No ipinfo privacy data files found.")
+
+            # Sort by date and take the most recent one
+            data_files.sort(key=lambda x: x.stem.split('.')[-1], reverse=True)
+            raw_path = data_files[0]
+
+        # See if we already processed this file
+        processed_path = self.io_helper.processed / f"{raw_path.name}.parquet"
+        if processed_path.exists():
+            self.db = pd.read_parquet(processed_path)
+
+            self.io_helper.logger.info(
+                f"Loaded existing parquet file for {raw_path.name} from {processed_path}"
+            )
+        else:
+            # Read the CSV file into a DataFrame
+            self.db = pd.read_csv(
+                raw_path,
+                dtype={
+                    "hosting": bool,
+                    "proxy":   bool,
+                    "tor":     bool,
+                    "relay":   bool,
+                    "vpn":     bool,
+                },
+            )
+
+            # Save as parquet for faster future access
+            self.db.to_parquet(path=processed_path, compression="snappy")
+
+            self.io_helper.logger.info(
+                f"Saved parquet file for {raw_path.name} to {processed_path}"
+            )
+
+        # Build PyTricia trees
+        self.trie4 = PyTricia(32)
+        self.trie6 = PyTricia(128)
+        for idx, net in self.db["network"].items():
+            nw = ip_network(net, strict=False)
+            trie = self.trie4 if nw.version == 4 else self.trie6
+            trie[str(nw)] = idx
+
+        self.io_helper.logger.info(
+            f"Loaded {len(self.db)} records into PyTricia trees."
+        )
+
+    def lookup(
+        self,
+        addr: IPv4Address | IPv6Address | str,
+    ) -> pd.Series | None:
+        """
+        Lookup the privacy information for a given IP address.
+
+        Args:
+            addr (IPv4Address | IPv6Address | str):
+                The IP address to look up.
+
+        Returns:
+            ret (pd.Series | None):
+                A pandas Series containing the privacy information for the given IP address,
+                or None if the address is not found in the dataset.
+        """
+
+        ip = ip_address(addr) if isinstance(addr, str) else addr
+        trie = self.trie4 if ip.version == 4 else self.trie6
+        try:
+            idx = trie.get(str(ip))
+        except KeyError:
+            return None
+        return self.db.loc[idx] if idx is not None else None

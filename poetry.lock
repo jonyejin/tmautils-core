@@ -925,6 +925,17 @@ files = [
 six = ">=1.5"
 
 [[package]]
+name = "pytricia"
+version = "1.0.2"
+description = "An efficient IP address storage and lookup module for Python."
+optional = false
+python-versions = "*"
+files = [
+    {file = "pytricia-1.0.2-cp37-cp37m-macosx_10_9_x86_64.whl", hash = "sha256:ee49486fd0726eca7d2219029bef162652ca80dfb07f7eedadc6cfc5f3559231"},
+    {file = "pytricia-1.0.2.tar.gz", hash = "sha256:7f6c0afdce55a1b7651a1a56d8b621c228a211dd23f3f8c5c1fdec3af2c19b15"},
+]
+
+[[package]]
 name = "pytz"
 version = "2025.2"
 description = "World timezone definitions, modern and historical"
@@ -1194,4 +1205,4 @@ propcache = ">=0.2.1"
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "6575a12b8c756ee391017cd3b1e688bc57281dbfa95ae9a5b1f299c3c46412a0"
+content-hash = "bcd8d24dc3e96909fd71ee76f6d71c2bbaab7643bcb071bad4857928cf5c6617"
