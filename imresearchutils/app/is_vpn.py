@@ -1,6 +1,7 @@
 from imresearchutils.common import *
 import pandas as pd
 import requests
+import sqlite3
 from pytricia import PyTricia
 
 
@@ -305,6 +306,8 @@ class IpInfoPrivacyUtil:
             See the IOHelper class for more details.
     """
 
+    CSV_CHUNK_SIZE = 50_000
+
     def __init__(
         self,
         ipinfo_privacy_dir: Path,
@@ -318,14 +321,12 @@ class IpInfoPrivacyUtil:
             data_dir=data_dir,
             **kwargs,
         )
-
-        self._load_data(date)
-
+        self._init_db(date)
         self.io_helper.logger.info(
             f"Initialized IpInfoPrivacyUtil with raw directory: {self.io_helper.raw}"
         )
 
-    def _load_data(self, date: str | None = None):
+    def _init_db(self, date: str | None = None):
         if date is not None:
             # Verify that the date is in the ISO format 'YYYY-MM-DD'
             try:
@@ -357,44 +358,79 @@ class IpInfoPrivacyUtil:
             data_files.sort(key=lambda x: x.stem.split('.')[-1], reverse=True)
             raw_path = data_files[0]
 
-        # See if we already processed this file
-        processed_path = self.io_helper.processed / f"{raw_path.name}.parquet"
-        if processed_path.exists():
-            self.db = pd.read_parquet(processed_path)
+        # Initialize and open the database
+        self.db_path = self.io_helper.processed / f"{raw_path.stem}.sqlite3"
+        is_initialized = self.db_path.exists()
+        self.db_conn = sqlite3.connect(self.db_path)
+        self.db_conn.execute("PRAGMA journal_mode=WAL;")  # Write-Ahead Logging
 
+        if is_initialized:
             self.io_helper.logger.info(
-                f"Loaded existing parquet file for {raw_path.name} from {processed_path}"
+                f"Database already exists at {self.db_path}, skipping initialization."
             )
-        else:
-            # Read the CSV file into a DataFrame
-            self.db = pd.read_csv(
-                raw_path,
-                dtype={
-                    "hosting": bool,
-                    "proxy":   bool,
-                    "tor":     bool,
-                    "relay":   bool,
-                    "vpn":     bool,
-                },
+            return
+
+        # Create the table
+        self.db_conn.execute("""
+        CREATE TABLE ipinfo_privacy (
+            version           INTEGER    NOT NULL,
+            prefix_length     INTEGER    NOT NULL,
+            network_start     BLOB       NOT NULL,
+            network_end       BLOB       NOT NULL,
+            hosting           BOOLEAN,
+            proxy             BOOLEAN,
+            tor               BOOLEAN,
+            relay             BOOLEAN,
+            vpn               BOOLEAN,
+            service           TEXT,
+            PRIMARY KEY (version, network_start, prefix_length)
+        );
+        """)
+
+        # Index network range for faster lookups
+        self.db_conn.execute("""
+        CREATE INDEX idx_version_range ON ipinfo_privacy (
+            version, network_start, network_end
+        );
+        """)
+
+        # Stream the CSV in chunks, compute numeric columns, insert
+        chunker = pd.read_csv(
+            raw_path,
+            dtype={
+                "hosting": bool,
+                "proxy":   bool,
+                "tor":     bool,
+                "relay":   bool,
+                "vpn":     bool,
+            },
+            chunksize=self.CSV_CHUNK_SIZE,
+        )
+        for df_chunk in chunker:
+            df_chunk: pd.DataFrame
+
+            net_objs = df_chunk.pop("network").map(lambda x: ip_network(x))
+            df_chunk["version"] = net_objs.map(lambda n: n.version)
+            df_chunk["prefix_length"] = net_objs.map(lambda n: n.prefixlen)
+            df_chunk["network_start"] = net_objs.map(
+                lambda n: n.network_address.packed
+            )
+            df_chunk["network_end"] = net_objs.map(
+                lambda n: n.broadcast_address.packed
             )
 
-            # Save as parquet for faster future access
-            self.db.to_parquet(path=processed_path, compression="snappy")
-
-            self.io_helper.logger.info(
-                f"Saved parquet file for {raw_path.name} to {processed_path}"
+            # Append to the database
+            df_chunk.to_sql(
+                "ipinfo_privacy",
+                self.db_conn,
+                if_exists="append",
+                index=False,
             )
 
-        # Build PyTricia trees
-        self.trie4 = PyTricia(32)
-        self.trie6 = PyTricia(128)
-        for idx, net in self.db["network"].items():
-            nw = ip_network(net, strict=False)
-            trie = self.trie4 if nw.version == 4 else self.trie6
-            trie[str(nw)] = idx
+        self.db_conn.commit()
 
         self.io_helper.logger.info(
-            f"Loaded {len(self.db)} records into PyTricia trees."
+            "Created and populated SQLite database at {self.db_path}."
         )
 
     def lookup(
@@ -415,9 +451,40 @@ class IpInfoPrivacyUtil:
         """
 
         ip = ip_address(addr) if isinstance(addr, str) else addr
-        trie = self.trie4 if ip.version == 4 else self.trie6
-        try:
-            idx = trie.get(str(ip))
-        except KeyError:
+        ip_blob = ip.packed
+
+        sql = """
+            SELECT
+                version, network_start, prefix_length,
+                hosting, proxy, tor, relay, vpn, service
+            FROM ipinfo_privacy
+            WHERE version = ?
+            AND network_start <= ?
+            AND network_end   >= ?
+            ORDER BY prefix_length DESC
+            LIMIT 1
+        """
+        cur = self.db_conn.execute(sql, (ip.version, ip_blob, ip_blob))
+        row = cur.fetchone()
+        if row is None:
             return None
-        return self.db.loc[idx] if idx is not None else None
+
+        (version, start_blob, prefix_length,
+         hosting, proxy, tor, relay, vpn, service) = row
+
+        start_int = int.from_bytes(start_blob, byteorder="big")
+        net = ip_network((start_int, prefix_length))
+
+        return pd.Series({
+            "version":        version,
+            "prefix_length":  prefix_length,
+            "network":        str(net),
+            "network_start":  net.network_address,
+            "network_end":    net.broadcast_address,
+            "service":        service,
+            "hosting":        bool(hosting),
+            "proxy":          bool(proxy),
+            "tor":            bool(tor),
+            "relay":          bool(relay),
+            "vpn":            bool(vpn),
+        })
