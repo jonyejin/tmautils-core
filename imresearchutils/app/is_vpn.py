@@ -412,6 +412,8 @@ class IpInfoPrivacyUtil:
             ret (pd.Series | None):
                 A pandas Series containing the privacy information for the given IP address,
                 or None if the address is not found in the dataset.
+                In original dataset, the columns are:
+                    - network, hosting, proxy, tor, relay, vpn, service
         """
 
         ip = ip_address(addr) if isinstance(addr, str) else addr
