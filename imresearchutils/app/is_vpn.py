@@ -448,6 +448,8 @@ class IpInfoPrivacyUtil:
             ret (pd.Series | None):
                 A pandas Series containing the privacy information for the given IP address,
                 or None if the address is not found in the dataset.
+                In original dataset, the columns are:
+                    - network, hosting, proxy, tor, relay, vpn, service
         """
 
         ip = ip_address(addr) if isinstance(addr, str) else addr
@@ -488,3 +490,29 @@ class IpInfoPrivacyUtil:
             "relay":          bool(relay),
             "vpn":            bool(vpn),
         })
+
+    def is_ip_vpn(
+        self,
+        addr: IPv4Address | IPv6Address | str,
+    ) -> tuple[bool, Optional[str]]:
+        """
+        Check if the given IP address is associated with a VPN.
+
+        Args:
+            addr (IPv4Address | IPv6Address | str):
+                The IP address to check.
+
+        Returns:
+            bool: True if the IP address is associated with a VPN, False otherwise.
+        """
+        ret = self.lookup(addr)
+        if ret is not None:
+            if ret["vpn"]:
+                # If 'service' is present, return it
+                if "service" in ret:
+                    return True, ret["service"]
+                return True, None
+        # If not found or not a VPN, return False
+        return False, None
+    
+    
