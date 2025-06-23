@@ -25,21 +25,49 @@ class IpInfoCarrierUtil:
 
     def _load_data(self, date: str | None = None):
         """
-        Load the data from the specified date.
-        :param date: Date string in 'YYYY-MM-DD' format. If None, uses the latest data.
+        Load the carrier IP data for a specific date (or the latest one available).
         """
-        if date is None:
-            date = self.io_helper.get_latest_date()
+        from ipaddress import ip_network
 
-        self.io_helper.logger.info(f"Loading data for date: {date}")
-        df = self.io_helper.load_data(date)
+        if date is not None:
+            try:
+                pd.to_datetime(date, format='%Y-%m-%d', errors='raise')
+            except ValueError:
+                self.io_helper.logger.error(f"Invalid date format: {date}. Expected 'YYYY-MM-DD'.")
+                raise
 
-        if df is None:
-            raise ValueError(f"No data found for date: {date}")
-        
-        # Convert network strings to ip_network objects for fast matching
-        df["network"] = df["network"].apply(ipaddress.ip_network)
+            raw_path = self.io_helper.raw / f"ipinfo_carrier.{date}.csv"
+            if not raw_path.exists():
+                self.io_helper.logger.error(f"Data file for date {date} not found: {raw_path}")
+                raise FileNotFoundError(f"Data file for date {date} not found.")
+        else:
+            data_files = list(self.io_helper.raw.glob("ipinfo_carrier.*.csv"))
+            if not data_files:
+                self.io_helper.logger.error("No ipinfo carrier data files found.")
+                raise FileNotFoundError("No ipinfo carrier data files found.")
+
+            data_files.sort(key=lambda f: f.stem.split('.')[-1], reverse=True)
+            raw_path = data_files[0]
+            date = raw_path.stem.split('.')[-1]
+
+        self.io_helper.logger.info(f"Loading carrier IP data from: {raw_path}")
+
+        # Load CSV
+        df = pd.read_csv(
+            raw_path,
+            dtype={
+                "name": "string",
+                "country": "string",
+                "mcc": "string",
+                "mnc": "string",
+            }
+        )
+
+        df["network"] = df["network"].apply(ip_network)
+
         self.data = df
+        self.io_helper.logger.info(f"Loaded {len(df)} carrier prefixes for date: {date}")
+
 
     def is_ip_carrier(self, ip: str) -> bool:
         """
@@ -57,7 +85,7 @@ class IpInfoCarrierUtil:
             self.io_helper.logger.warning(f"Invalid IP address format: {ip}")
             return False
 
-    def get_carrier_info(self, ip: str) -> dict | None:
+    def get_carrier_by_ip(self, ip: str) -> dict | None:
         """
         Return the carrier info for a given IP, if available.
         :param ip: IP address to check.
