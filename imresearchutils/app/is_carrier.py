@@ -69,7 +69,7 @@ class IpInfoCarrierUtil:
         self.io_helper.logger.info(f"Loaded {len(df)} carrier prefixes for date: {date}")
 
 
-    def is_ip_carrier(self, ip: str) -> bool:
+    def is_carrier(self, ip: str) -> bool:
         """
         Check if the given IP address is in the carrier IP prefix list.
         :param ip: IP address to check.
@@ -90,6 +90,9 @@ class IpInfoCarrierUtil:
         Return the carrier info for a given IP, if available.
         :param ip: IP address to check.
         :return: Dictionary of carrier info, or None if not found.
+
+        Why?
+            Sometimes we need to know the carrier information for a specific IP address.
         """
         try:
             ip_obj = ipaddress.ip_address(ip)
