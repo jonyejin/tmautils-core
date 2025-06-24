@@ -1,5 +1,6 @@
 import requests
-import pandas
+import pandas as pd
+import csv
 
 from imresearchutils.common import *
 
@@ -39,29 +40,142 @@ class ASdbCategoryUtil:
             **kwargs,
         )
 
-        url = f"https://asdb.stanford.edu/data/{year}-{month:02d}_categorized_ases.csv"
-        saved_file = self.io_helper.processed / url.split("/")[-1]
-        if not saved_file.exists():
+        data_url = f"https://asdb.stanford.edu/data/{year}-{month:02d}_categorized_ases.csv"
+        category_url = f"https://asdb.stanford.edu/data/NAICSlite.csv"
+
+        saved_data_file = self.io_helper.raw / data_url.split("/")[-1]
+        saved_category_file = self.io_helper.raw / category_url.split("/")[-1]
+
+        # Check if the files exist, if not, download them
+        for (url, saved_file) in [
+            (data_url, saved_data_file),
+            (category_url, saved_category_file)
+        ]:
+            if saved_file.exists():
+                continue
+
             try:
                 self.io_helper.logger.info(
-                    f"Downloading ASdb dataset from {url} to {saved_file}"
+                    f"Downloading ASdb data file from {url} to {saved_file}"
                 )
                 r = requests.get(url, timeout=5)
             except requests.exceptions.Timeout:
                 self.io_helper.logger.error(
-                    f"Could not download ASdb dataset from {url}, cannot proceed"
+                    f"Could not download ASdb data file from {url}, cannot proceed"
                 )
                 raise
             else:
                 saved_file.write_text(r.text)
-        self.db = pandas.read_csv(
-            saved_file,
-            index_col=0,
-            low_memory=False,
-        ).iloc[:, :6].to_dict(orient='index')
+
+        # Load the category dataset
+        self.category = self._build_category_dict(saved_category_file)
         self.io_helper.logger.info(
-            f"Loaded ASdb dataset from {saved_file}"
+            f"Loaded ASdb category dataset from {saved_category_file}"
         )
+
+        # Load raw data file
+        raw_df = pd.read_csv(saved_data_file, low_memory=False)
+
+        # 1) identify all Layer-1 and Layer-2 columns
+        l1_cols = [c for c in raw_df.columns if "Layer 1" in c]
+        l2_cols = [c for c in raw_df.columns if "Layer 2" in c]
+
+        # 2) melt into long form
+        df_l1 = raw_df.melt(
+            id_vars=["ASN"], value_vars=l1_cols,
+            var_name="cat_layer", value_name="layer1"
+        )
+        df_l2 = raw_df.melt(
+            id_vars=["ASN"], value_vars=l2_cols,
+            var_name="cat_layer", value_name="layer2"
+        )
+
+        # 3) extract category index (1..78)
+        df_l1["cat_idx"] = df_l1["cat_layer"].str.extract(
+            r"Category (\d+)"
+        )[0].astype(int)
+        df_l2["cat_idx"] = df_l2["cat_layer"].str.extract(
+            r"Category (\d+)"
+        )[0].astype(int)
+
+        # 4) merge on ASN + cat_idx
+        df_long = pd.merge(
+            df_l1.drop(columns="cat_layer"),
+            df_l2.drop(columns="cat_layer"),
+            on=["ASN", "cat_idx"],
+            how="left"
+        )
+
+        # 5) clean & convert
+        df_long = (
+            df_long
+            # drop rows where layer1 is missing or empty
+            .loc[lambda d: d["layer1"].notna() & (d["layer1"] != "")]
+            # strip "AS" prefix and convert to int
+            .assign(
+                asn=lambda d: d["ASN"].str.lstrip("AS").astype(int),
+                layer2=lambda d: d["layer2"]
+                .where(d["layer2"].notna() & (d["layer2"] != ""), None)
+            )
+            .loc[:, ["asn", "layer1", "layer2"]]
+            .reset_index(drop=True)
+        )
+
+        self.df = df_long.copy()
+
+        self.io_helper.logger.info(
+            f"Loaded ASdb dataset from {saved_data_file}"
+        )
+
+    def _build_category_dict(self, category_url: str | Path) -> dict[str, list[str]]:
+        """
+        Build a category dictinonary. Max Depth = 2.
+        Accessing non-existing category will throw an KeyError.
+
+        Returns:
+            category (dict[str, list[str]]):
+                Dictionary where keys are categories and values are lists of layers.
+
+                Example:
+                ```
+                { "Computer and Information Technology": ["Internet Service Provider (ISP)", "Phone Provider", ...], 
+                  "Media, Publishing, and Broadcasting": ["Online Music and Video Streaming Services", ...]
+                }
+                ```
+        """
+        category: dict[str, list[str | None]] = {}
+        try:
+            with open(category_url, 'r', newline='\n') as file:
+                category_reader = csv.reader(file, delimiter=',')
+                current_category = None
+                for index, row in enumerate(category_reader):
+                    if index == 0:
+                        # Skip header row
+                        continue
+                    else:
+                        name, level = row[:2]
+                        if level == "1":
+                            category[name] = []
+                            current_category = name
+                        elif level == "2":
+                            if name == "":
+                                category[current_category].append(None)
+                            else:
+                                category[current_category].append(name)
+            return category
+        except FileNotFoundError:
+            self.io_helper.logger.error(
+                f"Category file not found: {category_url}"
+            )
+            raise
+        except KeyError:
+            self.io_helper.logger.error(
+                f"Invalid category format in file: {category_url}"
+            )
+            raise
+        except Exception as e:
+            self.io_helper.logger.error(f"Error reading category file: {e}")
+            raise
 
     def get_full(
         self,
@@ -75,35 +189,26 @@ class ASdbCategoryUtil:
                 ASN to query.
 
         Returns:
-            catdict (dict[str, dict[str, str]]):
-            Dictionary of categories and layers for the given ASN.
+            asinfo (pd.DataFrame):
+                DataFrame containing the ASdb category information for the given ASN.
+                If the ASN is not found, an empty DataFrame is returned.
+
+                Example:
+                ```
+                6837    Computer and Information Technology   Internet Service Provider (ISP)  
+                6837    Computer and Information Technology   None
+                ```
         """
 
-        catdict_flat: dict[str, str | Any] = self.db.get(f"AS{asn}", {})
+        asinfo = self.df[self.df["asn"] == asn]
 
-        catdict: dict[str, dict[str, str]] = {}
-        for k, v in catdict_flat.items():
-            # Skip entries where the value is NaN
-            if pandas.isna(v):
-                continue
-
-            # Split the key into category and layer
-            try:
-                category, layer = k.split(" - ", 1)
-            except ValueError:
-                continue
-
-            if category not in catdict:
-                catdict[category] = {"Layer 1": None, "Layer 2": None}
-            catdict[category][layer] = v
-
-        return catdict
+        return asinfo
 
     def get(
         self,
         asn: int,
-        category: str = "Category 1",
-        layer: str = "Layer 1",
+        layer1: str | None = None,
+        layer2: str | None = None,
     ):
         """
         Get the ASdb category for a given ASN, category, and layer.
@@ -111,24 +216,47 @@ class ASdbCategoryUtil:
         Args:
             asn (int):
                 ASN to query.
-
-            category (str):
-                Category to query.
-                Default is "Category 1".
-
-            layer (str):
-                Layer to query.
-                Default is "Layer 1".
+            layer1 (str | None):
+                layer 1 to query.
+            layer2 (str | None):
+                layer 2 to query.
 
         Returns:
-            str | None:
-                The value of the specified category and layer for the given ASN.
-                Returns None if the ASN, category, or layer is not found.
+            pd.DataFrame:
+                DataFrame containing the ASdb category information for the given ASN, layer 1, and layer 2.
+                If the ASN is not found, an empty DataFrame is returned.
         """
 
-        catdict = self.get_full(asn)
-        if category not in catdict:
-            return None
-        if layer not in catdict[category]:
-            return None
-        return catdict[category][layer]
+        asninfo = self.get_full(asn)
+        if layer1 is not None:
+            asninfo = asninfo[asninfo["layer 1"] == layer1]
+        if layer2 is not None:
+            asninfo = asninfo[asninfo["layer 2"] == layer2]
+        return asninfo
+
+    def find_ases_in_category(
+        self,
+        layer1_category: str,
+        layer2_category: Optional[str] = None,
+    ) -> list[int]:
+        """
+        Return all ASNs matching the given primary and (optional) secondary category.
+
+        Args:
+            layer1_category (str): Name of the Layer-1 category to match.
+            layer2_category (Optional[str]): Name of the Layer-2 category to match (if any).
+
+        Returns:
+            df (pd.DataFrame):
+            DataFrame containing the ASNs that match the given categories.
+            If no ASNs match, an empty DataFrame is returned.
+        """
+        # Filter by layer1
+        df_filtered = self.df[self.df["layer1"] == layer1_category]
+
+        # If a specific layer2 is requested, filter further
+        if layer2_category is not None:
+            df_filtered = df_filtered[df_filtered["layer2"] == layer2_category]
+
+        # Extract unique ASNs
+        return df_filtered.drop_duplicates()
