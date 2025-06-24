@@ -1,6 +1,11 @@
 from enum import Enum
+from typing import Union, Any, Optional, Callable
+from ipaddress import IPv4Address, IPv6Address
+
 from dataclasses import dataclass
 from tldextract import extract
+
+IPAddress = Union[IPv4Address, IPv6Address]
 
 
 class IPVersion(Enum):

@@ -7,6 +7,8 @@ from pathlib import Path
 from logging import Logger
 from contextlib import contextmanager
 
+from .utils import try_convert_ip
+
 
 # Context-manager to locally register adapters/converters
 @contextmanager
@@ -111,11 +113,10 @@ class SqliteTable:
     # (for ease and performance)
     SQLITE3_CONVERTERS: dict[str, Callable] = {
         "BOOL": lambda b: bool(int.from_bytes(b, byteorder='little')),
-        "IPADDR": lambda ip: ip_address(
-            ip.decode() if isinstance(ip, (bytes, bytearray)) else ip
-        ),
+        # Leave IP addresses as is, we will handle it ourselves later
+        "IPADDR": lambda ip: ip,
         # Just bytes -> str for timestamps (Pandas will handle the rest)
-        "TIMESTAMP": lambda ts: ts.decode() if isinstance(ts, (bytes, bytearray)) else ts,
+        "TIMESTAMP": lambda ts: ts.decode() if isinstance(ts, bytes) else ts,
     }
     PANDAS_DTYPE_MAP: dict[type, str] = {
         bool:   'boolean',
@@ -367,6 +368,7 @@ class SqliteTable:
             col_name for col_name, py_type in self.schema.items()
             if col_name in query_cols and self.PYTHON_TO_SQLITE[py_type] == "TIMESTAMP"
         ]
+
         # Identify columns which need to be converted to pandas dtypes
         dtype = {
             col_name: self.PANDAS_DTYPE_MAP[py_type]
@@ -382,6 +384,24 @@ class SqliteTable:
                 parse_dates=parse_dates,
                 dtype=dtype,
             )
+
+        # Post-process IP addresses if needed
+        if ip_cols := [
+            col_name for col_name, py_type in self.schema.items()
+            if col_name in query_cols and self.PYTHON_TO_SQLITE[py_type] == "IPADDR"
+        ]:
+            raw_ips = pd.unique(
+                pd.concat([df[col] for col in ip_cols], ignore_index=True)
+            )
+
+            # Build a mapping from raw IPs to converted IPAddress objects (or leave as is)
+            mapping = {}
+            for raw_ip in raw_ips:
+                mapping[raw_ip] = try_convert_ip(raw_ip)
+
+            # Apply the mapping to each IP column
+            for col in ip_cols:
+                df[col] = df[col].map(mapping)
 
         if self.logger:
             self.logger.info(
