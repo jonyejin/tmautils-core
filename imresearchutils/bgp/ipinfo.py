@@ -25,8 +25,14 @@ class IPInfoLiteUtil:
             saved_csv_path: Path,
             fields: list[str] | None = None,
     ):
-        # Load raw data file
-        self.fields = fields if fields is not None else self.DEFAULT_FIELDS
+        fields = fields if fields is not None else list(self.DEFAULT_FIELDS)
+
+        # Ensure "network" is in the list exactly once
+        if "network" not in fields:
+            fields.append("network")
+
+        self.fields = fields
+
         self.df = pd.read_csv(saved_csv_path,
                               usecols=self.fields,
                               low_memory=False)
