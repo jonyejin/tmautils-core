@@ -1,7 +1,31 @@
 from functools import wraps
-from ipaddress import ip_address
-
+from ipaddress import ip_address, ip_network
 from .types import *
+
+import pandas as pd
+import requests
+from pytricia import PyTricia
+
+
+class LongestPrefixSearch:
+    def __init__(self, db):
+        self.trie4 = PyTricia(32)
+        self.trie6 = PyTricia(128)
+        self.db = db
+
+        for idx, net in self.db["network"].items():
+            nw = ip_network(net, strict=False)
+            trie = self.trie4 if nw.version == 4 else self.trie6
+            trie[str(nw)] = idx
+
+    def __getitem__(self, addr):
+        ip = ip_address(addr) if isinstance(addr, str) else addr
+        trie = self.trie4 if ip.version == 4 else self.trie6
+        try:
+            idx = trie.get(str(ip))
+        except KeyError:
+            return None
+        return (idx, self.db.loc[idx]) if idx is not None else None
 
 
 def maybe_apply(fn: Callable):
@@ -16,6 +40,7 @@ def maybe_apply(fn: Callable):
             return fn(x)
         except Exception:
             return x
+
     return wrapper
 
 
