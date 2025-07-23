@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 
 from imresearchutils.common import *
 from .types import *
+from .openwpm import OpenWpmCrawlUtil
 
 neterror_pattern = re.compile(
     r"Received neterror (?P<error_type>\w+) while executing command: "
@@ -53,6 +54,181 @@ class TrancoTopListUtil:
     @property
     def list_id(self):
         return self.tranco_list.list_id
+
+
+class PeriodicTrancoCrawlUtil:
+    """
+    A utility class for periodically crawling the Tranco top list using OpenWPM.
+
+    Args:
+        openwpm_path (Path):
+            Path to the OpenWPM installation directory.
+
+        data_dir (Path | None):
+            Base directory for data files.
+            If None, the current working directory will be used.
+
+        continue_only (bool):
+            If True, only resume incomplete crawls.
+            If False, resume incomplete crawls and start a new one.
+            Default is True.
+
+        top_count (int):
+            Number of top sites to crawl from the Tranco list.
+            Default is 100,000.
+
+        openwpm_args (dict):
+            Additional arguments to pass to the OpenWPM crawl utility.
+            See the OpenWpmCrawlUtil class for more details.
+
+        **kwargs (dict):
+            Additional arguments for IOHelper.
+            See the IOHelper class for more details.
+    """
+
+    def __init__(
+        self,
+        openwpm_path: Path,
+        data_dir: Path | None = None,
+        continue_only: bool = True,
+        top_count: int = 100000,
+        openwpm_args: dict = {},
+        **kwargs,
+    ):
+        self.openwpm_path = openwpm_path
+        self.openwpm_args = openwpm_args
+        self.data_dir = data_dir
+        self.top_count = top_count
+
+        self.io_helper = IOHelper(
+            module_name=self.__class__.__name__,
+            data_dir=data_dir,
+            **kwargs,
+        )
+
+        # Resume incomplete crawls
+        self.resume_crawls()
+
+        # If not continuing, start a new crawl
+        if not continue_only:
+            self.crawl()
+
+    def crawl(self):
+        """
+        Start a new crawl using the latest Tranco top list.
+
+        This method fetches the latest Tranco list, merges it with any previous
+        crawls, and initiates an OpenWPM crawl with the combined list.
+        """
+
+        from datetime import datetime
+
+        self.io_helper.logger.info("Starting new crawl")
+
+        prev_sites = []
+
+        # Start with old list of sites if a previous crawl exists
+        openwpm_dir = self.data_dir / OpenWpmCrawlUtil.__name__
+        if openwpm_dir.exists():
+            prev_crawls = sorted(
+                [d for d in openwpm_dir.glob("*") if d.is_dir()],
+                key=lambda d: d.name,
+            )
+            if prev_crawls:
+                last_crawl = prev_crawls[-1]
+                prev_util = OpenWpmCrawlUtil(
+                    openwpm_path=self.openwpm_path,
+                    crawl_id=last_crawl.name,
+                    data_dir=self.data_dir,
+                    **self.openwpm_args,
+                )
+                prev_sites = prev_util.sites
+                self.io_helper.logger.info(
+                    f"Starting with {len(prev_sites)} sites from last crawl"
+                )
+
+        # Fetch the latest Tranco top list
+        tranco_util = TrancoTopListUtil(
+            data_dir=self.data_dir,
+            n_top_sites=self.top_count,
+        )
+
+        # Merge previous sites with the latest Tranco list
+        seen = set(prev_sites)
+        merged = prev_sites + [s for s in tranco_util.list if s not in seen]
+        self.io_helper.logger.info(
+            f"Total sites to crawl: {len(merged)} "
+            f"(including {len(prev_sites)} from previous crawls)"
+        )
+
+        # Create OpenWPM crawl utility with merged sites
+        openwpm_util = OpenWpmCrawlUtil(
+            openwpm_path=self.openwpm_path,
+            crawl_id=datetime.now().date().isoformat(),
+            sites=merged,
+            data_dir=self.data_dir,
+            **self.openwpm_args,
+        )
+
+        # Write metadata about the crawl
+        openwpm_util.io_helper.raw.joinpath("tranco_list_id.txt").write_text(
+            tranco_util.list_id
+        )
+        openwpm_util.io_helper.raw.joinpath("tranco_list.txt").write_text(
+            "\n".join(tranco_util.list) + "\n"
+        )
+
+        # Start the crawl
+        self.io_helper.logger.info(
+            f"Starting OpenWPM crawl with id {openwpm_util.crawl_id} "
+            f"and {len(openwpm_util.sites)} sites."
+        )
+        openwpm_util.crawl()
+        self.io_helper.logger.info(
+            f"Crawl completed for {openwpm_util.crawl_id} with "
+            f"{len(openwpm_util.sites)} sites."
+        )
+
+    def resume_crawls(self):
+        """
+        Resume any incomplete OpenWPM crawls from previous runs.
+        """
+
+        self.io_helper.logger.info("Resuming incomplete crawls")
+
+        openwpm_dir = self.data_dir / OpenWpmCrawlUtil.__name__
+        if not openwpm_dir.exists():
+            # No previous crawls to resume
+            self.io_helper.logger.info(
+                "No previous OpenWPM crawls found, nothing to resume."
+            )
+            return
+
+        crawl_dirs = [d for d in openwpm_dir.glob("*") if d.is_dir()]
+        for crawl_dir in crawl_dirs:
+            openwpm_util = OpenWpmCrawlUtil(
+                openwpm_path=self.openwpm_path,
+                crawl_id=crawl_dir.name,
+                data_dir=self.data_dir,
+                **self.openwpm_args,
+            )
+
+            if openwpm_util.is_crawl_done():
+                self.io_helper.logger.info(
+                    f"Crawl for {crawl_dir.name} is already done."
+                )
+                continue
+
+            self.io_helper.logger.info(
+                f"Resuming crawl for {openwpm_util.crawl_id} with "
+                f"{len(openwpm_util.sites)} sites."
+            )
+
+            openwpm_util.crawl()
+
+            self.io_helper.logger.info(
+                f"Crawl for {crawl_dir.name} completed."
+            )
 
 
 class TrancoProcessUtil:
