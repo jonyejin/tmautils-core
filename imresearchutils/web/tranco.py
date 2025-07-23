@@ -1,10 +1,6 @@
 import sqlite3
-import logging
 import re
 from urllib.parse import urlparse
-
-from dataclasses import dataclass
-from dataclasses_json import DataClassJsonMixin
 
 from imresearchutils.common import *
 from .types import *
@@ -15,297 +11,48 @@ neterror_pattern = re.compile(
 )
 
 
-@dataclass
-class CrawlProgress(DataClassJsonMixin):
-    chunks_done: int = 0
-
-
-class TrancoCrawlUtil:
-    """
-    A utility class for crawling a Tranco list using OpenWPM.
-
-    Args:
-        openwpm_path (Path):
-            Path to the OpenWPM installation directory.
-
-        tranco_list_id (str | None):
-            ID of the Tranco list to crawl.
-            If None, the latest list will be used.
-
-        data_dir (Path | None):
-            Base directory for data files.
-            If None, the current working directory will be used.
-
-        repeat (int):
-            Repetition number for the crawl.
-            Used to create a unique instance name for the IOHelper.
-            Default is 1.
-
-        n_top_sites (int):
-            Number of top sites to crawl from the Tranco list.
-            Default is 100000.
-
-        n_browsers (int):
-            Number of browsers to use for crawling.
-            Default is 10.
-
-        n_click_internal_links (int):
-            Number of internal links to click on main page.
-            Default is 5.
-
-        browser_sleep_dur (int):
-            Sleep duration (in seconds) passed to BrowseCommand.
-            Default is 3.
-
-        n_sites_chunk (int):
-            Number of sites to crawl in each chunk.
-            Default is 100.
-
-        max_retry_per_chunk (int):
-            Maximum number of retries for each chunk.
-            Default is 3.
-
-        **kwargs (dict):
-            Additional arguments for IOHelper.
-            See the IOHelper class for more details.
-    """
-
+class TrancoTopListUtil:
     def __init__(
         self,
-        openwpm_path: Path,
-        tranco_list_id: str | None = None,
+        date: str | None = None,
+        list_id: str | None = None,
+        subdomains: bool = False,
+        full: bool = False,
         data_dir: Path | None = None,
-        repeat: int = 1,
         n_top_sites: int = 100000,
-        n_browsers: int = 10,
-        n_click_internal_links: int = 5,
-        browser_sleep_dur: int = 3,
-        n_sites_chunk: int = 100,
-        max_retry_per_chunk: int = 3,
         **kwargs,
     ):
-        import sys
         import tranco
 
-        # Update sys.path to include the OpenWPM path
-        self.openwpm_path = openwpm_path.expanduser().resolve()
-        if not self.openwpm_path.is_dir():
-            raise ValueError(
-                f"Provided path {self.openwpm_path} is not a valid directory."
-            )
-        if str(self.openwpm_path) not in sys.path:
-            sys.path.insert(0, str(self.openwpm_path))
-
-        # Import OpenWPM modules
-        openwpm_modules = [
-            ("openwpm.command_sequence", "CommandSequence"),
-            ("openwpm.commands.browser_commands", "BrowseCommand"),
-            ("openwpm.config", "BrowserParams"),
-            ("openwpm.config", "ManagerParams"),
-            ("openwpm.storage.sql_provider", "SQLiteStorageProvider"),
-            ("openwpm.task_manager", "TaskManager"),
-        ]
-        for module, attr in openwpm_modules:
-            setattr(self, attr, import_module_attr(module, attr))
-
         self.n_top_sites = n_top_sites
-        self.n_browsers = n_browsers
-        self.n_click_internal_links = n_click_internal_links
-        self.browser_sleep_dur = browser_sleep_dur
-        self.n_sites_chunk = n_sites_chunk
-        self.n_chunks = n_top_sites // n_sites_chunk
-        self.max_retry_per_chunk = max_retry_per_chunk
 
-        # Set up Tranco list
-        if data_dir is not None:
-            cache_dir = data_dir / ".tmp" / "tranco_cache"
-            cache_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            cache_dir = None
-        self.tranco_list = tranco.Tranco(
-            cache_dir=cache_dir,
-        ).list(list_id=tranco_list_id)
-        self.top_sites: list[str] = [
-            f"http://{x}" for x in self.tranco_list.top(self.n_top_sites)
-        ]
-
-        # Set up data directory
-        instance_name = (
-            self.tranco_list.list_id if repeat == 1 else f"{self.tranco_list.list_id}_{repeat}"
-        )
         self.io_helper = IOHelper(
             module_name=self.__class__.__name__,
-            instance_name=instance_name,
             data_dir=data_dir,
             **kwargs,
         )
+
+        self.tranco_list = tranco.Tranco(
+            cache_dir=self.io_helper.raw,
+        ).list(
+            date=date,
+            list_id=list_id,
+            subdomains=subdomains,
+            full=full,
+        )
+
         self.io_helper.logger.info(
-            f"Using Tranco list with id {self.tranco_list.list_id} "
+            f"Obtained Tranco list with id {self.tranco_list.list_id} "
             f"and date {self.tranco_list.date}"
         )
 
-        # Load progress if resuming
-        self.progress_path = self.io_helper.raw / "progress"
-        if self.progress_path.exists():
-            self.progress = CrawlProgress.from_json(
-                self.progress_path.read_text()
-            )
-            self.io_helper.logger.info(
-                f"Resuming crawl: Tranco list id {self.tranco_list.list_id}"
-            )
-        else:
-            self.progress = CrawlProgress()
+    @property
+    def list(self):
+        return [f"http://{x}" for x in self.tranco_list.top(self.n_top_sites)]
 
-        # Remove incomplete crawl database if it exists
-        for extension in ('sqlite', 'sqlite-journal'):
-            self.io_helper.raw.joinpath(
-                f"crawl_chunk_{self.progress.chunks_done}.{extension}"
-            ).unlink(missing_ok=True)
-
-        self.openwpm_log_path = (
-            self.io_helper.raw / f"{self.tranco_list.list_id}.log"
-        )
-        self.log_pos = 0
-        self.io_helper.logger.info(
-            "Initialization complete."
-        )
-
-    def crawl_chunk(
-        self,
-        chunknum: int,
-    ):
-        """
-        Crawl a chunk of sites from the Tranco list.
-
-        Args:
-            chunknum (int):
-                Chunk number to crawl.
-        """
-
-        site_ranks = range(
-            chunknum*self.n_sites_chunk,
-            (chunknum+1)*self.n_sites_chunk
-        )
-        sites_to_crawl = list(zip(
-            site_ranks,
-            [self.top_sites[s] for s in site_ranks]
-        ))
-
-        db_path = self.io_helper.raw / f"crawl_chunk_{chunknum}.sqlite"
-
-        for trynum in range(self.max_retry_per_chunk):
-            if trynum > 0:
-                self.io_helper.logger.warning(
-                    f"Crawling failed for {sites_to_crawl}, retrying"
-                )
-
-            num_browsers = min(self.n_browsers, len(sites_to_crawl))
-            manager_params = self.ManagerParams(
-                num_browsers=num_browsers,
-                data_directory=self.io_helper.raw,
-                log_path=self.openwpm_log_path,
-                process_watchdog=True,
-                memory_watchdog=True,
-            )
-            browser_params = [
-                self.BrowserParams(
-                    display_mode="xvfb",
-                    http_instrument=True,
-                    dns_instrument=True,
-                    bot_mitigation=True,
-                    cookie_instrument=False,
-                )
-                for _ in range(num_browsers)
-            ]
-
-            # Do the crawling
-            with self.TaskManager(
-                manager_params,
-                browser_params,
-                self.SQLiteStorageProvider(db_path),
-                None,
-                logger_kwargs={
-                    'log_level_console': logging.CRITICAL,
-                    'log_level_file': logging.INFO,
-                }
-            ) as task_manager:
-                for (site_rank, site) in sites_to_crawl:
-                    self.io_helper.logger.info(
-                        f"Starting crawl for site {site} "
-                        f"({site_rank} out of {self.n_top_sites})"
-                    )
-                    command_sequence = self.CommandSequence(
-                        site,
-                        site_rank=site_rank,
-                        reset=True,
-                    )
-                    command_sequence.append_command(
-                        self.BrowseCommand(
-                            url=site,
-                            num_links=self.n_click_internal_links,
-                            sleep=self.browser_sleep_dur,
-                        ),
-                        timeout=30,
-                    )
-                    task_manager.execute_command_sequence(command_sequence)
-
-            # Find sites that failed to crawl
-            missing_sites: set[str] = set()
-            with sqlite3.connect(db_path) as db_conn:
-                missing_sites.update(map(
-                    lambda x: TrancoSiteCrawlResult(*x).fqdn.name,
-                    db_conn.execute(
-                        """
-                        SELECT sv.site_rank, sv.site_url, sv.visit_id FROM site_visits sv
-                        WHERE sv.visit_id NOT IN (SELECT DISTINCT visit_id FROM dns_responses)
-                        ORDER BY sv.site_rank
-                        """
-                    ).fetchall()
-                ))
-            self.io_helper.logger.info(
-                f"Sites missing from database after crawl: {missing_sites}"
-            )
-
-            # Do not retry sites that failed due to network problems
-            neterrors = set()
-            with open(self.openwpm_log_path) as log:
-                log.seek(self.log_pos)
-                for line in log:
-                    if (m := neterror_pattern.search(line)) is not None:
-                        neterrors.add(m.groupdict()['url'])
-                self.log_pos = log.tell()
-            self.io_helper.logger.info(
-                f"Sites with network errors: {neterrors}. "
-                f"Not retrying these sites."
-            )
-            missing_sites.difference_update(neterrors)
-
-            # Update set of sites to retry
-            sites_to_crawl = list(filter(
-                lambda s: s[1][7:] in missing_sites,
-                sites_to_crawl
-            ))
-            if not sites_to_crawl:
-                break
-
-    def crawl(self):
-        """
-        Crawl the Tranco list in chunks.
-        """
-
-        for chunknum in range(self.progress.chunks_done, self.n_chunks):
-            self.io_helper.logger.info(
-                f"Starting crawl for chunk {chunknum}"
-            )
-            try:
-                self.crawl_chunk(chunknum)
-            except Exception as e:
-                self.io_helper.logger.error(
-                    f"Error crawling chunk {chunknum}: {repr(e)}"
-                )
-                raise
-            self.progress.chunks_done += 1
-            self.progress_path.write_text(self.progress.to_json())
+    @property
+    def list_id(self):
+        return self.tranco_list.list_id
 
 
 class TrancoProcessUtil:
@@ -344,7 +91,7 @@ class TrancoProcessUtil:
             self.tranco_list_id if repeat == 1 else f"{self.tranco_list_id}_{repeat}"
         )
         self.io_helper = IOHelper(
-            module_name=TrancoCrawlUtil.__name__,
+            module_name=self.__class__.__name__,
             instance_name=instance_name,
             data_dir=data_dir,
             **kwargs,
@@ -362,6 +109,15 @@ class TrancoProcessUtil:
             f"Initialized TrancoProcessUtil with list id {self.tranco_list_id} "
             f"and {self.n_chunks} chunks"
         )
+
+    def get_db_cursor(self, chunk_num: int):
+        db_path = self.io_helper.raw / f"crawl_chunk_{chunk_num}.sqlite"
+        if not db_path.exists():
+            raise ValueError(
+                f"Chunk {chunk_num} does not exist in {self.io_helper.raw}"
+            )
+
+        return sqlite3.connect(db_path).cursor()
 
     def load_db(
         self,
@@ -389,7 +145,7 @@ class TrancoProcessUtil:
                 f"Chunk {chunk_num} does not exist"
             )
 
-        sites: dict[FQDN, TrancoSiteCrawlResult] = None
+        sites: dict[FQDN, OpenWpmSiteCrawlResult] = None
         processed_path = (
             self.io_helper.processed / f"{chunk_path.name}.processed"
         )
@@ -408,10 +164,10 @@ class TrancoProcessUtil:
                 )
 
         # If we are here, we need to process the chunk
-        cursor = sqlite3.connect(chunk_path).cursor()
+        cursor = self.get_db_cursor(chunk_num)
         sites = {
             s.fqdn: s for s in map(
-                lambda x: TrancoSiteCrawlResult(*x),
+                lambda x: OpenWpmSiteCrawlResult(*x),
                 cursor.execute(
                     """
                     SELECT sv.site_rank, sv.site_url, sv.visit_id FROM site_visits sv
@@ -431,7 +187,7 @@ class TrancoProcessUtil:
 
     def _parse_log_errors(self):
         self.errors: dict[str, str] = {}
-        with open(self.io_helper.raw / f"{self.tranco_list_id}.log") as log:
+        with open(self.io_helper.raw / "openwpm.log") as log:
             for line in log:
                 if (m := neterror_pattern.search(line)) is not None:
                     gd = m.groupdict()
@@ -448,7 +204,7 @@ class TrancoProcessUtil:
 
     def _populate_site_info(
         self,
-        site: TrancoSiteCrawlResult,
+        site: OpenWpmSiteCrawlResult,
         cursor: sqlite3.Cursor
     ):
         site.root_page_url = self._get_root_page_url(site, cursor)
@@ -488,7 +244,7 @@ class TrancoProcessUtil:
 
     def _get_root_page_url(
         self,
-        site: TrancoSiteCrawlResult,
+        site: OpenWpmSiteCrawlResult,
         cursor: sqlite3.Cursor
     ):
         """
@@ -528,7 +284,7 @@ class TrancoProcessUtil:
 
     def _get_root_page_url_walk(
         self,
-        site: TrancoSiteCrawlResult,
+        site: OpenWpmSiteCrawlResult,
         cursor: sqlite3.Cursor
     ):
         """
