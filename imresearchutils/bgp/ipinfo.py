@@ -45,9 +45,10 @@ class IPInfoLiteUtil:
             addr: IPv4Address | IPv6Address | str,
             fields: list[str] | None = None,
     ):
+        # returns DataFrame with given fields
         result = self.longestPrefixSearch[addr]
         if result is None:
             return None
         else:
             idx, record = result
-            return self.df.loc[idx, fields]
+            return self.df.loc[[idx], fields]
