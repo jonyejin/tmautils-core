@@ -90,6 +90,7 @@ class SqliteTable:
     SQLITE3_ADAPTERS: dict[Type[Any], Callable] = {
         # Boolean
         bool: lambda b: int(b),
+        np.bool_: lambda b: int(b),
 
         # IP Addresses
         IPv4Address: lambda ip: ip.packed,
@@ -112,7 +113,6 @@ class SqliteTable:
     # SQLite type -> Python type conversion is split between SQLite3 and pandas
     # (for ease and performance)
     SQLITE3_CONVERTERS: dict[str, Callable] = {
-        "BOOL": lambda b: bool(int.from_bytes(b, byteorder='little')),
         # Leave IP addresses as is, we will handle it ourselves later
         "IPADDR": lambda ip: ip,
         # Just bytes -> str for timestamps (Pandas will handle the rest)

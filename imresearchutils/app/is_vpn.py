@@ -2,7 +2,6 @@ from imresearchutils.common import *
 import pandas as pd
 import requests
 import sqlite3
-from pytricia import PyTricia
 
 
 class VpnIpAz0:
@@ -307,6 +306,7 @@ class IpInfoPrivacyUtil:
     """
 
     CSV_CHUNK_SIZE = 50_000
+    CACHE_KB_DEFAULT = 256_000
 
     def __init__(
         self,
@@ -362,6 +362,7 @@ class IpInfoPrivacyUtil:
         self.db_path = self.io_helper.processed / f"{raw_path.stem}.sqlite3"
         is_initialized = self.db_path.exists()
         self.db_conn = sqlite3.connect(self.db_path)
+        self.db_conn.execute(f"PRAGMA cache_size=-{self.CACHE_KB_DEFAULT};")
         self.db_conn.execute("PRAGMA journal_mode=WAL;")  # Write-Ahead Logging
 
         if is_initialized:
@@ -371,6 +372,9 @@ class IpInfoPrivacyUtil:
             return
 
         # Create the table
+        self.io_helper.logger.info(
+            f"Populating SQLite database at {self.db_path}..."
+        )
         self.db_conn.execute("""
         CREATE TABLE ipinfo_privacy (
             version           INTEGER    NOT NULL,
@@ -514,5 +518,3 @@ class IpInfoPrivacyUtil:
                 return True, None
         # If not found or not a VPN, return False
         return False, None
-    
-    

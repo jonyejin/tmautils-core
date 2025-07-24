@@ -30,23 +30,38 @@ def try_convert_ip(ip: Union[str, bytes, IPAddress]) -> Union[str, bytes, IPAddr
     if isinstance(ip, (IPv4Address, IPv6Address)):
         return ip
 
-    # If input is a bytes object, try to decode it
-    # This is useful for cases where the input might be a byte string representation of an IP
-    if isinstance(ip, bytes):
-        try:
-            ip = ip.decode()
-        except UnicodeDecodeError:
-            pass
-
-    # If raw bytes OR string, ip_address can directly handle it
+    # If **raw** bytes OR string, ip_address can directly handle it
     if isinstance(ip, (bytes, str)):
         try:
             return ip_address(ip)
         except ValueError:
             pass
 
+    # If input is the byte string representation of an IP, decode and try again
+    if isinstance(ip, bytes):
+        try:
+            return ip_address(ip.decode())
+        except (UnicodeDecodeError, ValueError):
+            pass
+
     # Give up
     return ip
+
+
+def is_ipv4(ip: Union[str, bytes, IPAddress]) -> bool:
+    """
+    Check if the input is an IPv4 address.
+    """
+    ip_obj = try_convert_ip(ip)
+    return isinstance(ip_obj, IPv4Address)
+
+
+def is_ipv6(ip: Union[str, bytes, IPAddress]) -> bool:
+    """
+    Check if the input is an IPv6 address.
+    """
+    ip_obj = try_convert_ip(ip)
+    return isinstance(ip_obj, IPv6Address)
 
 
 def is_internal_flow(src_ip: IPAddress, dst_ip: IPAddress):
