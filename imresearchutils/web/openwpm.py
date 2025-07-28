@@ -153,7 +153,8 @@ class OpenWpmCrawlUtil:
         self.log_pos = 0
 
         self.io_helper.logger.info(
-            f"OpenWPM crawl utility initialized with crawl ID: {self.crawl_id}"
+            f"OpenWPM crawl utility initialized with crawl ID: {self.crawl_id}, "
+            f"module directory: {self.io_helper.module_dir}"
         )
 
     def crawl_chunk(

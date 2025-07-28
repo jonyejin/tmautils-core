@@ -80,7 +80,7 @@ class IPApiBatchUtil:
         self._load_cache()
 
         self.io_helper.logger.info(
-            f"Initialized IPApiBatchUtil with cache directory: {self.io_helper.processed}"
+            f"Initialized IPApiBatchUtil with module directory: {self.io_helper.module_dir}"
         )
 
     @staticmethod

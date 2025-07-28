@@ -5,4 +5,5 @@ from .types import *
 from .utils import *
 from .io import IOHelper
 from .io import import_module_attr
-from .sqlite3_storage import SqliteDatabase, SqliteTable
+from .storage.sqlite3_storage import SqliteDatabase, SqliteTable
+from .storage.sqlite3_helpers import SqliteLpmTrieHelper

@@ -21,7 +21,7 @@ class IpInfoCarrierUtil:
         self._load_data(date)
 
         self.io_helper.logger.info(
-            f"Initialized IpInfoCarrierUtil with raw directory: {self.io_helper.raw}"
+            f"Initialized IpInfoCarrierUtil with module directory: {self.io_helper.module_dir}"
         )
 
     def _load_data(self, date: str | None = None):

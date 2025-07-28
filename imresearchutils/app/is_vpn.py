@@ -1,7 +1,6 @@
 from imresearchutils.common import *
 import pandas as pd
 import requests
-import sqlite3
 
 
 class VpnIpAz0:
@@ -34,7 +33,7 @@ class VpnIpAz0:
         self._download_current_file()
 
         self.io_helper.logger.info(
-            f"Initialized VpnIPAz0 with raw directory: {self.io_helper.raw}"
+            f"Initialized VpnIPAz0 with module directory: {self.io_helper.module_dir}"
         )
 
     def _download_current_file(self):
@@ -184,7 +183,7 @@ class ListsVpnX4BNet:
         self._load_dataframes()
 
         self.io_helper.logger.info(
-            f"Initialized ListsVpnX4BNet with raw directory: {self.io_helper.raw}"
+            f"Initialized ListsVpnX4BNet with module directory: {self.io_helper.module_dir}"
         )
 
     def _download_lists(self) -> None:
@@ -321,16 +320,61 @@ class IpInfoPrivacyUtil:
             data_dir=data_dir,
             **kwargs,
         )
-        self._init_db(date)
-        self.io_helper.logger.info(
-            f"Initialized IpInfoPrivacyUtil with raw directory: {self.io_helper.raw}"
+
+        # Raw and processed paths
+        raw_path = self._locate_csv(date)
+        self.db_path = self.io_helper.processed / f"{raw_path.stem}.sqlite3"
+        is_initialized = self.db_path.exists()
+
+        # Initialize SqliteDatabase and register the table
+        self.db = SqliteDatabase(
+            self.db_path,
+            logger=self.io_helper.logger,
+        )
+        self.ipinfo_privacy_table: SqliteTable = self.db.register_table(
+            "ipinfo_privacy",
+            schema={
+                "version":          int,
+                "prefix_length":    int,
+                "network_start":    IPv6Address,
+                "network_end":      IPv6Address,
+                "hosting":          bool,
+                "proxy":            bool,
+                "tor":              bool,
+                "relay":            bool,
+                "vpn":              bool,
+                "service":          str,
+            },
+            qualifiers={
+                "version": "NOT NULL",
+                "prefix_length": "NOT NULL",
+                "network_start": "NOT NULL",
+                "network_end": "NOT NULL",
+            },
+            table_constraints=[
+                "PRIMARY KEY (version, network_start, prefix_length)"
+            ],
+            indices=[["version", "network_start", "network_end"]],
+        )
+        if not is_initialized:
+            self._populate_table(raw_path)
+
+        # Use SqliteLpmTrieHelper for fast lookups
+        self.lpm_helper = SqliteLpmTrieHelper(
+            self.db.path,
+            self.ipinfo_privacy_table,
+            logger=self.io_helper.logger,
         )
 
-    def _init_db(self, date: str | None = None):
+        self.io_helper.logger.info(
+            f"Initialized IpInfoPrivacyUtil with module directory: {self.io_helper.module_dir}"
+        )
+
+    def _locate_csv(self, date: str | None = None):
         if date is not None:
             # Verify that the date is in the ISO format 'YYYY-MM-DD'
             try:
-                pd.to_datetime(date, format='%Y-%m-%d', errors='raise')
+                pd.to_datetime(date, format="%Y-%m-%d", errors="raise")
             except ValueError:
                 self.io_helper.logger.error(
                     f"Invalid date format: {date}. Expected 'YYYY-MM-DD'."
@@ -358,47 +402,13 @@ class IpInfoPrivacyUtil:
             data_files.sort(key=lambda x: x.stem.split('.')[-1], reverse=True)
             raw_path = data_files[0]
 
-        # Initialize and open the database
-        self.db_path = self.io_helper.processed / f"{raw_path.stem}.sqlite3"
-        is_initialized = self.db_path.exists()
-        self.db_conn = sqlite3.connect(self.db_path)
-        self.db_conn.execute(f"PRAGMA cache_size=-{self.CACHE_KB_DEFAULT};")
-        self.db_conn.execute("PRAGMA journal_mode=WAL;")  # Write-Ahead Logging
+        return raw_path
 
-        if is_initialized:
-            self.io_helper.logger.info(
-                f"Database already exists at {self.db_path}, skipping initialization."
-            )
-            return
-
-        # Create the table
-        self.io_helper.logger.info(
-            f"Populating SQLite database at {self.db_path}..."
-        )
-        self.db_conn.execute("""
-        CREATE TABLE ipinfo_privacy (
-            version           INTEGER    NOT NULL,
-            prefix_length     INTEGER    NOT NULL,
-            network_start     BLOB       NOT NULL,
-            network_end       BLOB       NOT NULL,
-            hosting           BOOLEAN,
-            proxy             BOOLEAN,
-            tor               BOOLEAN,
-            relay             BOOLEAN,
-            vpn               BOOLEAN,
-            service           TEXT,
-            PRIMARY KEY (version, network_start, prefix_length)
-        );
-        """)
-
-        # Index network range for faster lookups
-        self.db_conn.execute("""
-        CREATE INDEX idx_version_range ON ipinfo_privacy (
-            version, network_start, network_end
-        );
-        """)
-
+    def _populate_table(self, raw_path: Path):
         # Stream the CSV in chunks, compute numeric columns, insert
+        self.io_helper.logger.info(
+            f"Populating SQLite database at {self.db_path}"
+        )
         chunker = pd.read_csv(
             raw_path,
             dtype={
@@ -417,21 +427,14 @@ class IpInfoPrivacyUtil:
             df_chunk["version"] = net_objs.map(lambda n: n.version)
             df_chunk["prefix_length"] = net_objs.map(lambda n: n.prefixlen)
             df_chunk["network_start"] = net_objs.map(
-                lambda n: n.network_address.packed
+                lambda n: n.network_address
             )
             df_chunk["network_end"] = net_objs.map(
-                lambda n: n.broadcast_address.packed
+                lambda n: n.broadcast_address
             )
 
-            # Append to the database
-            df_chunk.to_sql(
-                "ipinfo_privacy",
-                self.db_conn,
-                if_exists="append",
-                index=False,
-            )
-
-        self.db_conn.commit()
+            # Write to the SQLite database
+            self.ipinfo_privacy_table.insert_df(df_chunk)
 
         self.io_helper.logger.info(
             "Created and populated SQLite database at {self.db_path}."
@@ -440,7 +443,7 @@ class IpInfoPrivacyUtil:
     def lookup(
         self,
         addr: IPv4Address | IPv6Address | str,
-    ) -> pd.Series | None:
+    ) -> pd.Series:
         """
         Lookup the privacy information for a given IP address.
 
@@ -456,44 +459,7 @@ class IpInfoPrivacyUtil:
                     - network, hosting, proxy, tor, relay, vpn, service
         """
 
-        ip = ip_address(addr) if isinstance(addr, str) else addr
-        ip_blob = ip.packed
-
-        sql = """
-            SELECT
-                version, network_start, prefix_length,
-                hosting, proxy, tor, relay, vpn, service
-            FROM ipinfo_privacy
-            WHERE version = ?
-            AND network_start <= ?
-            AND network_end   >= ?
-            ORDER BY prefix_length DESC
-            LIMIT 1
-        """
-        cur = self.db_conn.execute(sql, (ip.version, ip_blob, ip_blob))
-        row = cur.fetchone()
-        if row is None:
-            return None
-
-        (version, start_blob, prefix_length,
-         hosting, proxy, tor, relay, vpn, service) = row
-
-        start_int = int.from_bytes(start_blob, byteorder="big")
-        net = ip_network((start_int, prefix_length))
-
-        return pd.Series({
-            "version":        version,
-            "prefix_length":  prefix_length,
-            "network":        str(net),
-            "network_start":  net.network_address,
-            "network_end":    net.broadcast_address,
-            "service":        service,
-            "hosting":        bool(hosting),
-            "proxy":          bool(proxy),
-            "tor":            bool(tor),
-            "relay":          bool(relay),
-            "vpn":            bool(vpn),
-        })
+        return self.lpm_helper.lookup(addr)
 
     def is_ip_vpn(
         self,
@@ -507,13 +473,15 @@ class IpInfoPrivacyUtil:
                 The IP address to check.
 
         Returns:
-            bool: True if the IP address is associated with a VPN, False otherwise.
+            (is_vpn, service) (tuple[bool, Optional[str]]):
+                A tuple where the first element is True if the IP is a VPN,
+                and the second element is the service name if available, otherwise None.
         """
         ret = self.lookup(addr)
-        if ret is not None:
-            if ret["vpn"]:
+        if not ret.empty:
+            if "vpn" in ret and ret["vpn"]:
                 # If 'service' is present, return it
-                if "service" in ret:
+                if "service" in ret and pd.notna(ret["service"]):
                     return True, ret["service"]
                 return True, None
         # If not found or not a VPN, return False
