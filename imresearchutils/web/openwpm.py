@@ -51,6 +51,10 @@ class OpenWpmCrawlUtil:
             Sleep duration (in seconds) passed to BrowseCommand.
             Default is 3.
 
+        failure_limit (int | None):
+            Maximum number of consecutive failures before stopping the crawl.
+            If None, the default OpenWPM limit will be used.
+
         n_sites_chunk (int):
             Number of sites to crawl in each chunk.
             Default is 100.
@@ -73,6 +77,7 @@ class OpenWpmCrawlUtil:
         n_browsers: int = 10,
         n_click_internal_links: int = 5,
         browser_sleep_dur: int = 3,
+        failure_limit: int | None = None,
         n_sites_chunk: int = 100,
         max_retry_per_chunk: int = 3,
         **kwargs,
@@ -105,6 +110,7 @@ class OpenWpmCrawlUtil:
         self.n_browsers = n_browsers
         self.n_click_internal_links = n_click_internal_links
         self.browser_sleep_dur = browser_sleep_dur
+        self.failure_limit = failure_limit
         self.n_sites_chunk = n_sites_chunk
         self.max_retry_per_chunk = max_retry_per_chunk
 
@@ -193,6 +199,7 @@ class OpenWpmCrawlUtil:
                 log_path=self.openwpm_log_path,
                 process_watchdog=True,
                 memory_watchdog=True,
+                _failure_limit=self.failure_limit,
             )
             browser_params = [
                 self.BrowserParams(
