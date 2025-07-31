@@ -297,10 +297,50 @@ class OpenWpmCrawlUtil:
             if not sites_to_crawl:
                 break
 
+        if sites_to_crawl:
+            self.io_helper.logger.warning(
+                f"Failed to crawl sites {sites_to_crawl} after "
+                f"{self.max_retry_per_chunk} retries."
+            )
+        else:
+            self.io_helper.logger.info(
+                f"Successfully crawled all sites in chunk {chunknum}."
+            )
+
+    def compress_crawled_chunks(
+        self,
+        force: bool = False
+    ):
+        """
+        Compress all crawled chunk databases in the raw directory.
+        This method compresses each SQLite database file into a gzip file and removes the original file.
+
+        Args:
+            force (bool):
+                If True, compress all files regardless of whether they have been compressed before.
+                Default is False.
+        """
+
+        import gzip
+        for path in self.io_helper.raw.glob("crawl_chunk_*.sqlite"):
+            gz_path = path.with_suffix(".sqlite.gz")
+            if gz_path.exists() and not force:
+                continue
+            gz_path.write_bytes(
+                gzip.compress(path.read_bytes())
+            )
+            path.unlink(missing_ok=True)
+            self.io_helper.logger.info(
+                f"Compressed {path} to {gz_path} and removed the original file."
+            )
+
     def crawl(self):
         """
         Crawl the list of sites in chunks.
         """
+
+        # Compress any previously completed crawl chunks
+        self.compress_crawled_chunks()
 
         if self.is_crawl_done():
             return
