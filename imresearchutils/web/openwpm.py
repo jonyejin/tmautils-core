@@ -35,10 +35,6 @@ class OpenWpmCrawlUtil:
             If None, the sites will be read from `sites.txt` in the raw directory.
             Passing None is useful for resuming crawls.
 
-        data_dir (Path | None):
-            Base directory for data files.
-            If None, the current working directory will be used.
-
         n_browsers (int):
             Number of browsers to use for crawling.
             Default is 10.
@@ -63,6 +59,13 @@ class OpenWpmCrawlUtil:
             Maximum number of retries for each chunk.
             Default is 3.
 
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
+            If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
+
         **kwargs (dict):
             Additional arguments for IOHelper.
             See the IOHelper class for more details.
@@ -73,13 +76,14 @@ class OpenWpmCrawlUtil:
         openwpm_path: Path,
         crawl_id: str,
         sites: list[str] | None = None,
-        data_dir: Path | None = None,
         n_browsers: int = 10,
         n_click_internal_links: int = 5,
         browser_sleep_dur: int = 3,
         failure_limit: int | None = None,
         n_sites_chunk: int = 100,
         max_retry_per_chunk: int = 3,
+        working_root: Path | None = None,
+        data_dir: Path | None = None,
         **kwargs,
     ):
         import sys
@@ -115,10 +119,13 @@ class OpenWpmCrawlUtil:
         self.max_retry_per_chunk = max_retry_per_chunk
 
         # Set up data directory
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
-            module_name=self.__class__.__name__,
+            self.__class__.__name__,
             instance_name=self.crawl_id,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 
@@ -160,7 +167,7 @@ class OpenWpmCrawlUtil:
 
         self.io_helper.logger.info(
             f"OpenWPM crawl utility initialized with crawl ID: {self.crawl_id}, "
-            f"module directory: {self.io_helper.module_dir}"
+            f"top-level directory: {self.io_helper.top_level_dir}"
         )
 
     def crawl_chunk(

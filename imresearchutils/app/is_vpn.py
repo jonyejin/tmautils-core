@@ -8,9 +8,12 @@ class VpnIpAz0:
         Utility class for interacting with the az0/vpn_ip Github library.
 
         Args:
-            data_dir (Path | None):
-                Base directory for data files.
+            working_root (Path | None):
+                Base directory where the namespace directory will be created.
                 If None, the current working directory will be used.
+
+            data_dir (Path | None):
+                Deprecated alias for `working_root`.
 
             **kwargs (dict):
                 Additional arguments for IOHelper.
@@ -21,19 +24,23 @@ class VpnIpAz0:
 
     def __init__(
         self,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 
         self._download_current_file()
 
         self.io_helper.logger.info(
-            f"Initialized VpnIPAz0 with module directory: {self.io_helper.module_dir}"
+            f"Initialized VpnIPAz0 with top-level directory: {self.io_helper.top_level_dir}"
         )
 
     def _download_current_file(self):
@@ -149,12 +156,15 @@ class ListsVpnX4BNet:
     combined datacenter+VPN networks, and provides query methods.
 
     Args:
-            data_dir (Path | None):
-                Base directory for data files.
-                If None, uses the current working directory.
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
+            If None, the current working directory will be used.
 
-            **kwargs:
-                Additional arguments for IOHelper.
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
+
+        **kwargs:
+            Additional arguments for IOHelper.
     """
     URL_VPN_IPV4 = (
         "https://raw.githubusercontent.com/X4BNet/lists_vpn/"
@@ -167,12 +177,16 @@ class ListsVpnX4BNet:
 
     def __init__(
         self,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs
         )
 
@@ -183,7 +197,7 @@ class ListsVpnX4BNet:
         self._load_dataframes()
 
         self.io_helper.logger.info(
-            f"Initialized ListsVpnX4BNet with module directory: {self.io_helper.module_dir}"
+            f"Initialized ListsVpnX4BNet with top-level directory: {self.io_helper.top_level_dir}"
         )
 
     def _download_lists(self) -> None:
@@ -295,9 +309,12 @@ class IpInfoPrivacyUtil:
             Date of the dataset to use, in 'YYYY-MM-DD' format.
             If None, the latest available dataset will be used.
 
-        data_dir (Path | None):
-            Base directory for data files.
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
 
         **kwargs (dict):
             Additional arguments for IOHelper.
@@ -311,13 +328,17 @@ class IpInfoPrivacyUtil:
         self,
         ipinfo_privacy_dir: Path,
         date: str | None = None,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
+            working_root=working_root,
             raw_dir_symlink_to=ipinfo_privacy_dir,
-            data_dir=data_dir,
             **kwargs,
         )
 
@@ -367,7 +388,8 @@ class IpInfoPrivacyUtil:
         )
 
         self.io_helper.logger.info(
-            f"Initialized IpInfoPrivacyUtil with module directory: {self.io_helper.module_dir}"
+            f"Initialized IpInfoPrivacyUtil with top-level directory: "
+            f"{self.io_helper.top_level_dir}"
         )
 
     def _locate_csv(self, date: str | None = None):

@@ -49,9 +49,12 @@ class IPApiBatchUtil:
             Number of days to consider a cached result fresh.
             Default is 7 days.
 
-        data_dir (Path | None):
-            Base directory for data files.
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
 
         **kwargs (dict):
             Additional arguments for IOHelper.
@@ -61,12 +64,16 @@ class IPApiBatchUtil:
     def __init__(
         self,
         cache_days_fresh: int = CACHE_DAYS_FRESH,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 
@@ -80,7 +87,7 @@ class IPApiBatchUtil:
         self._load_cache()
 
         self.io_helper.logger.info(
-            f"Initialized IPApiBatchUtil with module directory: {self.io_helper.module_dir}"
+            f"Initialized IPApiBatchUtil with top-level directory: {self.io_helper.top_level_dir}"
         )
 
     @staticmethod

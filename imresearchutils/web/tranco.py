@@ -19,17 +19,21 @@ class TrancoTopListUtil:
         list_id: str | None = None,
         subdomains: bool = False,
         full: bool = False,
-        data_dir: Path | None = None,
         n_top_sites: int = 100000,
+        working_root: Path | None = None,
+        data_dir: Path | None = None,
         **kwargs,
     ):
         import tranco
 
         self.n_top_sites = n_top_sites
 
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
-            module_name=self.__class__.__name__,
-            data_dir=data_dir,
+            self.__class__.__name__,
+            working_root=working_root,
             **kwargs,
         )
 
@@ -64,10 +68,6 @@ class PeriodicTrancoCrawlUtil:
         openwpm_path (Path):
             Path to the OpenWPM installation directory.
 
-        data_dir (Path | None):
-            Base directory for data files.
-            If None, the current working directory will be used.
-
         continue_only (bool):
             If True, only resume incomplete crawls.
             If False, resume incomplete crawls and start a new one.
@@ -81,6 +81,13 @@ class PeriodicTrancoCrawlUtil:
             Additional arguments to pass to the OpenWPM crawl utility.
             See the OpenWpmCrawlUtil class for more details.
 
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
+            If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
+
         **kwargs (dict):
             Additional arguments for IOHelper.
             See the IOHelper class for more details.
@@ -89,20 +96,23 @@ class PeriodicTrancoCrawlUtil:
     def __init__(
         self,
         openwpm_path: Path,
-        data_dir: Path | None = None,
         continue_only: bool = True,
         top_count: int = 100000,
         openwpm_args: dict = {},
+        working_root: Path | None = None,
+        data_dir: Path | None = None,
         **kwargs,
     ):
         self.openwpm_path = openwpm_path
         self.openwpm_args = openwpm_args
-        self.data_dir = data_dir
         self.top_count = top_count
 
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
-            module_name=self.__class__.__name__,
-            data_dir=data_dir,
+            self.__class__.__name__,
+            working_root=working_root,
             **kwargs,
         )
 
@@ -128,7 +138,7 @@ class PeriodicTrancoCrawlUtil:
         prev_sites = []
 
         # Start with old list of sites if a previous crawl exists
-        openwpm_dir = self.data_dir / OpenWpmCrawlUtil.__name__
+        openwpm_dir = self.io_helper.working_root / OpenWpmCrawlUtil.__name__
         if openwpm_dir.exists():
             prev_crawls = sorted(
                 [d for d in openwpm_dir.glob("*") if d.is_dir()],
@@ -139,7 +149,7 @@ class PeriodicTrancoCrawlUtil:
                 prev_util = OpenWpmCrawlUtil(
                     openwpm_path=self.openwpm_path,
                     crawl_id=last_crawl.name,
-                    data_dir=self.data_dir,
+                    working_root=self.io_helper.working_root,
                     **self.openwpm_args,
                 )
                 prev_sites = prev_util.sites
@@ -149,8 +159,8 @@ class PeriodicTrancoCrawlUtil:
 
         # Fetch the latest Tranco top list
         tranco_util = TrancoTopListUtil(
-            data_dir=self.data_dir,
             n_top_sites=self.top_count,
+            working_root=self.io_helper.working_root,
         )
 
         # Merge previous sites with the latest Tranco list
@@ -166,7 +176,7 @@ class PeriodicTrancoCrawlUtil:
             openwpm_path=self.openwpm_path,
             crawl_id=datetime.now().date().isoformat(),
             sites=merged,
-            data_dir=self.data_dir,
+            working_root=self.io_helper.working_root,
             **self.openwpm_args,
         )
 
@@ -196,7 +206,7 @@ class PeriodicTrancoCrawlUtil:
 
         self.io_helper.logger.info("Resuming incomplete crawls")
 
-        openwpm_dir = self.data_dir / OpenWpmCrawlUtil.__name__
+        openwpm_dir = self.io_helper.working_root / OpenWpmCrawlUtil.__name__
         if not openwpm_dir.exists():
             # No previous crawls to resume
             self.io_helper.logger.info(
@@ -209,7 +219,7 @@ class PeriodicTrancoCrawlUtil:
             openwpm_util = OpenWpmCrawlUtil(
                 openwpm_path=self.openwpm_path,
                 crawl_id=crawl_dir.name,
-                data_dir=self.data_dir,
+                working_root=self.io_helper.working_root,
                 **self.openwpm_args,
             )
 
@@ -239,14 +249,17 @@ class TrancoProcessUtil:
         tranco_list_id (str):
             ID of the Tranco list to process.
 
-        data_dir (Path | None):
-            Base directory for data files.
-            If None, the current working directory will be used.
-
         repeat (int):
             Repetition number for the crawl.
             Used to create a unique instance name for the IOHelper.
             Default is 1.
+
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
+            If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
 
         **kwargs (dict):
             Additional arguments for IOHelper.
@@ -256,8 +269,9 @@ class TrancoProcessUtil:
     def __init__(
         self,
         tranco_list_id: str,
-        data_dir: Path | None = None,
         repeat: int = 1,
+        working_root: Path | None = None,
+        data_dir: Path | None = None,
         **kwargs,
     ):
         self.tranco_list_id = tranco_list_id
@@ -266,10 +280,13 @@ class TrancoProcessUtil:
         instance_name = (
             self.tranco_list_id if repeat == 1 else f"{self.tranco_list_id}_{repeat}"
         )
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
-            module_name=self.__class__.__name__,
+            self.__class__.__name__,
             instance_name=instance_name,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 

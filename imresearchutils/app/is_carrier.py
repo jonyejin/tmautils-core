@@ -8,20 +8,25 @@ class IpInfoCarrierUtil:
         self,
         ipinfo_privacy_dir: Path,
         date: str | None = None,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
+            working_root=working_root,
             raw_dir_symlink_to=ipinfo_privacy_dir,
-            data_dir=data_dir,
             **kwargs,
         )
 
         self._load_data(date)
 
         self.io_helper.logger.info(
-            f"Initialized IpInfoCarrierUtil with module directory: {self.io_helper.module_dir}"
+            f"Initialized IpInfoCarrierUtil with top-level directory: "
+            f"{self.io_helper.top_level_dir}"
         )
 
     def _load_data(self, date: str | None = None):

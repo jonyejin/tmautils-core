@@ -13,9 +13,12 @@ class CaidaAsOrgInfoUtil:
         date_str (str):
             Date string in the ISO format (YYYY-MM-DD)
 
-        data_dir (Path | None):
-            Base directory for data files.
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
 
         **kwargs (dict):
             Additional arguments for IOHelper.
@@ -25,12 +28,16 @@ class CaidaAsOrgInfoUtil:
     def __init__(
         self,
         date_str: str,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 
