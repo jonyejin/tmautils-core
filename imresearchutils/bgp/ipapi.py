@@ -87,7 +87,7 @@ class IPApiBatchUtil:
         self._load_cache()
 
         self.io_helper.logger.info(
-            f"Initialized IPApiBatchUtil with top-level directory: {self.io_helper.top_level_dir}"
+            f"Initialized IPApiBatchUtil with cache_days_fresh: {self.cache_days_fresh}"
         )
 
     @staticmethod

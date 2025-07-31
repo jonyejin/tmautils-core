@@ -39,9 +39,7 @@ class VpnIpAz0:
 
         self._download_current_file()
 
-        self.io_helper.logger.info(
-            f"Initialized VpnIPAz0 with top-level directory: {self.io_helper.top_level_dir}"
-        )
+        self.io_helper.logger.info("Initialized VpnIPAz0")
 
     def _download_current_file(self):
         """
@@ -196,9 +194,7 @@ class ListsVpnX4BNet:
         # Load into DataFrames
         self._load_dataframes()
 
-        self.io_helper.logger.info(
-            f"Initialized ListsVpnX4BNet with top-level directory: {self.io_helper.top_level_dir}"
-        )
+        self.io_helper.logger.info("Initialized ListsVpnX4BNet")
 
     def _download_lists(self) -> None:
         """
@@ -388,8 +384,8 @@ class IpInfoPrivacyUtil:
         )
 
         self.io_helper.logger.info(
-            f"Initialized IpInfoPrivacyUtil with top-level directory: "
-            f"{self.io_helper.top_level_dir}"
+            f"Initialized IpInfoPrivacyUtil with date: {date if date else 'latest'} "
+            f"and database at {self.db_path}"
         )
 
     def _locate_csv(self, date: str | None = None):

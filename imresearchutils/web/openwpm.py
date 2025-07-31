@@ -166,8 +166,14 @@ class OpenWpmCrawlUtil:
         self.log_pos = 0
 
         self.io_helper.logger.info(
-            f"OpenWPM crawl utility initialized with crawl ID: {self.crawl_id}, "
-            f"top-level directory: {self.io_helper.top_level_dir}"
+            f"OpenWPM crawl utility initialized with "
+            f"{len(self.sites)} sites, "
+            f"{self.n_browsers} browsers, "
+            f"{self.n_click_internal_links} internal link clicks per site, "
+            f"{self.browser_sleep_dur} seconds sleep duration, "
+            f"{self.failure_limit} failure limit, "
+            f"{self.n_sites_chunk} sites per chunk, and "
+            f"{self.max_retry_per_chunk} retries per chunk."
         )
 
     def crawl_chunk(

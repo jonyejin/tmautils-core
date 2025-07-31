@@ -158,6 +158,9 @@ class IOHelper:
 
         if setup_logging:
             self.logger = self.setup_logging(**kwargs)
+            self.logger.info(
+                f"IOHelper initialized with top-level directory: {self.top_level_dir}"
+            )
 
     @staticmethod
     def handle_working_root_data_dir(

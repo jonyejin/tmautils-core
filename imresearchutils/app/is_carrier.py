@@ -25,8 +25,7 @@ class IpInfoCarrierUtil:
         self._load_data(date)
 
         self.io_helper.logger.info(
-            f"Initialized IpInfoCarrierUtil with top-level directory: "
-            f"{self.io_helper.top_level_dir}"
+            f"Initialized IpInfoCarrierUtil with date: {date if date else 'latest'}"
         )
 
     def _load_data(self, date: str | None = None):
