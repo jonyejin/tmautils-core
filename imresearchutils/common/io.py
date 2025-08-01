@@ -1,5 +1,7 @@
 from pathlib import Path
-import pandas as pd
+import logging
+
+GZIP_STREAM_CHUNK_SIZE = 64 * 1024  # 64 KiB
 
 
 def import_module_attr(module_path: str, attr_name: str):
@@ -35,6 +37,114 @@ def import_module_attr(module_path: str, attr_name: str):
             f"Attribute '{attr_name}' not found in module '{module_path}'"
         ) from e
     return attr
+
+
+def gzip_file(
+    file_path: Path,
+    force: bool = False,
+    delete_original: bool = True,
+    compression_level: int = 9,
+    logger: logging.Logger | None = None,
+):
+    """
+    Compress a file using gzip.
+
+    Args:
+        file_path (Path):
+            Path to the file to be compressed.
+
+        force (bool):
+            If True, will overwrite the existing gzipped file if it exists.
+            If False, will skip compression if the gzipped file already exists.
+
+        delete_original (bool):
+            If True, the original file will be deleted after compression.
+            If False, the original file will be kept.
+
+        compression_level (int):
+            Compression level for gzip, from 0 (no compression) to 9 (maximum compression).
+            Default is 9 (maximum compression).
+
+        logger (logging.Logger | None):
+            Optional logger to log messages.
+            If None, no logging will be performed.
+    """
+    gz_path = file_path.with_suffix(f"{file_path.suffix}.gz")
+
+    if gz_path.exists():
+        if not force:
+            if logger is not None:
+                logger.info(f"{gz_path} already exists. Skipping compression.")
+            return
+        else:
+            gz_path.unlink(missing_ok=True)
+
+    tmp_gz = gz_path.with_name(f"{gz_path.name}.tmp")
+    try:
+        import gzip
+        import shutil
+        import os
+
+        with (
+            file_path.open("rb") as f_in,
+            gzip.open(tmp_gz, "wb", compresslevel=compression_level) as f_out
+        ):
+            # Stream in chunks
+            shutil.copyfileobj(f_in, f_out, length=GZIP_STREAM_CHUNK_SIZE)
+
+        os.replace(tmp_gz, gz_path)
+        if delete_original:
+            file_path.unlink()
+
+        if logger is not None:
+            logger.info(f"Compressed {file_path} to {gz_path}")
+    except Exception as e:
+        if logger is not None:
+            logger.error(f"Failed to gzip {file_path}: {e}")
+        if tmp_gz.exists():
+            tmp_gz.unlink()
+        raise
+
+
+def gunzip_file(
+    gz_path: Path,
+    force: bool = False,
+    delete_gzip: bool = True,
+    logger: logging.Logger | None = None,
+):
+    unzipped_path = gz_path.with_suffix("")
+
+    if unzipped_path.exists():
+        if not force:
+            if logger is not None:
+                logger.info(
+                    f"{unzipped_path} already exists. Skipping decompression.")
+            return
+        else:
+            unzipped_path.unlink(missing_ok=True)
+
+    tmp_unzipped = unzipped_path.with_name(f"{unzipped_path.name}.tmp")
+    try:
+        import gzip
+        import shutil
+        import os
+
+        with gzip.open(gz_path, "rb") as f_in, tmp_unzipped.open("wb") as f_out:
+            # Stream in chunks
+            shutil.copyfileobj(f_in, f_out, length=GZIP_STREAM_CHUNK_SIZE)
+
+        os.replace(tmp_unzipped, unzipped_path)
+        if delete_gzip:
+            gz_path.unlink()
+
+        if logger is not None:
+            logger.info(f"Decompressed {gz_path} to {unzipped_path}")
+    except Exception as e:
+        if logger is not None:
+            logger.error(f"Failed to gunzip {gz_path}: {e}")
+        if tmp_unzipped.exists():
+            tmp_unzipped.unlink()
+        raise
 
 
 class IOHelper:
@@ -209,10 +319,9 @@ class IOHelper:
     @property
     def results(self):
         return self.top_level_dir / "results"
-    
+
     def setup_logging(self, **kwargs):
         from datetime import datetime
-        import logging
 
         logger_name = (
             f"{self.namespace}/{self.instance_name}" if self.instance_name is not None
@@ -249,23 +358,3 @@ class IOHelper:
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
         return logger
-
-    def write_processed_pickle(self, filename: str, data: object):
-        import pickle
-
-        self.processed.joinpath(filename).write_bytes(
-            pickle.dumps(data)
-        )
-
-    def read_processed_pickle(self, filename: str) -> object:
-        import pickle
-
-        return pickle.loads(
-            self.processed.joinpath(filename).read_bytes()
-        )
-
-    def write_processed_df_csv(self, filename: str, df: pd.DataFrame, **kwargs):
-        df.to_csv(self.processed / filename, **kwargs)
-
-    def read_processed_df_csv(self, filename: str, **kwargs) -> pd.DataFrame:
-        return pd.read_csv(self.processed / filename, **kwargs)

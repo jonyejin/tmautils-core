@@ -71,6 +71,8 @@ class OpenWpmCrawlUtil:
             See the IOHelper class for more details.
     """
 
+    COMPRESSION_MAX_WORKERS = 2
+
     def __init__(
         self,
         openwpm_path: Path,
@@ -307,32 +309,41 @@ class OpenWpmCrawlUtil:
                 f"Successfully crawled all sites in chunk {chunknum}."
             )
 
+        # Compress the chunk database file
+        gzip_file(db_path, force=True, logger=self.io_helper.logger)
+
     def compress_crawled_chunks(
         self,
-        force: bool = False
+        delete_original: bool = True,
     ):
         """
-        Compress all crawled chunk databases in the raw directory.
-        This method compresses each SQLite database file into a gzip file and removes the original file.
+        Compress all crawled chunk databases in the raw directory in parallel.
 
         Args:
-            force (bool):
-                If True, compress all files regardless of whether they have been compressed before.
-                Default is False.
+            delete_original (bool):
+                If True, the original SQLite files will be deleted after compression.
+                Default is True.
         """
 
-        import gzip
-        for path in self.io_helper.raw.glob("crawl_chunk_*.sqlite"):
-            gz_path = path.with_suffix(".sqlite.gz")
-            if gz_path.exists() and not force:
-                continue
-            gz_path.write_bytes(
-                gzip.compress(path.read_bytes())
-            )
-            path.unlink(missing_ok=True)
-            self.io_helper.logger.info(
-                f"Compressed {path} to {gz_path} and removed the original file."
-            )
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        paths = list(self.io_helper.raw.glob("crawl_chunk_*.sqlite"))
+        if not paths:
+            return
+
+        with ThreadPoolExecutor(max_workers=self.COMPRESSION_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    gzip_file, p, delete_original=delete_original, logger=self.io_helper.logger
+                ): p for p in paths
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    self.io_helper.logger.error(
+                        f"Failed to compress {futures[future]}: {repr(future.exception())}"
+                    )
 
     def crawl(self):
         """
