@@ -141,7 +141,7 @@ class CompletedHttpRequest:
 
 
 @dataclass
-class TrancoSiteCrawlResult:
+class OpenWpmSiteCrawlResult:
     rank: int
     url: str
     visit_id: int

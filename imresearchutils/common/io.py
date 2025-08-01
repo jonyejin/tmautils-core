@@ -177,7 +177,8 @@ class IOHelper:
         logger.setLevel(logging.DEBUG)
         if not logger.handlers:
             formatter = logging.Formatter(
-                "%(asctime)s %(levelname)s {%(name)s} [%(funcName)s] %(message)s",
+                "%(asctime)s %(levelname)s {%(name)s} "
+                "(%(module)s:%(lineno)d) [%(funcName)s] %(message)s",
                 datefmt='%Y-%m-%d %H:%M:%S'
             )
 

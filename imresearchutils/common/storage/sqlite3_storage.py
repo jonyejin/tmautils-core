@@ -1,4 +1,4 @@
-from ipaddress import IPv4Address, IPv6Address, ip_address
+from ipaddress import IPv4Address, IPv6Address
 from typing import Type, Any, Callable
 import sqlite3
 import pandas as pd
@@ -7,7 +7,7 @@ from pathlib import Path
 from logging import Logger
 from contextlib import contextmanager
 
-from .utils import try_convert_ip
+from ..utils import try_convert_ip
 
 
 # Context-manager to locally register adapters/converters
@@ -90,6 +90,7 @@ class SqliteTable:
     SQLITE3_ADAPTERS: dict[Type[Any], Callable] = {
         # Boolean
         bool: lambda b: int(b),
+        np.bool_: lambda b: int(b),
 
         # IP Addresses
         IPv4Address: lambda ip: ip.packed,
@@ -112,7 +113,6 @@ class SqliteTable:
     # SQLite type -> Python type conversion is split between SQLite3 and pandas
     # (for ease and performance)
     SQLITE3_CONVERTERS: dict[str, Callable] = {
-        "BOOL": lambda b: bool(int.from_bytes(b, byteorder='little')),
         # Leave IP addresses as is, we will handle it ourselves later
         "IPADDR": lambda ip: ip,
         # Just bytes -> str for timestamps (Pandas will handle the rest)
@@ -270,10 +270,49 @@ class SqliteTable:
             self.logger.info(f"Qualifiers: {self.qualifiers}")
             self.logger.info(f"Indices: {self.indices}")
 
+    def cast_df_types_schema(self, df: pd.DataFrame):
+        """
+        Cast DataFrame columns to match the table schema types.
+
+        Args:
+            df (pd.DataFrame):
+                DataFrame to cast.
+
+        Returns:
+            pd.DataFrame:
+                DataFrame with columns cast to match the table schema types.
+        """
+
+        for col, typ in self.schema.items():
+            if col not in df.columns:
+                continue
+
+            # PANDAS_DTYPE_MAP maps some common types
+            if typ in self.PANDAS_DTYPE_MAP:
+                df[col] = df[col].astype(self.PANDAS_DTYPE_MAP[typ])
+
+            # Handle certain specific types
+            elif typ is np.datetime64:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+            elif typ is IPv4Address or typ is IPv6Address:
+                df[col] = df[col].map(
+                    lambda x: try_convert_ip(x) if pd.notna(x) else pd.NA
+                )
+
+            # Fallback: try a direct astype(typ), but ignore failures
+            else:
+                try:
+                    df[col] = df[col].astype(typ)
+                except Exception:
+                    pass
+
+        return df
+
     def insert_df(
         self,
         df: pd.DataFrame,
         if_exists: str = "append",
+        cast_columns_to_schema: bool = True,
     ):
         """
         Insert a pandas DataFrame into the table, converting types as needed.
@@ -288,6 +327,10 @@ class SqliteTable:
                 - `fail`: raise an error if the table exists.
                 - `replace`: Drop the table before inserting.
                 - `append`: Insert rows into the existing table.
+
+            cast_columns_to_schema (bool):
+                Whether to cast DataFrame columns to match the table schema types.
+                Default is True, which will attempt to convert DataFrame types to match the schema.
         """
         # Map if_exists to SQLite conflict clauses
         mode = if_exists.lower()
@@ -313,6 +356,10 @@ class SqliteTable:
 
         # Reorder DataFrame columns to match schema
         df = df.reindex(columns=cols)
+
+        # Cast DataFrame types to match schema if needed
+        if cast_columns_to_schema:
+            df = self.cast_df_types_schema(df)
 
         # Use generator to reduce memory footprint
         def _gen_rows():
@@ -442,8 +489,10 @@ class SqliteDatabase:
         logger: Logger | None = None,
         **connect_kwargs
     ):
+        self.path = Path(db_path).resolve()
+
         self.conn = self._connect_with_conversion(
-            db_path, uri=uri, **connect_kwargs
+            self.path, uri=uri, **connect_kwargs
         )
         if cache_kb > self.CACHE_KB_MIN:
             self.conn.execute(f"PRAGMA cache_size=-{cache_kb};")

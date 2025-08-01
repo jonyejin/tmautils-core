@@ -1,4 +1,4 @@
-import pandas
+import pandas as pd
 import requests
 import gzip
 
@@ -47,8 +47,8 @@ class CaidaAsOrgInfoUtil:
         )
 
         if (self.org_id_parquet.exists() and self.aut_parquet.exists()):
-            self.df_org_id = pandas.read_parquet(self.org_id_parquet)
-            self.df_aut = pandas.read_parquet(self.aut_parquet)
+            self.df_org_id = pd.read_parquet(self.org_id_parquet)
+            self.df_aut = pd.read_parquet(self.aut_parquet)
             self.io_helper.logger.info(
                 f"Loaded {self.org_id_parquet.name} and {self.aut_parquet.name} from disk."
             )
@@ -130,8 +130,8 @@ class CaidaAsOrgInfoUtil:
         org_id_cols, org_id_data = tables[0]
         aut_cols, aut_data = tables[1]
 
-        df_org_id = pandas.DataFrame(org_id_data, columns=org_id_cols)
-        df_aut = pandas.DataFrame(aut_data, columns=aut_cols)
+        df_org_id = pd.DataFrame(org_id_data, columns=org_id_cols)
+        df_aut = pd.DataFrame(aut_data, columns=aut_cols)
 
         return df_org_id, df_aut
 
@@ -166,3 +166,45 @@ class CaidaAsOrgInfoUtil:
         org_name = row_org_id['org_name']
 
         return aut_name, org_name
+
+    def annotate_df(
+        self,
+        df: pd.DataFrame,
+        asn_col: str = 'asn',
+        as_name_col: str = 'as_name',
+        org_name_col: str = 'org_name',
+    ) -> pd.DataFrame:
+        """
+        Annotate a DataFrame with autonomous system and organization names.
+
+        Args:
+            df (pandas.DataFrame):
+                DataFrame to annotate.
+
+            asn_col (str):
+                Column name containing ASN values.
+
+            as_name_col (str):
+                Column name to store autonomous system names.
+
+            org_name_col (str):
+                Column name to store organization names.
+
+        Returns:
+            pandas.DataFrame:
+                Annotated DataFrame with new columns for autonomous system and organization names.
+        """
+
+        name_map = {}
+        org_map = {}
+
+        unique_asns = df[asn_col].dropna().unique()
+        for asn in unique_asns:
+            name, org = self.lookup(asn)
+            name_map[asn] = name if name else pd.NA
+            org_map[asn] = org if org else pd.NA
+
+        df[as_name_col] = df[asn_col].map(name_map).astype('string')
+        df[org_name_col] = df[asn_col].map(org_map).astype('string')
+
+        return df
