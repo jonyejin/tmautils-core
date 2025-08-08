@@ -7,11 +7,6 @@ from dataclasses_json import DataClassJsonMixin
 from imresearchutils.common import *
 from .types import *
 
-neterror_pattern = re.compile(
-    r"Received neterror (?P<error_type>\w+) while executing command: "
-    r"BrowseCommand\(http://(?P<url>.*),5,3\)"
-)
-
 
 @dataclass
 class CrawlProgress(DataClassJsonMixin):
@@ -72,6 +67,10 @@ class OpenWpmCrawlUtil:
     """
 
     COMPRESSION_MAX_WORKERS = 2
+    NETERROR_PATTERN = re.compile(
+        r"Received neterror (?P<error_type>\w+) while executing command: "
+        r"BrowseCommand\(http://(?P<url>.*),5,3\)"
+    )
 
     def __init__(
         self,
@@ -282,7 +281,7 @@ class OpenWpmCrawlUtil:
             with open(self.openwpm_log_path) as log:
                 log.seek(self.log_pos)
                 for line in log:
-                    if (m := neterror_pattern.search(line)) is not None:
+                    if (m := self.NETERROR_PATTERN.search(line)) is not None:
                         neterrors.add(m.groupdict()['url'])
                 self.log_pos = log.tell()
             self.io_helper.logger.info(

@@ -56,10 +56,12 @@ def gzip_file(
         force (bool):
             If True, will overwrite the existing gzipped file if it exists.
             If False, will skip compression if the gzipped file already exists.
+            Default is False.
 
         delete_original (bool):
             If True, the original file will be deleted after compression.
             If False, the original file will be kept.
+            Default is True.
 
         compression_level (int):
             Compression level for gzip, from 0 (no compression) to 9 (maximum compression).
@@ -75,6 +77,8 @@ def gzip_file(
         if not force:
             if logger is not None:
                 logger.info(f"{gz_path} already exists. Skipping compression.")
+            if delete_original:
+                file_path.unlink(missing_ok=True)
             return
         else:
             gz_path.unlink(missing_ok=True)
@@ -112,13 +116,38 @@ def gunzip_file(
     delete_gzip: bool = True,
     logger: logging.Logger | None = None,
 ):
+    """
+    Decompress a gzipped file.
+
+    Args:
+        gz_path (Path):
+            Path to the gzipped file to be decompressed.
+
+        force (bool):
+            If True, will overwrite the existing unzipped file if it exists.
+            If False, will skip decompression if the unzipped file already exists.
+            Default is False.
+
+        delete_gzip (bool):
+            If True, the gzipped file will be deleted after decompression.
+            If False, the gzipped file will be kept.
+            Default is True.
+
+        logger (logging.Logger | None):
+            Optional logger to log messages.
+            If None, no logging will be performed.
+    """
+
     unzipped_path = gz_path.with_suffix("")
 
     if unzipped_path.exists():
         if not force:
             if logger is not None:
                 logger.info(
-                    f"{unzipped_path} already exists. Skipping decompression.")
+                    f"{unzipped_path} already exists. Skipping decompression."
+                )
+            if delete_gzip:
+                gz_path.unlink(missing_ok=True)
             return
         else:
             unzipped_path.unlink(missing_ok=True)
