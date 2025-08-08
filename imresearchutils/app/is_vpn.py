@@ -504,3 +504,6 @@ class IpInfoPrivacyUtil:
                 return True, None
         # If not found or not a VPN, return False
         return False, None
+
+    def get_all(self) -> pd.DataFrame:
+        return self.ipinfo_privacy_table.query_all()
