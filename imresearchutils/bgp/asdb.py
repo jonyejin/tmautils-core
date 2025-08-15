@@ -209,7 +209,7 @@ class ASdbCategoryUtil:
 
         asinfo = self.df[self.df["asn"] == asn]
 
-        return asinfo
+        return asinfo.reset_index(drop=True)
 
     def get(
         self,
@@ -239,13 +239,13 @@ class ASdbCategoryUtil:
             asninfo = asninfo[asninfo["layer 1"] == layer1]
         if layer2 is not None:
             asninfo = asninfo[asninfo["layer 2"] == layer2]
-        return asninfo
+        return asninfo.reset_index(drop=True)
 
     def find_ases_in_category(
         self,
         layer1_category: str,
         layer2_category: Optional[str] = None,
-    ) -> list[int]:
+    ):
         """
         Return all ASNs matching the given primary and (optional) secondary category.
 
@@ -266,4 +266,9 @@ class ASdbCategoryUtil:
             df_filtered = df_filtered[df_filtered["layer2"] == layer2_category]
 
         # Extract unique ASNs
-        return df_filtered.drop_duplicates()
+        return (
+            df_filtered
+            .drop_duplicates()
+            .sort_values(by="asn")
+            .reset_index(drop=True)
+        )
