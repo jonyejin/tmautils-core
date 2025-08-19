@@ -453,7 +453,16 @@ class TrancoProcessUtil:
             (request_id, url, resource_type,
              hostname, cname, addresses, used_address) = req_raw
             assert used_address is not None, "used_address is None"
+
+            # Workaround for a rare bug where addresses could be empty
             addresses: str
+            if not addresses:
+                self.io_helper.logger.warning(
+                    f"Empty addresses for {hostname} ({cname}) in request {request_id}, "
+                    f"using used_address {used_address} instead."
+                )
+                addresses = used_address
+
             dns_record = UsedDnsRecord(
                 FQDN(hostname),
                 FQDN(cname),
