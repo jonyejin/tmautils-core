@@ -3,3 +3,5 @@ from .is_vpn import (
     ListsVpnX4BNet,
     IpInfoPrivacyUtil,
 )
+from .is_carrier import IpInfoCarrierUtil
+from .is_chrome_prefetch_proxy import ChromePrefetchUtil
