@@ -1,49 +1,62 @@
-import requests
 import pandas as pd
-import csv
-import ipaddress
 
 
 from imresearchutils.common import *
 
+
 class ChromePrefetchUtil:
     """
-    columns: cidr, country
+    Utility class to check if an IP address belongs to Chrome Prefetch Proxy.
+
+    This class downloads the Chrome Prefetch Proxy geofeed data, processes it,
+    and provides methods to look up IP addresses to determine if they are part of
+    the Chrome Prefetch Proxy network.
+
+    Args:
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
+            If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
+
+        **kwargs (dict):
+            Additional arguments for IOHelper.
+            See the IOHelper class for more details.
     """
 
-    CACHE_KB_DEFAULT = 256_000
-
-    def __init__(self,
-                 data_dir: Path | None = None,
-                 **kwargs,
-                 ):
+    def __init__(
+        self,
+        working_root: Path | None = None,
+        data_dir: Path | None = None,
+        **kwargs,
+    ):
         self.io_helper = IOHelper(
             self.__class__.__name__,
             data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
+
         data_url = f"https://www.gstatic.com/chrome/prefetchproxy/prefetch_proxy_geofeed"
         saved_data_file = self.io_helper.raw / data_url.split("/")[-1]
 
         # Check if the files exist, if not, download them
-        for (url, saved_file) in [
-            (data_url, saved_data_file),
-        ]:
-            if saved_file.exists():
-                continue
+        if not saved_data_file.exists():
+            import requests
 
             try:
                 self.io_helper.logger.info(
-                    f"Downloading Chrome Prefetch Proxy file from {url} to {saved_file}"
+                    f"Downloading Chrome Prefetch Proxy file from {data_url} to {saved_data_file}"
                 )
-                r = requests.get(url, timeout=5)
+                r = requests.get(data_url, timeout=5)
             except requests.exceptions.Timeout:
                 self.io_helper.logger.error(
-                    f"Could not download Chrome Prefetch Proxy file from {url}, cannot proceed"
+                    f"Could not download Chrome Prefetch Proxy file from {data_url}, cannot proceed"
                 )
                 raise
             else:
-                saved_file.write_text(r.text)
+                saved_data_file.write_text(r.text)
 
         # Load raw data file & Parse the file
         self.df = self._load_geofeed_from_file(saved_data_file)
@@ -53,7 +66,9 @@ class ChromePrefetchUtil:
         )
 
         # building tree
-        self.db_path = self.io_helper.processed / f"{saved_data_file.stem}.sqlite3"
+        self.db_path = self.io_helper.processed.joinpath(
+            f"{saved_data_file.stem}.sqlite3"
+        )
         is_initialized = self.db_path.exists()
 
         # Initialize SqliteDatabase and register the table
@@ -93,28 +108,23 @@ class ChromePrefetchUtil:
         )
 
         self.io_helper.logger.info(
-            f"Initialized IpInfoCarrierUtil with module directory: {self.io_helper.module_dir}"
+            f"Initialized IpInfoCarrierUtil "
+            f"with top-level directory: {self.io_helper.top_level_dir}"
         )
 
     def _populate_table(self, df: pd.DataFrame):
-        # Stream the CSV in chunks, compute numeric columns, insert
         self.io_helper.logger.info(
             f"Populating SQLite database at {self.db_path}"
         )
-        df_chunk = df
 
-        net_objs = df_chunk.pop("network").map(lambda x: ip_network(x))
-        df_chunk["version"] = net_objs.map(lambda n: n.version)
-        df_chunk["prefix_length"] = net_objs.map(lambda n: n.prefixlen)
-        df_chunk["network_start"] = net_objs.map(
-            lambda n: n.network_address
-        )
-        df_chunk["network_end"] = net_objs.map(
-            lambda n: n.broadcast_address
-        )
+        net_objs = df.pop("network").map(lambda x: ip_network(x))
+        df["version"] = net_objs.map(lambda n: n.version)
+        df["prefix_length"] = net_objs.map(lambda n: n.prefixlen)
+        df["network_start"] = net_objs.map(lambda n: n.network_address)
+        df["network_end"] = net_objs.map(lambda n: n.broadcast_address)
 
         # Write to the SQLite database
-        self.ipinfo_carrier_table.insert_df(df_chunk)
+        self.ipinfo_carrier_table.insert_df(df)
 
         self.io_helper.logger.info(
             "Created and populated SQLite database at {self.db_path}."
@@ -128,7 +138,10 @@ class ChromePrefetchUtil:
             ]
 
         records = [line.split(",") for line in lines]
-        df = pd.DataFrame(records, columns=['network', 'country', 'field1', 'field2', 'field3'])
+        df = pd.DataFrame(
+            records,
+            columns=['network', 'country', 'field1', 'field2', 'field3']
+        )
 
         # if empty, drop the columns
         empty_cols = [col for col in ['field1', 'field2', 'field3']
@@ -138,10 +151,9 @@ class ChromePrefetchUtil:
         return df
 
     def lookup(
-            self,
-            ip: IPv4Address | IPv6Address | str
+        self,
+        ip: IPAddress | str
     ) -> pd.Series:
-
         """
         Lookup the carrier info for a given IP.
 
@@ -150,10 +162,8 @@ class ChromePrefetchUtil:
                 The IP address to look up.
 
         Returns:
-            ret (pd.Series | None):
-                A pandas Series containing the privacy information for the given IP address,
-                or None if the address is not found in the dataset.
-                In original dataset, the columns are:
-                    - network, country
+            ret (pd.Series):
+                A pandas Series containing the lookup result.
+                If the IP is not found, the Series will be empty.
         """
         return self.lpm_helper.lookup(ip)

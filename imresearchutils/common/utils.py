@@ -95,3 +95,18 @@ def is_internal_flow(src_ip: IPAddress, dst_ip: IPAddress):
 
 def is_external_flow(src_ip: IPAddress, dst_ip: IPAddress):
     return not is_internal_flow(src_ip, dst_ip)
+
+
+def is_internal_flow_or_same_v6_upper_64(src_ip: IPAddress, dst_ip: IPAddress):
+    """
+    Check if the flow is internal or, for IPv6, if the upper 64 bits of
+    the source and destination addresses are the same.
+
+    This may be useful in cases where nodes within the same network use
+    IPv6 GUA addresses to communicate with each other.
+    """
+    if is_internal_flow(src_ip, dst_ip):
+        return True
+    if src_ip.version == 6:  # We can skip the check for dst_ip
+        return src_ip.packed[:8] == dst_ip.packed[:8]
+    return False

@@ -1,6 +1,5 @@
 from imresearchutils.common import *
 import pandas as pd
-import ipaddress
 import warnings
 
 
@@ -32,21 +31,19 @@ class IpInfoCarrierUtil:
         self,
         ipinfo_carrier_dir: Path,
         date: str | None = None,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
+            working_root=working_root,
             raw_dir_symlink_to=ipinfo_carrier_dir,
-            data_dir=data_dir,
             **kwargs,
         )
-
-        # self._load_data(date)
-        #
-        # self.io_helper.logger.info(
-        #     f"Initialized IpInfoCarrierUtil with module directory: {self.io_helper.module_dir}"
-        # )
 
         # Raw and processed paths
         raw_path = self._locate_csv(date)
@@ -93,7 +90,7 @@ class IpInfoCarrierUtil:
         )
 
         self.io_helper.logger.info(
-            f"Initialized IpInfoCarrierUtil with module directory: {self.io_helper.module_dir}"
+            f"Initialized IpInfoCarrierUtil with date: {date if date else 'latest'}"
         )
 
     def _locate_csv(self, date: str | None = None):
@@ -130,7 +127,6 @@ class IpInfoCarrierUtil:
 
         return raw_path
 
-
     def _populate_table(self, raw_path: Path):
         # Stream the CSV in chunks, compute numeric columns, insert
         self.io_helper.logger.info(
@@ -166,17 +162,15 @@ class IpInfoCarrierUtil:
             "Created and populated SQLite database at {self.db_path}."
         )
 
-
     def is_ip_carrier(
-            self,
-            ip: IPv4Address | IPv6Address | str
+        self,
+        ip: IPv4Address | IPv6Address | str
     ) -> bool:
         ret = self.lookup(ip)
         if not ret.empty:
             return True
         else:
             return False
-
 
     def is_carrier(self, ip: str) -> bool:
         warnings.warn(
@@ -187,11 +181,10 @@ class IpInfoCarrierUtil:
 
         return self.is_ip_carrier(ip)
 
-    def lookup (
+    def lookup(
             self,
             ip: IPv4Address | IPv6Address | str
     ) -> pd.Series:
-
         """
         Lookup the carrier info for a given IP.
 

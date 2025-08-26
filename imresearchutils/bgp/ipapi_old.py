@@ -5,12 +5,16 @@ class IPApiUtil:
     def __init__(
         self,
         ipapi_data_dir: Path,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 

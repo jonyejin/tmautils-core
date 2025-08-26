@@ -6,11 +6,6 @@ from imresearchutils.common import *
 from .types import *
 from .openwpm import OpenWpmCrawlUtil
 
-neterror_pattern = re.compile(
-    r"Received neterror (?P<error_type>\w+) while executing command: "
-    r"BrowseCommand\(http://(?P<url>.*),5,3\)"
-)
-
 
 class TrancoTopListUtil:
     def __init__(
@@ -19,17 +14,21 @@ class TrancoTopListUtil:
         list_id: str | None = None,
         subdomains: bool = False,
         full: bool = False,
-        data_dir: Path | None = None,
         n_top_sites: int = 100000,
+        working_root: Path | None = None,
+        data_dir: Path | None = None,
         **kwargs,
     ):
         import tranco
 
         self.n_top_sites = n_top_sites
 
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
-            module_name=self.__class__.__name__,
-            data_dir=data_dir,
+            self.__class__.__name__,
+            working_root=working_root,
             **kwargs,
         )
 
@@ -64,10 +63,6 @@ class PeriodicTrancoCrawlUtil:
         openwpm_path (Path):
             Path to the OpenWPM installation directory.
 
-        data_dir (Path | None):
-            Base directory for data files.
-            If None, the current working directory will be used.
-
         continue_only (bool):
             If True, only resume incomplete crawls.
             If False, resume incomplete crawls and start a new one.
@@ -81,6 +76,13 @@ class PeriodicTrancoCrawlUtil:
             Additional arguments to pass to the OpenWPM crawl utility.
             See the OpenWpmCrawlUtil class for more details.
 
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
+            If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
+
         **kwargs (dict):
             Additional arguments for IOHelper.
             See the IOHelper class for more details.
@@ -89,20 +91,23 @@ class PeriodicTrancoCrawlUtil:
     def __init__(
         self,
         openwpm_path: Path,
-        data_dir: Path | None = None,
         continue_only: bool = True,
         top_count: int = 100000,
         openwpm_args: dict = {},
+        working_root: Path | None = None,
+        data_dir: Path | None = None,
         **kwargs,
     ):
         self.openwpm_path = openwpm_path
         self.openwpm_args = openwpm_args
-        self.data_dir = data_dir
         self.top_count = top_count
 
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
-            module_name=self.__class__.__name__,
-            data_dir=data_dir,
+            self.__class__.__name__,
+            working_root=working_root,
             **kwargs,
         )
 
@@ -128,7 +133,7 @@ class PeriodicTrancoCrawlUtil:
         prev_sites = []
 
         # Start with old list of sites if a previous crawl exists
-        openwpm_dir = self.data_dir / OpenWpmCrawlUtil.__name__
+        openwpm_dir = self.io_helper.working_root / OpenWpmCrawlUtil.__name__
         if openwpm_dir.exists():
             prev_crawls = sorted(
                 [d for d in openwpm_dir.glob("*") if d.is_dir()],
@@ -139,7 +144,7 @@ class PeriodicTrancoCrawlUtil:
                 prev_util = OpenWpmCrawlUtil(
                     openwpm_path=self.openwpm_path,
                     crawl_id=last_crawl.name,
-                    data_dir=self.data_dir,
+                    working_root=self.io_helper.working_root,
                     **self.openwpm_args,
                 )
                 prev_sites = prev_util.sites
@@ -149,8 +154,8 @@ class PeriodicTrancoCrawlUtil:
 
         # Fetch the latest Tranco top list
         tranco_util = TrancoTopListUtil(
-            data_dir=self.data_dir,
             n_top_sites=self.top_count,
+            working_root=self.io_helper.working_root,
         )
 
         # Merge previous sites with the latest Tranco list
@@ -166,7 +171,7 @@ class PeriodicTrancoCrawlUtil:
             openwpm_path=self.openwpm_path,
             crawl_id=datetime.now().date().isoformat(),
             sites=merged,
-            data_dir=self.data_dir,
+            working_root=self.io_helper.working_root,
             **self.openwpm_args,
         )
 
@@ -196,7 +201,7 @@ class PeriodicTrancoCrawlUtil:
 
         self.io_helper.logger.info("Resuming incomplete crawls")
 
-        openwpm_dir = self.data_dir / OpenWpmCrawlUtil.__name__
+        openwpm_dir = self.io_helper.working_root / OpenWpmCrawlUtil.__name__
         if not openwpm_dir.exists():
             # No previous crawls to resume
             self.io_helper.logger.info(
@@ -209,7 +214,7 @@ class PeriodicTrancoCrawlUtil:
             openwpm_util = OpenWpmCrawlUtil(
                 openwpm_path=self.openwpm_path,
                 crawl_id=crawl_dir.name,
-                data_dir=self.data_dir,
+                working_root=self.io_helper.working_root,
                 **self.openwpm_args,
             )
 
@@ -236,17 +241,19 @@ class TrancoProcessUtil:
     A utility class for processing the results of a Tranco crawl.
 
     Args:
-        tranco_list_id (str):
-            ID of the Tranco list to process.
+        openwpm_crawl_path (Path):
+            Path where the OpenWPM crawl results are stored.
+            There must be a directory named `OpenWpmCrawlUtil` at this path.
 
-        data_dir (Path | None):
-            Base directory for data files.
+        crawl_date (str):
+            Date of the crawl in ISO format (YYYY-MM-DD).
+
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
 
-        repeat (int):
-            Repetition number for the crawl.
-            Used to create a unique instance name for the IOHelper.
-            Default is 1.
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
 
         **kwargs (dict):
             Additional arguments for IOHelper.
@@ -255,21 +262,41 @@ class TrancoProcessUtil:
 
     def __init__(
         self,
-        tranco_list_id: str,
+        openwpm_crawl_path: Path,
+        crawl_date: str,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
-        repeat: int = 1,
         **kwargs,
     ):
-        self.tranco_list_id = tranco_list_id
+        # Verify that crawl_date is in the correct format
+        import pandas as pd
+        try:
+            pd.to_datetime(crawl_date, format="%Y-%m-%d", errors="raise")
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid crawl_date format: {crawl_date}. "
+                "Expected format is YYYY-MM-DD."
+            ) from e
 
-        # Reuse the data directory from the crawl
-        instance_name = (
-            self.tranco_list_id if repeat == 1 else f"{self.tranco_list_id}_{repeat}"
+        self.crawl_date = crawl_date
+
+        # Verify that this crawl date directory exists
+        crawl_base_path = openwpm_crawl_path / OpenWpmCrawlUtil.__name__
+        if not (crawl_base_path.exists() and (crawl_base_path / crawl_date).exists()):
+            raise ValueError(
+                f"OpenWPM crawl path {openwpm_crawl_path} does not contain "
+                f"the expected directory structure for crawl date {crawl_date}."
+            )
+
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
         )
         self.io_helper = IOHelper(
-            module_name=self.__class__.__name__,
-            instance_name=instance_name,
-            data_dir=data_dir,
+            self.__class__.__name__,
+            instance_name=self.crawl_date,
+            working_root=working_root,
+            raw_dir_symlink_to=crawl_base_path / crawl_date / "raw",
+            processed_dir_symlink_to=crawl_base_path / crawl_date / "processed",
             **kwargs,
         )
 
@@ -277,23 +304,48 @@ class TrancoProcessUtil:
         self._parse_log_errors()
 
         # Find number of chunks for convenience
-        self.n_chunks = len(list(
-            self.io_helper.raw.glob("crawl_chunk_*.sqlite")
-        ))
-
-        self.io_helper.logger.info(
-            f"Initialized TrancoProcessUtil with list id {self.tranco_list_id} "
-            f"and {self.n_chunks} chunks"
+        self.n_chunks = len(
+            list(self.io_helper.raw.glob("crawl_chunk_*.sqlite")) +
+            list(self.io_helper.raw.glob("crawl_chunk_*.sqlite.gz"))
         )
 
-    def get_db_cursor(self, chunk_num: int):
+        self.io_helper.logger.info(
+            f"Initialized TrancoProcessUtil with crawl date {self.crawl_date} "
+            f"and {self.n_chunks} chunks."
+        )
+
+    def _open_raw(self, chunk_num: int):
         db_path = self.io_helper.raw / f"crawl_chunk_{chunk_num}.sqlite"
-        if not db_path.exists():
+        db_path_gz = db_path.with_suffix('.sqlite.gz')
+
+        if not (db_path.exists() or db_path_gz.exists()):
             raise ValueError(
                 f"Chunk {chunk_num} does not exist in {self.io_helper.raw}"
             )
 
+        # If the chunk exists as a gzipped file, decompress it
+        if db_path_gz.exists():
+            gunzip_file(
+                db_path_gz,
+                force=False,
+                delete_gzip=False,
+                logger=self.io_helper.logger,
+            )
+
         return sqlite3.connect(db_path).cursor()
+
+    def _close_raw(self, chunk_num: int, cursor: sqlite3.Cursor):
+        # Close the cursor
+        cursor.close()
+
+        # Only keep the gzipped version of the chunk
+        db_path = self.io_helper.raw / f"crawl_chunk_{chunk_num}.sqlite"
+        gzip_file(
+            db_path,
+            force=False,
+            delete_original=True,
+            logger=self.io_helper.logger,
+        )
 
     def load_db(
         self,
@@ -314,13 +366,7 @@ class TrancoProcessUtil:
 
         import pickle
 
-        # Check if chunk_num is valid
         chunk_path = self.io_helper.raw / f"crawl_chunk_{chunk_num}.sqlite"
-        if not chunk_path.exists():
-            raise ValueError(
-                f"Chunk {chunk_num} does not exist"
-            )
-
         sites: dict[FQDN, OpenWpmSiteCrawlResult] = None
         processed_path = (
             self.io_helper.processed / f"{chunk_path.name}.processed"
@@ -334,13 +380,14 @@ class TrancoProcessUtil:
                     f"Loaded {chunk_path.name} from cache"
                 )
                 return sites
-            except:
+            except Exception as e:
                 self.io_helper.logger.info(
-                    f"Cache not found for {chunk_path.name}; processing"
+                    f"Failed to load cache for {chunk_path.name}: {e}. "
+                    "Attempting to process the chunk."
                 )
 
         # If we are here, we need to process the chunk
-        cursor = self.get_db_cursor(chunk_num)
+        cursor = self._open_raw(chunk_num)
         sites = {
             s.fqdn: s for s in map(
                 lambda x: OpenWpmSiteCrawlResult(*x),
@@ -354,18 +401,22 @@ class TrancoProcessUtil:
         }
         for site in sites.values():
             self._populate_site_info(site, cursor)
-
         processed_path.write_bytes(pickle.dumps(sites))
+
+        # Clean up
+        self._close_raw(chunk_num, cursor)
+
         self.io_helper.logger.info(
             f"Processed {chunk_path.name} and cached results"
         )
+
         return sites
 
     def _parse_log_errors(self):
         self.errors: dict[str, str] = {}
         with open(self.io_helper.raw / "openwpm.log") as log:
             for line in log:
-                if (m := neterror_pattern.search(line)) is not None:
+                if (m := OpenWpmCrawlUtil.NETERROR_PATTERN.search(line)) is not None:
                     gd = m.groupdict()
                     if gd['url'] in self.errors:
                         assert self.errors[gd['url']] == gd['error_type'], \
@@ -402,7 +453,16 @@ class TrancoProcessUtil:
             (request_id, url, resource_type,
              hostname, cname, addresses, used_address) = req_raw
             assert used_address is not None, "used_address is None"
+
+            # Workaround for a rare bug where addresses could be empty
             addresses: str
+            if not addresses:
+                self.io_helper.logger.warning(
+                    f"Empty addresses for {hostname} ({cname}) in request {request_id}, "
+                    f"using used_address {used_address} instead."
+                )
+                addresses = used_address
+
             dns_record = UsedDnsRecord(
                 FQDN(hostname),
                 FQDN(cname),
@@ -454,7 +514,7 @@ class TrancoProcessUtil:
                 """
             ).fetchone()
         except:
-            # If that does not work, we have no other option but to walk
+            # If that does not work, we have no other option but to walk the reditect chain
             root_page_url = self._get_root_page_url_walk(site, cursor)
         return root_page_url
 

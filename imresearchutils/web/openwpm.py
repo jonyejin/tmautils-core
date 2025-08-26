@@ -7,11 +7,6 @@ from dataclasses_json import DataClassJsonMixin
 from imresearchutils.common import *
 from .types import *
 
-neterror_pattern = re.compile(
-    r"Received neterror (?P<error_type>\w+) while executing command: "
-    r"BrowseCommand\(http://(?P<url>.*),5,3\)"
-)
-
 
 @dataclass
 class CrawlProgress(DataClassJsonMixin):
@@ -35,10 +30,6 @@ class OpenWpmCrawlUtil:
             If None, the sites will be read from `sites.txt` in the raw directory.
             Passing None is useful for resuming crawls.
 
-        data_dir (Path | None):
-            Base directory for data files.
-            If None, the current working directory will be used.
-
         n_browsers (int):
             Number of browsers to use for crawling.
             Default is 10.
@@ -51,6 +42,10 @@ class OpenWpmCrawlUtil:
             Sleep duration (in seconds) passed to BrowseCommand.
             Default is 3.
 
+        failure_limit (int | None):
+            Maximum number of consecutive failures before stopping the crawl.
+            If None, the default OpenWPM limit will be used.
+
         n_sites_chunk (int):
             Number of sites to crawl in each chunk.
             Default is 100.
@@ -59,22 +54,37 @@ class OpenWpmCrawlUtil:
             Maximum number of retries for each chunk.
             Default is 3.
 
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
+            If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
+
         **kwargs (dict):
             Additional arguments for IOHelper.
             See the IOHelper class for more details.
     """
+
+    COMPRESSION_MAX_WORKERS = 2
+    NETERROR_PATTERN = re.compile(
+        r"Received neterror (?P<error_type>\w+) while executing command: "
+        r"BrowseCommand\(http://(?P<url>.*),5,3\)"
+    )
 
     def __init__(
         self,
         openwpm_path: Path,
         crawl_id: str,
         sites: list[str] | None = None,
-        data_dir: Path | None = None,
         n_browsers: int = 10,
         n_click_internal_links: int = 5,
         browser_sleep_dur: int = 3,
+        failure_limit: int | None = None,
         n_sites_chunk: int = 100,
         max_retry_per_chunk: int = 3,
+        working_root: Path | None = None,
+        data_dir: Path | None = None,
         **kwargs,
     ):
         import sys
@@ -105,14 +115,18 @@ class OpenWpmCrawlUtil:
         self.n_browsers = n_browsers
         self.n_click_internal_links = n_click_internal_links
         self.browser_sleep_dur = browser_sleep_dur
+        self.failure_limit = failure_limit
         self.n_sites_chunk = n_sites_chunk
         self.max_retry_per_chunk = max_retry_per_chunk
 
         # Set up data directory
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
-            module_name=self.__class__.__name__,
+            self.__class__.__name__,
             instance_name=self.crawl_id,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 
@@ -153,8 +167,14 @@ class OpenWpmCrawlUtil:
         self.log_pos = 0
 
         self.io_helper.logger.info(
-            f"OpenWPM crawl utility initialized with crawl ID: {self.crawl_id}, "
-            f"module directory: {self.io_helper.module_dir}"
+            f"OpenWPM crawl utility initialized with "
+            f"{len(self.sites)} sites, "
+            f"{self.n_browsers} browsers, "
+            f"{self.n_click_internal_links} internal link clicks per site, "
+            f"{self.browser_sleep_dur} seconds sleep duration, "
+            f"{self.failure_limit} failure limit, "
+            f"{self.n_sites_chunk} sites per chunk, and "
+            f"{self.max_retry_per_chunk} retries per chunk."
         )
 
     def crawl_chunk(
@@ -193,6 +213,7 @@ class OpenWpmCrawlUtil:
                 log_path=self.openwpm_log_path,
                 process_watchdog=True,
                 memory_watchdog=True,
+                _failure_limit=self.failure_limit,
             )
             browser_params = [
                 self.BrowserParams(
@@ -260,7 +281,7 @@ class OpenWpmCrawlUtil:
             with open(self.openwpm_log_path) as log:
                 log.seek(self.log_pos)
                 for line in log:
-                    if (m := neterror_pattern.search(line)) is not None:
+                    if (m := self.NETERROR_PATTERN.search(line)) is not None:
                         neterrors.add(m.groupdict()['url'])
                 self.log_pos = log.tell()
             self.io_helper.logger.info(
@@ -277,10 +298,59 @@ class OpenWpmCrawlUtil:
             if not sites_to_crawl:
                 break
 
+        if sites_to_crawl:
+            self.io_helper.logger.warning(
+                f"Failed to crawl sites {sites_to_crawl} after "
+                f"{self.max_retry_per_chunk} retries."
+            )
+        else:
+            self.io_helper.logger.info(
+                f"Successfully crawled all sites in chunk {chunknum}."
+            )
+
+        # Compress the chunk database file
+        gzip_file(db_path, force=True, logger=self.io_helper.logger)
+
+    def compress_crawled_chunks(
+        self,
+        delete_original: bool = True,
+    ):
+        """
+        Compress all crawled chunk databases in the raw directory in parallel.
+
+        Args:
+            delete_original (bool):
+                If True, the original SQLite files will be deleted after compression.
+                Default is True.
+        """
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        paths = list(self.io_helper.raw.glob("crawl_chunk_*.sqlite"))
+        if not paths:
+            return
+
+        with ThreadPoolExecutor(max_workers=self.COMPRESSION_MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(
+                    gzip_file, p, delete_original=delete_original, logger=self.io_helper.logger
+                ): p for p in paths
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception:
+                    self.io_helper.logger.error(
+                        f"Failed to compress {futures[future]}: {repr(future.exception())}"
+                    )
+
     def crawl(self):
         """
         Crawl the list of sites in chunks.
         """
+
+        # Compress any previously completed crawl chunks
+        self.compress_crawled_chunks()
 
         if self.is_crawl_done():
             return

@@ -18,9 +18,12 @@ class ASdbCategoryUtil:
             Month of the ASdb dataset to download.
             Default is 1.
 
-        data_dir (Path | None):
-            Base directory for data files.
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
 
         **kwargs (dict):
             Additional arguments for IOHelper.
@@ -31,12 +34,16 @@ class ASdbCategoryUtil:
         self,
         year: int = 2024,
         month: int = 1,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 
@@ -202,7 +209,7 @@ class ASdbCategoryUtil:
 
         asinfo = self.df[self.df["asn"] == asn]
 
-        return asinfo
+        return asinfo.reset_index(drop=True)
 
     def get(
         self,
@@ -232,13 +239,13 @@ class ASdbCategoryUtil:
             asninfo = asninfo[asninfo["layer 1"] == layer1]
         if layer2 is not None:
             asninfo = asninfo[asninfo["layer 2"] == layer2]
-        return asninfo
+        return asninfo.reset_index(drop=True)
 
     def find_ases_in_category(
         self,
         layer1_category: str,
         layer2_category: Optional[str] = None,
-    ) -> list[int]:
+    ):
         """
         Return all ASNs matching the given primary and (optional) secondary category.
 
@@ -259,4 +266,9 @@ class ASdbCategoryUtil:
             df_filtered = df_filtered[df_filtered["layer2"] == layer2_category]
 
         # Extract unique ASNs
-        return df_filtered.drop_duplicates()
+        return (
+            df_filtered
+            .drop_duplicates()
+            .sort_values(by="asn")
+            .reset_index(drop=True)
+        )

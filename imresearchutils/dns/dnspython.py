@@ -24,9 +24,12 @@ class AsyncDnsPythonUtil:
             Size of the dnspython DNS cache.
             Defaults to 500000.
 
-        data_dir (Path | None):
-            Base directory for data files.
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
 
         **kwargs:
             Additional keyword arguments for IOHelper.
@@ -44,12 +47,16 @@ class AsyncDnsPythonUtil:
         nameservers: list[str] = ["127.0.0.1"],
         max_concurrent_requests: int = 500,
         cachesize: int = 500000,
+        working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs
     ):
+        working_root = IOHelper.handle_working_root_data_dir(
+            working_root, data_dir
+        )
         self.io_helper = IOHelper(
             self.__class__.__name__,
-            data_dir=data_dir,
+            working_root=working_root,
             **kwargs,
         )
 
