@@ -3,3 +3,4 @@ from .caida_as_org import CaidaAsOrgInfoUtil
 from .pyasn import PyasnUtil
 from .ipapi import IPApiBatchUtil
 from .ipapi_old import IPApiUtil
+from .ipinfo import IPInfoLiteUtil
