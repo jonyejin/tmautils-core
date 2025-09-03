@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Union, Any, Optional, Callable
+from typing import Union, Any, Optional, Callable, Literal
 from ipaddress import IPv4Address, IPv6Address
 
 from dataclasses import dataclass

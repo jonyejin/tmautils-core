@@ -25,7 +25,6 @@ class IpInfoCarrierUtil:
     """
 
     CSV_CHUNK_SIZE = 50_000
-    CACHE_KB_DEFAULT = 256_000
 
     def __init__(
         self,

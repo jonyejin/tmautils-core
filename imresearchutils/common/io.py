@@ -1,6 +1,8 @@
 from pathlib import Path
 import logging
 
+from .types import *
+
 GZIP_STREAM_CHUNK_SIZE = 64 * 1024  # 64 KiB
 
 
@@ -70,6 +72,10 @@ def gzip_file(
         logger (logging.Logger | None):
             Optional logger to log messages.
             If None, no logging will be performed.
+
+    Returns:
+        gz_path (Path):
+            Path to the compressed gzipped file.
     """
     gz_path = file_path.with_suffix(f"{file_path.suffix}.gz")
 
@@ -79,7 +85,7 @@ def gzip_file(
                 logger.info(f"{gz_path} already exists. Skipping compression.")
             if delete_original:
                 file_path.unlink(missing_ok=True)
-            return
+            return gz_path
         else:
             gz_path.unlink(missing_ok=True)
 
@@ -102,6 +108,8 @@ def gzip_file(
 
         if logger is not None:
             logger.info(f"Compressed {file_path} to {gz_path}")
+
+        return gz_path
     except Exception as e:
         if logger is not None:
             logger.error(f"Failed to gzip {file_path}: {e}")
@@ -136,6 +144,10 @@ def gunzip_file(
         logger (logging.Logger | None):
             Optional logger to log messages.
             If None, no logging will be performed.
+
+    Returns:
+        unzipped_path (Path):
+            Path to the decompressed file.
     """
 
     unzipped_path = gz_path.with_suffix("")
@@ -148,7 +160,7 @@ def gunzip_file(
                 )
             if delete_gzip:
                 gz_path.unlink(missing_ok=True)
-            return
+            return unzipped_path
         else:
             unzipped_path.unlink(missing_ok=True)
 
@@ -168,6 +180,8 @@ def gunzip_file(
 
         if logger is not None:
             logger.info(f"Decompressed {gz_path} to {unzipped_path}")
+
+        return unzipped_path
     except Exception as e:
         if logger is not None:
             logger.error(f"Failed to gunzip {gz_path}: {e}")
@@ -301,6 +315,57 @@ class IOHelper:
                 f"IOHelper initialized with top-level directory: {self.top_level_dir}"
             )
 
+    def create_symlink(
+        self,
+        dir_name: Literal["raw", "processed"],
+        target: Path,
+        link_name: Optional[str] = None,
+    ):
+        """
+        Create a symlink in the specified directory (raw or processed).
+
+        Args:
+            dir_name (Literal["raw", "processed"]):
+                Directory in which to create the symlink.
+                Must be either "raw" or "processed".
+
+            target (Path):
+                Path to which the symlink should point.
+
+            link_name (Optional[str]):
+                Name of the symlink to be created in the specified directory.
+                If None, the name of the target file will be used.
+
+        Returns:
+            link_path (Path):
+                Path of the created symlink.
+        """
+        if dir_name not in ("raw", "processed"):
+            raise ValueError("where must be either 'raw' or 'processed'.")
+
+        target = target.expanduser().resolve(strict=True)
+        if not target.exists():
+            raise FileNotFoundError(f"Target {target} does not exist.")
+
+        if link_name is None:
+            link_name = target.name
+        link_path = self.top_level_dir / dir_name / link_name
+
+        if link_path.exists():
+            if link_path.is_symlink():
+                link_path.unlink()
+            else:
+                raise FileExistsError(
+                    f"{link_path} exists and is not a symlink."
+                )
+
+        link_path.symlink_to(target, target_is_directory=target.is_dir())
+
+        if self.has_logger:
+            self.logger.info(f"Created symlink {link_path} -> {target}")
+
+        return link_path
+
     @staticmethod
     def handle_working_root_data_dir(
         working_root: Path | None,
@@ -348,6 +413,13 @@ class IOHelper:
     @property
     def results(self):
         return self.top_level_dir / "results"
+
+    @property
+    def has_logger(self):
+        """
+        True if the instance has a logger set up.
+        """
+        return hasattr(self, "logger") and isinstance(self.logger, logging.Logger)
 
     def setup_logging(self, **kwargs):
         from datetime import datetime

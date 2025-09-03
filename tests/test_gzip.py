@@ -33,11 +33,11 @@ def test_roundtrip_compress_decompress_keep_original(tmp_path, caplog):
     original.unlink(missing_ok=True)  # remove original to test decompression
 
     # decompress but keep gz
-    gunzip_file(gz, force=False, delete_gzip=False, logger=logger)
-    unzipped = gz.with_suffix("")  # removes .gz
+    unzipped = gunzip_file(gz, force=False, delete_gzip=False, logger=logger)
     assert unzipped.exists(), "unzipped file should have been created"
     assert read_bytes(
-        unzipped) == content, "decompressed content must equal original"
+        unzipped
+    ) == content, "decompressed content must equal original"
 
     # verify logging captured relevant messages
     messages = [rec.message for rec in caplog.records]
@@ -65,8 +65,7 @@ def test_skip_if_exists_without_force(tmp_path, caplog):
     assert mt_before == mt_after, "without force, existing gz file must not be overwritten"
 
     # decompress first time
-    gunzip_file(gz, delete_gzip=False, force=False, logger=logger)
-    unzipped = gz.with_suffix("")
+    unzipped = gunzip_file(gz, delete_gzip=False, force=False, logger=logger)
     assert unzipped.exists()
 
     mt_before_unzip = unzipped.stat().st_mtime
@@ -98,8 +97,7 @@ def test_force_overwrite(tmp_path):
     # gzip again with force=True -> should overwrite existing .gz
     gzip_file(original, delete_original=False, force=True)
     # decompress and verify it reflects new content
-    gunzip_file(gz, delete_gzip=True, force=True)
-    unzipped = gz.with_suffix("")
+    unzipped = gunzip_file(gz, delete_gzip=True, force=True)
     assert unzipped.exists()
     assert read_bytes(unzipped) == new_content
 
@@ -116,8 +114,7 @@ def test_delete_original_flags(tmp_path):
     assert not original.exists(), "original should be deleted when delete_original=True"
 
     # decompress with delete_original=True: gz should be removed
-    gunzip_file(gz, delete_gzip=True, force=False)
-    unzipped = gz.with_suffix("")
+    unzipped = gunzip_file(gz, delete_gzip=True, force=False)
     assert unzipped.exists()
     assert not gz.exists(), "gz file should be deleted when delete_original=True"
 
