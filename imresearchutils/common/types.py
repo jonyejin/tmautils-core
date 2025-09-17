@@ -1,5 +1,8 @@
 from enum import Enum
-from typing import Union, Any, Optional, Callable, Literal
+from typing import (
+    Union, Any, Optional, Callable,
+    Literal, Dict, List,
+)
 from ipaddress import IPv4Address, IPv6Address
 
 from dataclasses import dataclass
@@ -23,7 +26,7 @@ class L4Proto(Enum):
     ICMP = 1
     TCP = 6
     UDP = 17
-    ICMPv6 = 58
+    ICMPV6 = 58
 
 
 @dataclass(frozen=True)

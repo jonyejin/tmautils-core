@@ -435,9 +435,10 @@ class IOHelper:
         logger.setLevel(logging.DEBUG)
         if not logger.handlers:
             formatter = logging.Formatter(
-                "%(asctime)s %(levelname)s {%(name)s} "
-                "(%(module)s:%(lineno)d) [%(funcName)s] %(message)s",
-                datefmt='%Y-%m-%d %H:%M:%S'
+                "%(asctime)s.%(msecs)03d %(levelname)s "
+                "[unit=%(name)s pid=%(process)d thread=%(threadName)s] "
+                "(%(funcName)s @ %(module)s:%(lineno)d) %(message)s",
+                datefmt="%Y-%m-%dT%H:%M:%S%z"
             )
 
             # Console handler for output to the terminal.

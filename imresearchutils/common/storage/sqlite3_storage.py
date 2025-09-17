@@ -564,3 +564,16 @@ class SqliteDatabase:
             )
 
         return table
+
+    def close(self):
+        """
+        Close the database connection.
+        """
+
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+            if self.logger:
+                self.logger.info(
+                    f"Closed SQLite database connection at {self.path}"
+                )
