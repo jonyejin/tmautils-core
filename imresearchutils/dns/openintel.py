@@ -111,21 +111,14 @@ class OpenIntelZoneStreamUtil:
         cmd_queue: Queue,
     ):
         from collections import deque
-        from queue import Empty
-        import time
         import json
-        import pandas as pd
-        import logging
-        import traceback
-
-        from imresearchutils.common import IpcMsgType, IpcCommand
 
         ws_map = {}
         send_q = deque()
+        sender_wake_event = Event()
         running = True
 
         BATCH_MAX = 1000    # max msgs per IPC batch
-        SENDER_IDLE_SEC = 0.1   # sleep when queue empty
         PUT_TIMEOUT_SEC = 0.1   # queue put timeout
 
         def _safe_put(obj) -> bool:
@@ -135,57 +128,59 @@ class OpenIntelZoneStreamUtil:
             except Exception:
                 return False
 
-        def _log(level, text):   _safe_put((IpcMsgType.LOG, level, text))
-        def _status(st):         _safe_put((IpcMsgType.STATUS, st, None))
+        def _log(level, text):   _safe_put(IpcMsg.log(level, text))
+        def _status(st):         _safe_put(IpcMsg.status(st))
 
         def _sender_loop():
             nonlocal running
             while running or send_q:
                 if not send_q:
-                    # Nothing to send
-                    time.sleep(SENDER_IDLE_SEC)
-                    continue
+                    # Nothing to send, wait for sender_wake_event
+                    sender_wake_event.wait()
+                    sender_wake_event.clear()  # Once woke up, clear event
+                    continue  # Let the next iteration handle sending or exit
+
                 topic_map = {}
                 total = 0
                 while send_q and total < BATCH_MAX:
                     topic, msg = send_q.popleft()
                     topic_map.setdefault(topic, []).append(msg)
                     total += 1
-                if not _safe_put((IpcMsgType.DATA, topic_map)):
-                    # Something went wrong, wait and retry
-                    time.sleep(SENDER_IDLE_SEC)
+
+                if not _safe_put(IpcMsg.data((topic_map,))):
+                    # Queue is full, wait a bit before retrying
+                    time.sleep(PUT_TIMEOUT_SEC)
 
         def _check_cmd():
             nonlocal running
             try:
                 while True:
-                    cmd = cmd_queue.get_nowait()
-                    if isinstance(cmd, tuple) and (
-                        cmd[0] == IpcMsgType.COMMAND and cmd[1] == IpcCommand.STOP
-                    ):
+                    msg = cmd_queue.get()
+
+                    if not isinstance(msg, IpcMsg) or not msg.is_command:
+                        _log(logging.WARNING, f"Invalid command message: {msg}")
+                        continue
+
+                    if msg.get_command().is_stop:
                         running = False
+
+                        # Close all websockets
                         for ws in list(ws_map.values()):
                             try:
                                 ws.close()
                             except Exception:
                                 pass
+
+                        # Abort rel dispatcher
                         try:
                             rel.abort()
                         except Exception:
                             pass
-                        return False  # Do not reschedule as we are stopping
-                    _log(logging.WARNING, f"Unknown command: {cmd}")
-            except Empty:
-                # Nothing in queue
-                return True
-            except (EOFError, BrokenPipeError):
-                # Parent process gone, exit
-                running = False
-                try:
-                    rel.abort()
-                except Exception:
-                    pass
-                return False
+
+                        sender_wake_event.set()  # Signal sender to exit
+                        return
+            except Exception as e:
+                _log(logging.ERROR, f"Command loop crashed: {e}")
 
         def _on_open_factory(topic):
             def _on_open(ws):
@@ -201,6 +196,7 @@ class OpenIntelZoneStreamUtil:
                     return
                 msg["msg_timestamp"] = pd.Timestamp.now(tz="UTC")
                 send_q.append((topic, msg))
+                sender_wake_event.set()
             return _on_message
 
         def _on_error_factory(topic):
@@ -216,7 +212,8 @@ class OpenIntelZoneStreamUtil:
                 )
             return _on_close
 
-        sender = None
+        sender_thr: Optional[Thread] = None
+        cmd_thr: Optional[Thread] = None
         try:
             for topic in topics:
                 ws = WebSocketApp(
@@ -233,28 +230,36 @@ class OpenIntelZoneStreamUtil:
                 )
 
             # Sender thread
-            sender = Thread(
+            sender_thr = Thread(
                 target=_sender_loop,
                 name="zone-stream-child-sender",
                 daemon=True,
             )
-            sender.start()
+            sender_thr.start()
 
-            # Stop checker
-            rel.timeout(1, _check_cmd)
+            # Command thread
+            cmd_thr = Thread(
+                target=_check_cmd,
+                name="zone-stream-child-cmd",
+                daemon=True,
+            )
+            cmd_thr.start()
 
             _status(IpcStatus.READY)
             rel.dispatch()
         except Exception as e:
             _log(
                 logging.ERROR,
-                f"Child rel.dispatch crashed: {e}\n{traceback.format_exc()}"
+                f"Error starting WebSocket listeners: {e}\n"
             )
         finally:
             try:
                 running = False
-                if sender and sender.is_alive():
-                    sender.join(timeout=3.0)
+                sender_wake_event.set()  # ensure sender can exit
+                if sender_thr and sender_thr.is_alive():
+                    sender_thr.join(timeout=3.0)
+                if cmd_thr and cmd_thr.is_alive():
+                    cmd_thr.join(timeout=3.0)
             except Exception:
                 pass
             _status(IpcStatus.STOPPED)
@@ -325,7 +330,17 @@ class OpenIntelZoneStreamUtil:
         try:
             if self._cmd_queue:
                 self._cmd_queue.put(
-                    (IpcMsgType.COMMAND, IpcCommand.STOP),
+                    IpcMsg.command(IpcCommand.STOP),
+                    timeout=0.5
+                )
+        except Exception:
+            pass
+
+        # "Fake" status update in case child is unresponsive or already stopped
+        try:
+            if self._data_queue:
+                self._data_queue.put(
+                    IpcMsg.status(IpcStatus.STOPPED),
                     timeout=0.5
                 )
         except Exception:
@@ -378,31 +393,27 @@ class OpenIntelZoneStreamUtil:
 
         while not self._stop_event.is_set():
             try:
-                msg = self._data_queue.get(timeout=1.0)
+                msg = self._data_queue.get()
             except Exception:
                 continue
 
-            if not isinstance(msg, tuple) or not msg:
+            if not isinstance(msg, IpcMsg):
+                self.io_helper.logger.warning(f"Invalid IPC message: {msg}")
                 continue
 
-            typ = msg[0]
-            if typ == IpcMsgType.DATA:
-                _, topic_map = msg
+            if msg.is_data:
+                (topic_map,) = msg.get_data()
                 with self._lock:
                     for topic, batch in topic_map.items():
                         if topic in self.message_cache and batch:
                             self.message_cache[topic].extend(batch)
-            elif typ == IpcMsgType.LOG:
-                _, level, text = msg
-                level = level or logging.INFO
+            elif msg.is_log:
+                level, text = msg.get_log()
                 self.io_helper.logger.log(level, text)
-            elif typ == IpcMsgType.STATUS:
-                _, st, _ = msg
-                if not isinstance(st, IpcStatus):
-                    self.io_helper.logger.warning(f"Unknown status: {st}")
-                    continue
+            elif msg.is_status:
+                st = msg.get_status()
                 self.io_helper.logger.info(f"Child status: {st.name}")
-                if st == IpcStatus.STOPPED:
+                if st.is_stopped:
                     break  # Stop since child stopped
 
     def _writer_loop(self):
@@ -417,8 +428,11 @@ class OpenIntelZoneStreamUtil:
         }
 
         try:
-            while not self._stop_event.is_set():
-                time.sleep(self.WRITE_INTERVAL_SEC)
+            while True:
+                if self._stop_event.wait(timeout=self.WRITE_INTERVAL_SEC):
+                    # True => stop event set
+                    break
+                # False => timeout
                 self._flush_all()
 
             # Final flush on shutdown
