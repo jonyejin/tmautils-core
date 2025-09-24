@@ -12,6 +12,27 @@ from imresearchutils.common import *
 
 
 class OpenIntelZoneStreamUtil:
+    """
+    Utility to connect to OpenIntel Zone Stream WebSocket and store messages to
+    a local SQLite database.
+
+    Args:
+        topics (list[str]): List of topics to subscribe to. Valid topics are:
+            - "newly_registered_fqdn"
+            - "newly_registered_domain"
+            - "confirmed_newly_registered_domain"
+
+        working_root (Path | None):
+            Base directory where the namespace directory will be created.
+            If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
+
+        **kwargs:
+            Additional keyword arguments for IOHelper.
+            See IOHelper documentation for more details.
+    """
 
     WS_URL = "wss://zonestream.openintel.nl/ws/{topic}"
     WRITE_INTERVAL_SEC = 10
@@ -113,7 +134,7 @@ class OpenIntelZoneStreamUtil:
         from collections import deque
         import json
 
-        ws_map = {}
+        ws_map: dict[str, WebSocketApp] = {}
         send_q = deque()
         sender_wake_event = Event()
         running = True
@@ -128,8 +149,9 @@ class OpenIntelZoneStreamUtil:
             except Exception:
                 return False
 
-        def _log(level, text):   _safe_put(IpcMsg.log(level, text))
-        def _status(st):         _safe_put(IpcMsg.status(st))
+        def _put_log(level, text):   _safe_put(IpcMsg.log(level, text))
+        def _put_status(st):         _safe_put(IpcMsg.status(st))
+        def _put_data(data):         _safe_put(IpcMsg.data((data,)))
 
         def _sender_loop():
             nonlocal running
@@ -147,7 +169,7 @@ class OpenIntelZoneStreamUtil:
                     topic_map.setdefault(topic, []).append(msg)
                     total += 1
 
-                if not _safe_put(IpcMsg.data((topic_map,))):
+                if not _put_data(topic_map):
                     # Queue is full, wait a bit before retrying
                     time.sleep(PUT_TIMEOUT_SEC)
 
@@ -158,14 +180,17 @@ class OpenIntelZoneStreamUtil:
                     msg = cmd_queue.get()
 
                     if not isinstance(msg, IpcMsg) or not msg.is_command:
-                        _log(logging.WARNING, f"Invalid command message: {msg}")
+                        _put_log(
+                            logging.WARNING,
+                            f"Invalid command message: {msg}"
+                        )
                         continue
 
                     if msg.get_command().is_stop:
                         running = False
 
                         # Close all websockets
-                        for ws in list(ws_map.values()):
+                        for ws in ws_map.values():
                             try:
                                 ws.close()
                             except Exception:
@@ -180,11 +205,11 @@ class OpenIntelZoneStreamUtil:
                         sender_wake_event.set()  # Signal sender to exit
                         return
             except Exception as e:
-                _log(logging.ERROR, f"Command loop crashed: {e}")
+                _put_log(logging.ERROR, f"Command loop crashed: {e}")
 
         def _on_open_factory(topic):
             def _on_open(ws):
-                _log(logging.INFO, f"[{topic}] WebSocket opened: {ws.url}")
+                _put_log(logging.INFO, f"[{topic}] WebSocket opened: {ws.url}")
             return _on_open
 
         def _on_message_factory(topic):
@@ -192,7 +217,10 @@ class OpenIntelZoneStreamUtil:
                 try:
                     msg = json.loads(message)
                 except json.JSONDecodeError as e:
-                    _log(logging.ERROR, f"[{topic}] JSON decode error: {e}")
+                    _put_log(
+                        logging.ERROR,
+                        f"[{topic}] JSON decode error: {e}"
+                    )
                     return
                 msg["msg_timestamp"] = pd.Timestamp.now(tz="UTC")
                 send_q.append((topic, msg))
@@ -201,12 +229,12 @@ class OpenIntelZoneStreamUtil:
 
         def _on_error_factory(topic):
             def _on_error(ws, error: Exception):
-                _log(logging.ERROR, f"[{topic}] WebSocket error: {error}")
+                _put_log(logging.ERROR, f"[{topic}] WebSocket error: {error}")
             return _on_error
 
         def _on_close_factory(topic):
             def _on_close(ws, code, msg):
-                _log(
+                _put_log(
                     logging.INFO,
                     f"[{topic}] WebSocket closed, code={code}, msg={msg}"
                 )
@@ -245,10 +273,10 @@ class OpenIntelZoneStreamUtil:
             )
             cmd_thr.start()
 
-            _status(IpcStatus.READY)
+            _put_status(IpcStatus.READY)
             rel.dispatch()
         except Exception as e:
-            _log(
+            _put_log(
                 logging.ERROR,
                 f"Error starting WebSocket listeners: {e}\n"
             )
@@ -262,9 +290,13 @@ class OpenIntelZoneStreamUtil:
                     cmd_thr.join(timeout=3.0)
             except Exception:
                 pass
-            _status(IpcStatus.STOPPED)
+            _put_status(IpcStatus.STOPPED)
 
     def start(self):
+        """
+        Start the Zone Stream listener.
+        """
+
         if self._running:
             self.io_helper.logger.warning("Already running; start() ignored.")
             return
@@ -320,6 +352,10 @@ class OpenIntelZoneStreamUtil:
         )
 
     def stop(self):
+        """
+        Stop the Zone Stream listener and flush all caches to the database.
+        """
+
         if not self._running:
             return
         self._running = False

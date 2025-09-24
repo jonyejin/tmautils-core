@@ -54,6 +54,10 @@ class PyasnUtil:
             **kwargs,
         )
 
+        self.year = year
+        self.month = month
+        self.day = day
+
         # We don't know which hour we downloaded
         db_path = next(
             self.io_helper.processed.glob(
