@@ -45,7 +45,7 @@ class IpcStatus(Enum):
     
     @property
     def is_ready(self) -> bool:
-        return self == IpcStatus.READYi
+        return self == IpcStatus.READY
 
 
 class IpcMsg:
