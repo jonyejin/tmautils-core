@@ -2,7 +2,7 @@ from enum import StrEnum
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from imresearchutils.common import *
+from tmautils.common import *
 
 #######
 # Enums

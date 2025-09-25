@@ -2,7 +2,7 @@ import pandas as pd
 import requests
 import gzip
 
-from imresearchutils.common import *
+from tmautils.common import *
 
 
 class CaidaAsOrgInfoUtil:

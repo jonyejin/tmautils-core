@@ -8,7 +8,7 @@ from multiprocessing.queues import Queue
 import logging
 import time
 
-from imresearchutils.common import *
+from tmautils.common import *
 
 
 class OpenIntelZoneStreamUtil:

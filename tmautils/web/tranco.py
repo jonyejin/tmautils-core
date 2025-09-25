@@ -2,7 +2,7 @@ import sqlite3
 import re
 from urllib.parse import urlparse
 
-from imresearchutils.common import *
+from tmautils.common import *
 from .types import *
 from .openwpm import OpenWpmCrawlUtil
 

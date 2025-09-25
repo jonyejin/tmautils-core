@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from imresearchutils.common import gzip_file, gunzip_file
+from tmautils.common import gzip_file, gunzip_file
 
 
 def write_sample(path: Path, content: bytes):

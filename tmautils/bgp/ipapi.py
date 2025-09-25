@@ -1,7 +1,7 @@
 import asyncio
 import pandas as pd
 
-from imresearchutils.common import *
+from tmautils.common import *
 
 IP_API_BATCH_URL = "http://ip-api.com/batch"
 MAX_IPS_PER_BATCH = 100

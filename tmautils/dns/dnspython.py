@@ -12,7 +12,7 @@ from dns.resolver import (
 from dns.rdatatype import RdataType
 import dns.asyncresolver
 
-from imresearchutils.common import *
+from tmautils.common import *
 
 
 class AsyncDnsPythonUtil:

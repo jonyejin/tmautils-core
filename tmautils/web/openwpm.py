@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass
 from dataclasses_json import DataClassJsonMixin
 
-from imresearchutils.common import *
+from tmautils.common import *
 from .types import *
 
 

@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "imresearchutils"
+name = "tmautils"
 version = "0.1.0"
 description = "Internet Measurement Research Utilities"
 authors = ["Sulyab Thottungal Valapu <sulyabtv@gmail.com>"]

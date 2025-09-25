@@ -2,7 +2,7 @@ from ftplib import FTP
 
 from pyasn import pyasn, mrtx
 
-from imresearchutils.common import *
+from tmautils.common import *
 
 
 ROUTEVIEWS_FTP_SERVER = "archive.routeviews.org"

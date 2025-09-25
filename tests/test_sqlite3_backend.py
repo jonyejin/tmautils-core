@@ -7,7 +7,7 @@ import pytest
 
 from ipaddress import IPv4Address, IPv6Address
 
-from imresearchutils.common import SqliteDatabase
+from tmautils.common import SqliteDatabase
 
 
 def test_single_table_crud(tmp_path):
