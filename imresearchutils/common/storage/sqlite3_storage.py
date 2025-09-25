@@ -78,6 +78,7 @@ class SqliteTable:
         int: "INTEGER",
         float: "REAL",
         str: "TEXT",
+        bytes: "BLOB",
 
         # Custom types
         bool: "BOOL",
