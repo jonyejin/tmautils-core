@@ -299,6 +299,10 @@ class SqliteTable:
                 df[col] = df[col].map(
                     lambda x: try_convert_ip(x) if pd.notna(x) else pd.NA
                 )
+            elif typ is bytes:
+                df[col] = df[col].map(
+                    lambda x: x if pd.notna(x) else pd.NA
+                )
 
             # Fallback: try a direct astype(typ), but ignore failures
             else:

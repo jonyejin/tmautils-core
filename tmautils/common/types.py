@@ -1,7 +1,9 @@
 from enum import Enum
 from typing import (
-    Union, Any, Optional, Callable,
-    Literal, Dict, List,
+    Union, Any, Optional,
+    Callable, Awaitable,
+    Literal, Dict, List, Tuple,
+    TypeVar,
 )
 from ipaddress import IPv4Address, IPv6Address
 

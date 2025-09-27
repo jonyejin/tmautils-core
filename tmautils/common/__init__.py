@@ -22,3 +22,4 @@ from .storage.sqlite3_helpers import SqliteLpmTrieHelper
 from .ipc import (
     IpcMsgType, IpcStatus, IpcCommand, IpcMsg,
 )
+from .asyncutils import run_coro_sync

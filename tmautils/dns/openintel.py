@@ -7,6 +7,7 @@ import multiprocessing as mp
 from multiprocessing.queues import Queue
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from tmautils.common import *
 
@@ -21,6 +22,13 @@ class OpenIntelZoneStreamUtil:
             - "newly_registered_fqdn"
             - "newly_registered_domain"
             - "confirmed_newly_registered_domain"
+
+        callback (Callable[[str, list[dict]], None] | None):
+            Optional callback function to be called with each batch of messages
+            received from the stream.
+            The function should accept two arguments: the topic (str),
+            and a list of message dictionaries (list[dict]).
+            The callback will be called in a separate thread.
 
         working_root (Path | None):
             Base directory where the namespace directory will be created.
@@ -37,23 +45,24 @@ class OpenIntelZoneStreamUtil:
     WS_URL = "wss://zonestream.openintel.nl/ws/{topic}"
     WRITE_INTERVAL_SEC = 10
     RECONNECT_INTERVAL_SEC = 5
+    MAX_CALLBACK_WORKERS = 4
     TOPIC_TO_SCHEMA = {
         "newly_registered_fqdn": {
-            "msg_timestamp":    pd.Timestamp,
+            "msg_timestamp":    float,
             "fqdn":             str,
             "cert_index":       int,
             "ct_name":          str,
             "timestamp":        int,
         },
         "newly_registered_domain": {
-            "msg_timestamp":    pd.Timestamp,
+            "msg_timestamp":    float,
             "domain":           str,
             "cert_index":       int,
             "ct_name":          str,
             "timestamp":        int,
         },
         "confirmed_newly_registered_domain": {
-            "msg_timestamp":    pd.Timestamp,
+            "msg_timestamp":    float,
             "domain":           str,
             "cert_index":       int,
             "ct_name":          str,
@@ -77,6 +86,8 @@ class OpenIntelZoneStreamUtil:
     def __init__(
         self,
         topics: list[str],
+        *,
+        callback: Optional[Callable[[str, list[dict]], None]] = None,
         working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs
@@ -111,6 +122,13 @@ class OpenIntelZoneStreamUtil:
         self._cmd_queue: Optional[Queue] = None   # parent -> child
         self._data_queue: Optional[Queue] = None  # child -> parent
         self._proc: Optional[mp.Process] = None
+
+        # Callback
+        self._callback = callback
+        self._cb_pool = ThreadPoolExecutor(
+            max_workers=self.MAX_CALLBACK_WORKERS,
+            thread_name_prefix=f"{self.__class__.__name__}-cb"
+        ) if callback is not None else None
 
         # Parent-side buffers
         self._running = False
@@ -222,7 +240,7 @@ class OpenIntelZoneStreamUtil:
                         f"[{topic}] JSON decode error: {e}"
                     )
                     return
-                msg["msg_timestamp"] = pd.Timestamp.now(tz="UTC")
+                msg["msg_timestamp"] = pd.Timestamp.now(tz="UTC").timestamp()
                 send_q.append((topic, msg))
                 sender_wake_event.set()
             return _on_message
@@ -387,6 +405,17 @@ class OpenIntelZoneStreamUtil:
         if self._receiver_thread and self._receiver_thread.is_alive():
             self._receiver_thread.join(timeout=5.0)
 
+        # Shut down callback pool
+        try:
+            if self._cb_pool is not None:
+                self.io_helper.logger.info(
+                    "Shutting down callback thread pool"
+                )
+                self._cb_pool.shutdown(wait=True)
+                self._cb_pool = None
+        except Exception:
+            pass
+
         # Signal writer thread to stop
         self._stop_event.set()
 
@@ -423,6 +452,18 @@ class OpenIntelZoneStreamUtil:
         except Exception:
             pass
 
+    def _dispatch_cb(self, topic: str, batch: list[dict]) -> None:
+        if not self._callback or not self._cb_pool or not batch:
+            return
+
+        def _run(cb=self._callback, t=topic, b=batch):
+            try:
+                cb(t, b)
+            except Exception as e:
+                self.io_helper.logger.error(f"Callback error: {e}")
+
+        self._cb_pool.submit(_run)
+
     def _recv_loop(self):
         if self._data_queue is None:
             return
@@ -443,6 +484,8 @@ class OpenIntelZoneStreamUtil:
                     for topic, batch in topic_map.items():
                         if topic in self.message_cache and batch:
                             self.message_cache[topic].extend(batch)
+                            # Dispatch callback if any
+                            self._dispatch_cb(topic, batch)
             elif msg.is_log:
                 level, text = msg.get_log()
                 self.io_helper.logger.log(level, text)
