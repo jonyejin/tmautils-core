@@ -1,9 +1,11 @@
 from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.utils import CryptographyDeprecationWarning
 import asyncio
 import pandas as pd
 from dns.rdatatype import RdataType
 from concurrent.futures import ThreadPoolExecutor
 from ssl import SSLCertVerificationError
+import warnings
 
 from tmautils.common import *
 from tmautils.dns import AsyncDnsPythonUtil
@@ -190,22 +192,44 @@ class DomainProfileUtil:
                 "error": err,
             }])
         else:
-            cert_df = pd.DataFrame.from_records([{
-                "timestamp": timestamp,
-                "host": host,
-                "raw_cert": cert.public_bytes(encoding=serialization.Encoding.DER),
-                "version": cert.version.value,
-                "subject": cert.subject.rfc4514_string(),
-                "issuer": cert.issuer.rfc4514_string(),
-                "serial_number": str(cert.serial_number),
-                "not_valid_before": pd.to_datetime(cert.not_valid_before_utc, utc=True).timestamp(),
-                "not_valid_after": pd.to_datetime(cert.not_valid_after_utc, utc=True).timestamp(),
-                "signature_algorithm": cert.signature_algorithm_oid.dotted_string,
-                "hash_algorithm": getattr(cert.signature_hash_algorithm, "name", None),
-                "fingerprint": cert.fingerprint(hashes.SHA256()).hex(),
-                "valid": valid,
-                "error": err,
-            }])
+            with warnings.catch_warnings():
+                # Ignore cryptography deprecation warnings
+                # We cannot do anything about the certs we receive
+                warnings.filterwarnings(
+                    "ignore",
+                    category=CryptographyDeprecationWarning
+                )
+                warnings.filterwarnings("ignore", category=DeprecationWarning)
+                warnings.filterwarnings("ignore", category=UserWarning)
+
+                def _safe(getter, default=None):
+                    try:
+                        return getter()
+                    except Exception:
+                        return default
+
+                cert_df = pd.DataFrame.from_records([{
+                    "timestamp": timestamp,
+                    "host": host,
+                    "raw_cert": _safe(
+                        lambda: cert.public_bytes(
+                            serialization.Encoding.DER
+                        ),
+                    ),
+                    "version": _safe(lambda: cert.version.value),
+                    "subject": _safe(lambda: cert.subject.rfc4514_string()),
+                    "issuer": _safe(lambda: cert.issuer.rfc4514_string()),
+                    "serial_number": _safe(lambda: str(cert.serial_number)),
+                    "not_valid_before": _safe(lambda: cert.not_valid_before_utc.timestamp()),
+                    "not_valid_after": _safe(lambda: cert.not_valid_after_utc.timestamp()),
+                    "signature_algorithm": _safe(
+                        lambda: cert.signature_algorithm_oid.dotted_string
+                    ),
+                    "hash_algorithm": _safe(lambda: cert.signature_hash_algorithm.name),
+                    "fingerprint": _safe(lambda: cert.fingerprint(hashes.SHA256()).hex()),
+                    "valid": valid,
+                    "error": err,
+                }])
 
         await self._db_call(self.cert_table.insert_df, cert_df)
         return cert_df
