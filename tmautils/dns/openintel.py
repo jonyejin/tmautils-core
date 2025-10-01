@@ -533,7 +533,7 @@ class OpenIntelZoneStreamUtil:
             # Reorder
             df = df[list(self.TOPIC_TO_SCHEMA[topic].keys())]
 
-            self.topic_tables[topic].insert_df(df, if_exists="append")
+            self.topic_tables[topic].insert_df(df)
             self.message_cache[topic] = []
 
     def _flush_all(self):

@@ -316,7 +316,7 @@ class SqliteTable:
     def insert_df(
         self,
         df: pd.DataFrame,
-        if_exists: str = "append",
+        if_exists: str = "abort",
         cast_columns_to_schema: bool = True,
     ):
         """
@@ -327,28 +327,30 @@ class SqliteTable:
                 DataFrame to insert into the table.
 
             if_exists (str):
-                What to do if the table already exists.
+                What to do if the rows being inserted would cause a conflict.
 
-                - `fail`: raise an error if the table exists.
-                - `replace`: Drop the table before inserting.
-                - `append`: Insert rows into the existing table.
+                - `fail`: On conflict, raise an error but keep changes made so far.
+                - `replace`: On conflict, replace the existing row with the new row.
+                - `abort`: On conflict, raise an error and roll back all changes made so far.
+                - `ignore`: On conflict, skip the new row.
 
             cast_columns_to_schema (bool):
                 Whether to cast DataFrame columns to match the table schema types.
                 Default is True, which will attempt to convert DataFrame types to match the schema.
         """
         # Map if_exists to SQLite conflict clauses
-        mode = if_exists.lower()
-        if mode == "replace":
-            prefix = "INSERT OR REPLACE"
-        elif mode == "fail":
-            prefix = "INSERT OR FAIL"
-        elif mode == "append":
-            prefix = "INSERT"
-        else:
+        if_exists_map = {
+            "fail": "INSERT OR FAIL",
+            "replace": "INSERT OR REPLACE",
+            "abort": "INSERT",
+            "ignore": "INSERT OR IGNORE",
+        }
+        if_exists = if_exists.lower()
+        if if_exists not in if_exists_map:
             raise ValueError(
-                f"if_exists='{if_exists}' not one of 'append', 'replace', 'fail'"
+                f"if_exists='{if_exists}' not one of {', '.join(if_exists_map.keys())}"
             )
+        prefix = if_exists_map[if_exists]
 
         # Build the INSERT statement
         cols = list(self.schema.keys())

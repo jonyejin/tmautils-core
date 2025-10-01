@@ -8,7 +8,7 @@ from ssl import SSLCertVerificationError
 import warnings
 
 from tmautils.common import *
-from tmautils.dns import AsyncDnsPythonUtil
+from tmautils.dns import AsyncDnsPythonUtil, dns_msg_semantic_hash
 
 from .cert import get_cert_async
 
@@ -20,8 +20,7 @@ class DomainProfileUtil:
     Utility to grab and store TLS certificate and DNS information for domains.
     Stores data in a SQLite database with two tables: `cert_store` and `dns_store`.
     Note: This class runs a dedicated single-threaded executor for database operations.
-    This means that you MUST go through the provided `query..` methods to access the database,
-    and not access via the `db` or `cert_table`/`dns_table` attributes directly.
+    This means that you MUST go through the provided `query..` methods to access the database.
 
     Args:
         working_root (Path | None):
@@ -36,38 +35,95 @@ class DomainProfileUtil:
             See their documentation for more details.
     """
 
-    CERT_SCHEMA = {
-        "timestamp": float,
-        "host": str,
-        "raw_cert": bytes,
-        "version": int,
-        "subject": str,
-        "issuer": str,
-        "serial_number": str,
-        "not_valid_before": float,
-        "not_valid_after": float,
-        "signature_algorithm": str,
-        "hash_algorithm": str,
-        "fingerprint": str,
-        "valid": bool,
-        "error": str,
+    CERT_OBSERVATION = {
+        "schema": {
+            "timestamp": float,
+            "host": str,
+            "port": int,
+            "sni": str,
+            "fingerprint": str,
+            "valid": bool,
+            "error": str,
+        },
+        "constraints": [
+            "PRIMARY KEY (timestamp, host, port, sni)",
+            "FOREIGN KEY (fingerprint) REFERENCES cert_info(fingerprint)",
+        ],
+        "indices": [
+            ["host"], ["fingerprint"], ["timestamp"], ["sni"],
+        ],
     }
-    DNS_SCHEMA = {
-        "timestamp": float,
-        "host": str,
-        "A": str,
-        "AAAA": str,
-        "CNAME": str,
-        "CAA": str,
-        "DMARC": str,
-        "DNSKEY": str,
-        "DS": str,
-        "MX": str,
-        "NS": str,
-        "SOA": str,
-        "SPF": str,
-        "TXT": str,
+    CERT_INFO = {
+        "schema": {
+            "fingerprint": str,
+            "raw_cert": bytes,
+            "version": int,
+            "subject": str,
+            "issuer": str,
+            "serial_number": str,
+            "not_valid_before": float,
+            "not_valid_after": float,
+            "signature_algorithm": str,
+            "hash_algorithm": str,
+        },
+        "constraints": [
+            "PRIMARY KEY (fingerprint)",
+        ],
+        "indices": [
+            ["subject"], ["issuer"], ["not_valid_after"],
+        ],
     }
+    DNS_OBSERVATION = {
+        "schema": {
+            "timestamp": float,
+            "host": str,
+            "A_semhash": str, "A_expiry": float,
+            "AAAA_semhash": str, "AAAA_expiry": float,
+            "CNAME_semhash": str, "CNAME_expiry": float,
+            "CAA_semhash": str, "CAA_expiry": float,
+            "DMARC_semhash": str, "DMARC_expiry": float,
+            "DNSKEY_semhash": str, "DNSKEY_expiry": float,
+            "DS_semhash": str, "DS_expiry": float,
+            "MX_semhash": str, "MX_expiry": float,
+            "NS_semhash": str, "NS_expiry": float,
+            "SOA_semhash": str, "SOA_expiry": float,
+            "SPF_semhash": str, "SPF_expiry": float,
+            "TXT_semhash": str, "TXT_expiry": float,
+        },
+        "constraints": [
+            "PRIMARY KEY (timestamp, host)",
+            "FOREIGN KEY (A_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (AAAA_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (CNAME_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (CAA_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (DMARC_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (DNSKEY_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (DS_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (MX_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (NS_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (SOA_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (SPF_semhash) REFERENCES dns_info(hash)",
+            "FOREIGN KEY (TXT_semhash) REFERENCES dns_info(hash)",
+        ],
+        "indices": [
+            ["host"], ["timestamp"],
+        ],
+    }
+    DNS_INFO = {
+        "schema": {
+            "hash": str,
+            "wire_bytes": bytes,
+        },
+        "constraints": [
+            "PRIMARY KEY (hash)",
+        ],
+        "indices": [
+            ["hash"],
+        ],
+    }
+    DNS_RECORD_TYPES = [
+        t[:-8] for t in DNS_OBSERVATION["schema"].keys() if t.endswith("_semhash")
+    ]
 
     def __init__(
         self,
@@ -102,32 +158,46 @@ class DomainProfileUtil:
         # Build database and tables inside the db executor thread
         def _init_db():
             db = SqliteDatabase(self.db_path, logger=self.io_helper.logger)
-            cert_table = db.register_table(
-                "cert_store",
-                self.CERT_SCHEMA,
-                table_constraints=[
-                    "PRIMARY KEY (timestamp, host)",
-                ],
-                indices=[
-                    ["host"], ["subject"], ["issuer"], ["not_valid_after"],
-                ],
+            cert_obs_table = db.register_table(
+                "cert_observation",
+                schema=self.CERT_OBSERVATION["schema"],
+                table_constraints=self.CERT_OBSERVATION["constraints"],
+                indices=self.CERT_OBSERVATION["indices"],
             )
-            dns_table = db.register_table(
-                "dns_store",
-                self.DNS_SCHEMA,
-                table_constraints=[
-                    "PRIMARY KEY (timestamp, host)",
-                ],
+            cert_info_table = db.register_table(
+                "cert_info",
+                schema=self.CERT_INFO["schema"],
+                table_constraints=self.CERT_INFO["constraints"],
+                indices=self.CERT_INFO["indices"],
             )
-            return db, cert_table, dns_table
-        self.db, self.cert_table, self.dns_table = self._db_exec.submit(
-            _init_db
-        ).result()
+            dns_obs_table = db.register_table(
+                "dns_observation",
+                schema=self.DNS_OBSERVATION["schema"],
+                table_constraints=self.DNS_OBSERVATION["constraints"],
+                indices=self.DNS_OBSERVATION["indices"],
+            )
+            dns_info_table = db.register_table(
+                "dns_info",
+                schema=self.DNS_INFO["schema"],
+                table_constraints=self.DNS_INFO["constraints"],
+                indices=self.DNS_INFO["indices"],
+            )
+            return db, cert_obs_table, cert_info_table, dns_obs_table, dns_info_table
+        (self.db,
+         self.cert_obs_table, self.cert_info_table,
+         self.dns_table, self.dns_info_table) = self._db_exec.submit(_init_db).result()
         self._closed = False
 
     async def _db_call(self, fn: Callable[..., _T], *args, **kwargs) -> _T:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._db_exec, lambda: fn(*args, **kwargs))
+
+    def _cert_join(self, obs_df: pd.DataFrame, info_df: pd.DataFrame):
+        return obs_df.merge(
+            info_df,
+            on="fingerprint",
+            how="left",
+        )
 
     async def grab_cert_async(
         self,
@@ -184,14 +254,10 @@ class DomainProfileUtil:
             )
             err = repr(e)
 
-        timestamp = pd.Timestamp.now(tz="UTC").timestamp()
-        if cert is None:
-            cert_df = pd.DataFrame.from_records([{
-                "timestamp": timestamp,
-                "host": host,
-                "error": err,
-            }])
-        else:
+        # Prepare and insert cert info row if we got a cert
+        fingerprint = None
+        cert_info_df = pd.DataFrame(columns=self.CERT_INFO["schema"].keys())
+        if cert is not None:
             with warnings.catch_warnings():
                 # Ignore cryptography deprecation warnings
                 # We cannot do anything about the certs we receive
@@ -208,9 +274,11 @@ class DomainProfileUtil:
                     except Exception:
                         return default
 
-                cert_df = pd.DataFrame.from_records([{
-                    "timestamp": timestamp,
-                    "host": host,
+                fingerprint = _safe(
+                    lambda: cert.fingerprint(hashes.SHA256()).hex()
+                )
+                cert_info_df = pd.DataFrame.from_records([{
+                    "fingerprint": fingerprint,
                     "raw_cert": _safe(
                         lambda: cert.public_bytes(
                             serialization.Encoding.DER
@@ -226,13 +294,24 @@ class DomainProfileUtil:
                         lambda: cert.signature_algorithm_oid.dotted_string
                     ),
                     "hash_algorithm": _safe(lambda: cert.signature_hash_algorithm.name),
-                    "fingerprint": _safe(lambda: cert.fingerprint(hashes.SHA256()).hex()),
-                    "valid": valid,
-                    "error": err,
                 }])
 
-        await self._db_call(self.cert_table.insert_df, cert_df)
-        return cert_df
+            await self._db_call(self.cert_info_table.insert_df, cert_info_df, if_exists="ignore")
+
+        # Prepare and insert observation row
+        cert_obs_df = pd.DataFrame.from_records([{
+            "timestamp": pd.Timestamp.now(tz="UTC").timestamp(),
+            "host": host,
+            "port": port,
+            "sni": sni,
+            "fingerprint": fingerprint,
+            "valid": valid,
+            "error": err,
+        }])
+        await self._db_call(self.cert_obs_table.insert_df, cert_obs_df)
+
+        # Join cert_obs_df with cert_info_df on fingerprint to return full info
+        return self._cert_join(cert_obs_df, cert_info_df)
 
     def grab_cert(
         self,
@@ -247,6 +326,27 @@ class DomainProfileUtil:
         return run_coro_sync(
             self.grab_cert_async(host, port, sni=sni)
         )
+
+    def _dns_join(self, obs_df: pd.DataFrame, info_df: pd.DataFrame):
+        for col in self.DNS_RECORD_TYPES:
+            obs_df[col] = pd.Series([None] * len(obs_df), dtype="object")
+
+        if info_df.empty:
+            return obs_df
+
+        wire_bytes_map = info_df.set_index("hash")["wire_bytes"]
+
+        # Map all _semhash columns to wire_bytes
+        for col in [c for c in obs_df.columns if c.endswith("_semhash")]:
+            obs_df[col.replace("_semhash", "")] = obs_df[col].map(
+                wire_bytes_map
+            )
+
+        # Drop all _semhash columns
+        obs_df = obs_df.drop(
+            columns=[c for c in obs_df.columns if c.endswith("_semhash")])
+
+        return obs_df
 
     async def grab_dns_async(self, host: str):
         """
@@ -270,24 +370,43 @@ class DomainProfileUtil:
             soa=True, spf=True, txt=True,
         )
 
-        # Handle special rdtypes and convert responses to text
+        # Handle special rdtypes
         spf_dmarc_map = {"_spf": "SPF", "_dmarc": "DMARC"}
         dns_dict = {
-            (k.name if isinstance(k, RdataType) else spf_dmarc_map[k]):
-            (v.response.to_text() if v is not None else None)
+            (k.name if isinstance(k, RdataType) else spf_dmarc_map[k]): v
             for k, v in dns_dict.items()
         }
 
-        # Convert to dataframe
-        timestamp = pd.Timestamp.now(tz="UTC").timestamp()
-        dns_df = pd.DataFrame.from_records([{
-            "timestamp": timestamp,
+        dns_obs_dict = {
+            "timestamp": pd.Timestamp.now(tz="UTC").timestamp(),
             "host": host,
-            **dns_dict,
-        }])
+        }
+        dns_info_rows = []
 
-        await self._db_call(self.dns_table.insert_df, dns_df)
-        return dns_df
+        for k, v in dns_dict.items():
+            if v is None:
+                dns_obs_dict[f"{k}_semhash"] = None
+                dns_obs_dict[f"{k}_expiry"] = None
+                continue
+
+            dns_obs_dict[f"{k}_semhash"] = dns_msg_semantic_hash(v.response)
+            dns_obs_dict[f"{k}_expiry"] = v.expiration
+
+            dns_info_rows.append({
+                "hash": dns_obs_dict[f"{k}_semhash"],
+                "wire_bytes": v.response.to_wire(),
+            })
+
+        # Insert DNS info rows
+        dns_info_df = pd.DataFrame.from_records(dns_info_rows)
+        if not dns_info_df.empty:
+            await self._db_call(self.dns_info_table.insert_df, dns_info_df, if_exists="ignore")
+
+        # Insert DNS observation row
+        dns_obs_df = pd.DataFrame.from_records([dns_obs_dict])
+        await self._db_call(self.dns_table.insert_df, dns_obs_df)
+
+        return self._dns_join(dns_obs_df, dns_info_df)
 
     def grab_dns(self, host: str):
         """
@@ -357,18 +476,6 @@ class DomainProfileUtil:
         """
         return run_coro_sync(self._db_call(table.query, sql, params))
 
-    def query_dns(self, sql: str, params: Tuple = ()):
-        """
-        Query the DNS table with a SQL query and return the results as a DataFrame.
-        """
-        return self.query(self.dns_table, sql, params)
-
-    def query_cert(self, sql: str, params: Tuple = ()):
-        """
-        Query the certificate table with a SQL query and return the results as a DataFrame.
-        """
-        return self.query(self.cert_table, sql, params)
-
     def query_all(self, table: SqliteTable):
         """
         Query all rows from the specified table and return them as a DataFrame.
@@ -386,13 +493,17 @@ class DomainProfileUtil:
         """
         Return all rows from the DNS table as a DataFrame.
         """
-        return self.query_all(self.dns_table)
+        df_dns_obs = self.query_all(self.dns_table)
+        df_dns_info = self.query_all(self.dns_info_table)
+        return self._dns_join(df_dns_obs, df_dns_info)
 
     def query_all_cert(self):
         """
         Return all rows from the certificate table as a DataFrame.
         """
-        return self.query_all(self.cert_table)
+        df_cert_obs = self.query_all(self.cert_obs_table)
+        df_cert_info = self.query_all(self.cert_info_table)
+        return self._cert_join(df_cert_obs, df_cert_info)
 
     async def aclose(self):
         if self._closed:
