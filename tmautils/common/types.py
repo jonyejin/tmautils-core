@@ -1,13 +1,13 @@
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import (
     Union, Any, Optional,
     Callable, Awaitable,
     Literal, Dict, List, Tuple,
-    TypeVar,
+    TypeVar, TYPE_CHECKING,
 )
 from ipaddress import IPv4Address, IPv6Address
 
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict, field
 from tldextract import extract
 
 IPAddress = Union[IPv4Address, IPv6Address]

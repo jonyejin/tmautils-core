@@ -20,6 +20,6 @@ from .io import (
 from .storage.sqlite3_storage import SqliteDatabase, SqliteTable
 from .storage.sqlite3_helpers import SqliteLpmTrieHelper
 from .ipc import (
-    IpcMsgType, IpcStatus, IpcCommand, IpcMsg,
+    IpcMsgType, IpcStatusCode, IpcMethodBase, IpcMsg,
 )
 from .asyncutils import run_coro_sync
