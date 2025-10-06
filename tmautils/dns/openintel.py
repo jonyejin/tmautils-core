@@ -6,10 +6,209 @@ import atexit
 import multiprocessing as mp
 from multiprocessing.queues import Queue
 import logging
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 from tmautils.common import *
+
+
+class ZoneStreamMethod(IpcMethodBase, StrEnum):
+    STOP = "stop"
+    BATCH = "batch"
+
+
+class OpenIntelZoneStreamWorker:
+    SERVICE = "openintel_zonestream"
+    WS_URL = "wss://zonestream.openintel.nl/ws/{topic}"
+    BATCH_MAX = 1000
+    THREAD_JOIN_TIMEOUT_SEC = 3.0
+    RECONNECT_INTERVAL_SEC = 5
+
+    def __init__(
+        self,
+        topics: list[str],
+        data_q: Queue,
+        cmd_q: Queue,
+    ):
+        from collections import deque
+
+        self.topics = topics
+        self.data_q = data_q
+        self.cmd_q = cmd_q
+
+        self.ws_map: dict[str, WebSocketApp] = {}
+
+        self.send_q = deque()
+        self.sender_wake = Event()
+        self.running = Event()
+        self.running.set()
+
+        self.sender_thr: Optional[Thread] = None
+        self.cmd_thr: Optional[Thread] = None
+
+    def _sender_loop(self):
+        while self.running.is_set() or self.send_q:
+            if not self.send_q:
+                # Nothing to send, wait for sender_wake_event
+                self.sender_wake.wait()
+                self.sender_wake.clear()  # Woke up => clear event
+                continue  # Let the next iteration handle sending or exit
+
+            topic_map = {}
+            total = 0
+            while self.send_q and total < self.BATCH_MAX:
+                topic, msg = self.send_q.popleft()
+                topic_map.setdefault(topic, []).append(msg)
+                total += 1
+
+            self.data_q.put(
+                IpcMsg.notify(
+                    self.SERVICE,
+                    ZoneStreamMethod.BATCH,
+                    topic_map=topic_map
+                )
+            )
+
+    def _cmd_loop(self):
+        while self.running.is_set():
+            try:
+                msg = self.cmd_q.get(timeout=0.5)
+            except Exception:
+                continue
+
+            if ((not isinstance(msg, IpcMsg)) or
+                (msg.service != self.SERVICE) or
+                    (not msg.is_notify)):
+                continue
+
+            if ZoneStreamMethod.get_method(msg) == ZoneStreamMethod.STOP:
+                self.shutdown()
+                break
+
+    def _on_open_factory(self, topic):
+        def _on_open(ws):
+            self.data_q.put(
+                IpcMsg.log(
+                    logging.INFO,
+                    f"[{topic}] WebSocket opened: {ws.url}"
+                )
+            )
+
+        return _on_open
+
+    def _on_message_factory(self, topic):
+        import json
+
+        def _on_message(ws, message: str):
+            try:
+                msg = json.loads(message)
+            except Exception as e:
+                self.data_q.put(
+                    IpcMsg.log(
+                        logging.ERROR,
+                        f"[{topic}] JSON decode error: {e}"
+                    )
+                )
+                return
+            msg["msg_timestamp"] = pd.Timestamp.now(tz="UTC").timestamp()
+            self.send_q.append((topic, msg))
+            self.sender_wake.set()
+
+        return _on_message
+
+    def _on_error_factory(self, topic):
+        def _on_error(ws, error: Exception):
+            self.data_q.put(
+                IpcMsg.log(
+                    logging.ERROR,
+                    f"[{topic}] WebSocket error: {error}"
+                )
+            )
+
+        return _on_error
+
+    def _on_close_factory(self, topic):
+        def _on_close(ws, code, msg):
+            self.data_q.put(
+                IpcMsg.log(
+                    logging.INFO,
+                    f"[{topic}] WebSocket closed, code={code}, msg={msg}"
+                )
+            )
+
+        return _on_close
+
+    def shutdown(self):
+        if not self.running.is_set():
+            return
+        self.running.clear()
+
+        # Close all websockets
+        for ws in self.ws_map.values():
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        # Abort rel dispatcher
+        try:
+            rel.abort()
+        except Exception:
+            pass
+
+        # Signal sender to exit
+        self.sender_wake.set()
+
+    def run(self):
+        try:
+            for topic in self.topics:
+                ws = WebSocketApp(
+                    self.WS_URL.format(topic=topic),
+                    on_open=self._on_open_factory(topic),
+                    on_message=self._on_message_factory(topic),
+                    on_error=self._on_error_factory(topic),
+                    on_close=self._on_close_factory(topic),
+                )
+                self.ws_map[topic] = ws
+                ws.run_forever(
+                    dispatcher=rel,  # Use rel to run in background
+                    reconnect=self.RECONNECT_INTERVAL_SEC,
+                )
+
+            # Sender thread
+            self.sender_thr = Thread(
+                target=self._sender_loop,
+                name=f"{self.__class__.__name__}-sender",
+                daemon=True,
+            )
+            self.sender_thr.start()
+
+            # Command thread
+            self.cmd_thr = Thread(
+                target=self._cmd_loop,
+                name=f"{self.__class__.__name__}-cmd",
+                daemon=True,
+            )
+            self.cmd_thr.start()
+
+            self.data_q.put(IpcMsg.status(IpcStatusCode.READY))
+            rel.dispatch()
+        except Exception as e:
+            self.data_q.put(
+                IpcMsg.log(
+                    logging.ERROR,
+                    f"Error starting WebSocket listeners: {e}\n"
+                )
+            )
+        finally:
+            self.shutdown()
+            try:
+                if self.sender_thr and self.sender_thr.is_alive():
+                    self.sender_thr.join(timeout=self.THREAD_JOIN_TIMEOUT_SEC)
+                if self.cmd_thr and self.cmd_thr.is_alive():
+                    self.cmd_thr.join(timeout=self.THREAD_JOIN_TIMEOUT_SEC)
+            except Exception:
+                pass
+            self.data_q.put(IpcMsg.status(IpcStatusCode.STOPPED))
 
 
 class OpenIntelZoneStreamUtil:
@@ -42,9 +241,7 @@ class OpenIntelZoneStreamUtil:
             See IOHelper documentation for more details.
     """
 
-    WS_URL = "wss://zonestream.openintel.nl/ws/{topic}"
     WRITE_INTERVAL_SEC = 10
-    RECONNECT_INTERVAL_SEC = 5
     MAX_CALLBACK_WORKERS = 4
     TOPIC_TO_SCHEMA = {
         "newly_registered_fqdn": {
@@ -142,173 +339,12 @@ class OpenIntelZoneStreamUtil:
         self.topic_tables: Optional[dict[str, SqliteTable]] = None
 
     @staticmethod
-    def _websocket_listener(
-        topics: list[str],
-        ws_url: str,
-        reconnect_interval_sec: int,
-        data_queue: Queue,
-        cmd_queue: Queue,
-    ):
-        from collections import deque
-        import json
+    def _child_entry(topics: list[str], data_q: Queue, cmd_q: Queue):
+        # Ignore SIGINT in child
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-        ws_map: dict[str, WebSocketApp] = {}
-        send_q = deque()
-        sender_wake_event = Event()
-        running = True
-
-        BATCH_MAX = 1000    # max msgs per IPC batch
-        PUT_TIMEOUT_SEC = 0.1   # queue put timeout
-
-        def _safe_put(obj) -> bool:
-            try:
-                data_queue.put(obj, timeout=PUT_TIMEOUT_SEC)
-                return True
-            except Exception:
-                return False
-
-        def _put_log(level, text):   _safe_put(IpcMsg.log(level, text))
-        def _put_status(st):         _safe_put(IpcMsg.status(st))
-        def _put_data(data):         _safe_put(IpcMsg.data((data,)))
-
-        def _sender_loop():
-            nonlocal running
-            while running or send_q:
-                if not send_q:
-                    # Nothing to send, wait for sender_wake_event
-                    sender_wake_event.wait()
-                    sender_wake_event.clear()  # Once woke up, clear event
-                    continue  # Let the next iteration handle sending or exit
-
-                topic_map = {}
-                total = 0
-                while send_q and total < BATCH_MAX:
-                    topic, msg = send_q.popleft()
-                    topic_map.setdefault(topic, []).append(msg)
-                    total += 1
-
-                if not _put_data(topic_map):
-                    # Queue is full, wait a bit before retrying
-                    time.sleep(PUT_TIMEOUT_SEC)
-
-        def _check_cmd():
-            nonlocal running
-            try:
-                while True:
-                    msg = cmd_queue.get()
-
-                    if not isinstance(msg, IpcMsg) or not msg.is_command:
-                        _put_log(
-                            logging.WARNING,
-                            f"Invalid command message: {msg}"
-                        )
-                        continue
-
-                    if msg.get_command().is_stop:
-                        running = False
-
-                        # Close all websockets
-                        for ws in ws_map.values():
-                            try:
-                                ws.close()
-                            except Exception:
-                                pass
-
-                        # Abort rel dispatcher
-                        try:
-                            rel.abort()
-                        except Exception:
-                            pass
-
-                        sender_wake_event.set()  # Signal sender to exit
-                        return
-            except Exception as e:
-                _put_log(logging.ERROR, f"Command loop crashed: {e}")
-
-        def _on_open_factory(topic):
-            def _on_open(ws):
-                _put_log(logging.INFO, f"[{topic}] WebSocket opened: {ws.url}")
-            return _on_open
-
-        def _on_message_factory(topic):
-            def _on_message(ws, message: str):
-                try:
-                    msg = json.loads(message)
-                except json.JSONDecodeError as e:
-                    _put_log(
-                        logging.ERROR,
-                        f"[{topic}] JSON decode error: {e}"
-                    )
-                    return
-                msg["msg_timestamp"] = pd.Timestamp.now(tz="UTC").timestamp()
-                send_q.append((topic, msg))
-                sender_wake_event.set()
-            return _on_message
-
-        def _on_error_factory(topic):
-            def _on_error(ws, error: Exception):
-                _put_log(logging.ERROR, f"[{topic}] WebSocket error: {error}")
-            return _on_error
-
-        def _on_close_factory(topic):
-            def _on_close(ws, code, msg):
-                _put_log(
-                    logging.INFO,
-                    f"[{topic}] WebSocket closed, code={code}, msg={msg}"
-                )
-            return _on_close
-
-        sender_thr: Optional[Thread] = None
-        cmd_thr: Optional[Thread] = None
-        try:
-            for topic in topics:
-                ws = WebSocketApp(
-                    ws_url.format(topic=topic),
-                    on_open=_on_open_factory(topic),
-                    on_message=_on_message_factory(topic),
-                    on_error=_on_error_factory(topic),
-                    on_close=_on_close_factory(topic),
-                )
-                ws_map[topic] = ws
-                ws.run_forever(
-                    dispatcher=rel,
-                    reconnect=reconnect_interval_sec
-                )
-
-            # Sender thread
-            sender_thr = Thread(
-                target=_sender_loop,
-                name="zone-stream-child-sender",
-                daemon=True,
-            )
-            sender_thr.start()
-
-            # Command thread
-            cmd_thr = Thread(
-                target=_check_cmd,
-                name="zone-stream-child-cmd",
-                daemon=True,
-            )
-            cmd_thr.start()
-
-            _put_status(IpcStatus.READY)
-            rel.dispatch()
-        except Exception as e:
-            _put_log(
-                logging.ERROR,
-                f"Error starting WebSocket listeners: {e}\n"
-            )
-        finally:
-            try:
-                running = False
-                sender_wake_event.set()  # ensure sender can exit
-                if sender_thr and sender_thr.is_alive():
-                    sender_thr.join(timeout=3.0)
-                if cmd_thr and cmd_thr.is_alive():
-                    cmd_thr.join(timeout=3.0)
-            except Exception:
-                pass
-            _put_status(IpcStatus.STOPPED)
+        OpenIntelZoneStreamWorker(topics, data_q, cmd_q).run()
 
     def start(self):
         """
@@ -329,12 +365,10 @@ class OpenIntelZoneStreamUtil:
         # Child process
         self.io_helper.logger.info("Starting child process")
         self._proc = self._ctx.Process(
-            target=OpenIntelZoneStreamUtil._websocket_listener,
+            target=OpenIntelZoneStreamUtil._child_entry,
             name=f"{OpenIntelZoneStreamUtil.__name__}-child",
             args=(
                 self.topics,
-                self.WS_URL,
-                self.RECONNECT_INTERVAL_SEC,
                 self._data_queue,
                 self._cmd_queue,
             ),
@@ -384,7 +418,10 @@ class OpenIntelZoneStreamUtil:
         try:
             if self._cmd_queue:
                 self._cmd_queue.put(
-                    IpcMsg.command(IpcCommand.STOP),
+                    IpcMsg.notify(
+                        OpenIntelZoneStreamWorker.SERVICE,
+                        ZoneStreamMethod.STOP
+                    ),
                     timeout=0.5
                 )
         except Exception:
@@ -394,7 +431,7 @@ class OpenIntelZoneStreamUtil:
         try:
             if self._data_queue:
                 self._data_queue.put(
-                    IpcMsg.status(IpcStatus.STOPPED),
+                    IpcMsg.status(IpcStatusCode.STOPPED),
                     timeout=0.5
                 )
         except Exception:
@@ -478,25 +515,44 @@ class OpenIntelZoneStreamUtil:
                 self.io_helper.logger.warning(f"Invalid IPC message: {msg}")
                 continue
 
-            if msg.is_data:
-                (topic_map,) = msg.get_data()
-                with self._lock:
-                    for topic, batch in topic_map.items():
-                        if topic in self.message_cache and batch:
-                            self.message_cache[topic].extend(batch)
-                            # Dispatch callback if any
-                            self._dispatch_cb(topic, batch)
-            elif msg.is_log:
-                level, text = msg.get_log()
-                self.io_helper.logger.log(level, text)
-            elif msg.is_status:
-                st = msg.get_status()
-                self.io_helper.logger.info(f"Child status: {st.name}")
-                if st.is_stopped:
+            if msg.is_log:
+                self.io_helper.logger.log(
+                    msg.level or logging.INFO,
+                    msg.message,
+                )
+                continue
+
+            if msg.is_status:
+                st = msg.status_code
+                self.io_helper.logger.info(
+                    f"Child status: {st.value if st else st}"
+                )
+                if st == IpcStatusCode.STOPPED:
                     break  # Stop since child stopped
+                continue
+
+            if msg.service != OpenIntelZoneStreamWorker.SERVICE:
+                self.io_helper.logger.warning(
+                    f"Message for unknown service: {msg.service}"
+                )
+                continue
+
+            if msg.is_notify:
+                if ZoneStreamMethod.get_method(msg) == ZoneStreamMethod.BATCH:
+                    topic_map = (msg.kwargs or {}).get("topic_map", {})
+                    with self._lock:
+                        for topic, batch in topic_map.items():
+                            if topic in self.message_cache and batch:
+                                self.message_cache[topic].extend(batch)
+                                # Dispatch callback if any
+                                self._dispatch_cb(topic, batch)
 
     def _writer_loop(self):
-        self.db = SqliteDatabase(self.db_path, logger=self.io_helper.logger)
+        self.db = SqliteDatabase(
+            self.db_path,
+            logger=self.io_helper.logger,
+            offload_to_worker=True,
+        )
         self.topic_tables = {
             topic: self.db.register_table(
                 topic,
@@ -514,12 +570,12 @@ class OpenIntelZoneStreamUtil:
                 # False => timeout
                 self._flush_all()
 
-            # Final flush on shutdown
-            self._flush_all()
+            # Final blocking flush on shutdown
+            self._flush_all(block=True)
         finally:
             self.db.close()
 
-    def _write_to_db(self, topic: str):
+    def _write_to_db(self, topic: str, block: bool = False):
         with self._lock:
             cache = self.message_cache.get(topic, [])
             if not cache:
@@ -533,12 +589,12 @@ class OpenIntelZoneStreamUtil:
             # Reorder
             df = df[list(self.TOPIC_TO_SCHEMA[topic].keys())]
 
-            self.topic_tables[topic].insert_df(df)
+            self.topic_tables[topic].insert_df(df, block=block)
             self.message_cache[topic] = []
 
-    def _flush_all(self):
+    def _flush_all(self, block: bool = False):
         for t in list(self.topics):
             try:
-                self._write_to_db(t)
+                self._write_to_db(t, block=block)
             except Exception as e:
                 self.io_helper.logger.error(f"[{t}] flush failed: {e}")

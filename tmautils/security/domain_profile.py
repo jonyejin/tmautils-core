@@ -149,48 +149,39 @@ class DomainProfileUtil:
         )
         self.db_path = self.io_helper.raw / "domain.sqlite"
 
-        # Dedicated DB executor (single thread)
-        self._db_exec = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix=f"{self.__class__.__name__}-dbexec"
+        self.db = SqliteDatabase(
+            self.db_path,
+            logger=self.io_helper.logger,
+            offload_to_worker=True,
+        )
+        self.cert_info_table = self.db.register_table(
+            "cert_info",
+            schema=self.CERT_INFO["schema"],
+            table_constraints=self.CERT_INFO["constraints"],
+            indices=self.CERT_INFO["indices"],
+        )
+        self.cert_obs_table = self.db.register_table(
+            "cert_observation",
+            schema=self.CERT_OBSERVATION["schema"],
+            table_constraints=self.CERT_OBSERVATION["constraints"],
+            indices=self.CERT_OBSERVATION["indices"],
+        )
+        self.dns_info_table = self.db.register_table(
+            "dns_info",
+            schema=self.DNS_INFO["schema"],
+            table_constraints=self.DNS_INFO["constraints"],
+            indices=self.DNS_INFO["indices"],
+        )
+        self.dns_obs_table = self.db.register_table(
+            "dns_observation",
+            schema=self.DNS_OBSERVATION["schema"],
+            table_constraints=self.DNS_OBSERVATION["constraints"],
+            indices=self.DNS_OBSERVATION["indices"],
         )
 
-        # Build database and tables inside the db executor thread
-        def _init_db():
-            db = SqliteDatabase(self.db_path, logger=self.io_helper.logger)
-            cert_obs_table = db.register_table(
-                "cert_observation",
-                schema=self.CERT_OBSERVATION["schema"],
-                table_constraints=self.CERT_OBSERVATION["constraints"],
-                indices=self.CERT_OBSERVATION["indices"],
-            )
-            cert_info_table = db.register_table(
-                "cert_info",
-                schema=self.CERT_INFO["schema"],
-                table_constraints=self.CERT_INFO["constraints"],
-                indices=self.CERT_INFO["indices"],
-            )
-            dns_obs_table = db.register_table(
-                "dns_observation",
-                schema=self.DNS_OBSERVATION["schema"],
-                table_constraints=self.DNS_OBSERVATION["constraints"],
-                indices=self.DNS_OBSERVATION["indices"],
-            )
-            dns_info_table = db.register_table(
-                "dns_info",
-                schema=self.DNS_INFO["schema"],
-                table_constraints=self.DNS_INFO["constraints"],
-                indices=self.DNS_INFO["indices"],
-            )
-            return db, cert_obs_table, cert_info_table, dns_obs_table, dns_info_table
-        (self.db,
-         self.cert_obs_table, self.cert_info_table,
-         self.dns_table, self.dns_info_table) = self._db_exec.submit(_init_db).result()
-        self._closed = False
-
-    async def _db_call(self, fn: Callable[..., _T], *args, **kwargs) -> _T:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._db_exec, lambda: fn(*args, **kwargs))
+        self.io_helper.logger.info(
+            f"{self.__class__.__name__} initialized with DB at {self.db_path}"
+        )
 
     def _cert_join(self, obs_df: pd.DataFrame, info_df: pd.DataFrame):
         return obs_df.merge(
@@ -296,7 +287,7 @@ class DomainProfileUtil:
                     "hash_algorithm": _safe(lambda: cert.signature_hash_algorithm.name),
                 }])
 
-            await self._db_call(self.cert_info_table.insert_df, cert_info_df, if_exists="ignore")
+            self.cert_info_table.insert_df(cert_info_df, if_exists="ignore")
 
         # Prepare and insert observation row
         cert_obs_df = pd.DataFrame.from_records([{
@@ -308,7 +299,7 @@ class DomainProfileUtil:
             "valid": valid,
             "error": err,
         }])
-        await self._db_call(self.cert_obs_table.insert_df, cert_obs_df)
+        self.cert_obs_table.insert_df(cert_obs_df)
 
         # Join cert_obs_df with cert_info_df on fingerprint to return full info
         return self._cert_join(cert_obs_df, cert_info_df)
@@ -400,11 +391,11 @@ class DomainProfileUtil:
         # Insert DNS info rows
         dns_info_df = pd.DataFrame.from_records(dns_info_rows)
         if not dns_info_df.empty:
-            await self._db_call(self.dns_info_table.insert_df, dns_info_df, if_exists="ignore")
+            self.dns_info_table.insert_df(dns_info_df, if_exists="ignore")
 
         # Insert DNS observation row
         dns_obs_df = pd.DataFrame.from_records([dns_obs_dict])
-        await self._db_call(self.dns_table.insert_df, dns_obs_df)
+        self.dns_obs_table.insert_df(dns_obs_df)
 
         return self._dns_join(dns_obs_df, dns_info_df)
 
@@ -457,66 +448,15 @@ class DomainProfileUtil:
             self.grab_cert_dns_async(host, port)
         )
 
-    def query(self, table: SqliteTable, sql: str, params: Tuple = ()):
-        """
-        Execute a SQL query on the specified table and return the results as a DataFrame.
-
-        Args:
-            table (SqliteTable):
-                The table to query.
-
-            sql (str):
-                The SQL query to execute.
-
-            params (Tuple):
-                Optional parameters for the SQL query.
-
-        Returns:
-            A DataFrame with the query results.
-        """
-        return run_coro_sync(self._db_call(table.query, sql, params))
-
-    def query_all(self, table: SqliteTable):
-        """
-        Query all rows from the specified table and return them as a DataFrame.
-
-        Args:
-            table (SqliteTable):
-                The table to query.
-
-        Returns:
-            A DataFrame with all rows from the table.
-        """
-        return run_coro_sync(self._db_call(table.query_all))
-
-    def query_all_dns(self):
-        """
-        Return all rows from the DNS table as a DataFrame.
-        """
-        df_dns_obs = self.query_all(self.dns_table)
-        df_dns_info = self.query_all(self.dns_info_table)
-        return self._dns_join(df_dns_obs, df_dns_info)
-
-    def query_all_cert(self):
-        """
-        Return all rows from the certificate table as a DataFrame.
-        """
-        df_cert_obs = self.query_all(self.cert_obs_table)
-        df_cert_info = self.query_all(self.cert_info_table)
-        return self._cert_join(df_cert_obs, df_cert_info)
-
     async def aclose(self):
-        if self._closed:
+        if not self.db:
             return
 
-        def _close_db():
-            try:
-                self.db.close()
-            except Exception as e:
-                self.io_helper.logger.warning(f"Error closing DB: {e}")
-        await self._db_call(_close_db)
-        self._db_exec.shutdown(wait=True)
-        self._closed = True
+        try:
+            self.db.close()
+            self.db = None
+        except Exception as e:
+            self.io_helper.logger.warning(f"Error closing DB: {e}")
 
     def close(self):
         return run_coro_sync(self.aclose())
