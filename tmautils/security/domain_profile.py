@@ -153,6 +153,7 @@ class DomainProfileUtil:
             self.db_path,
             logger=self.io_helper.logger,
             offload_to_worker=True,
+            write_buffering=True,
         )
         self.cert_info_table = self.db.register_table(
             "cert_info",

@@ -1,6 +1,6 @@
 from websocket import WebSocketApp
 import pandas as pd
-from threading import Thread, Event, Lock
+from threading import Thread, Event
 import rel
 import atexit
 import multiprocessing as mp
@@ -241,7 +241,6 @@ class OpenIntelZoneStreamUtil:
             See IOHelper documentation for more details.
     """
 
-    WRITE_INTERVAL_SEC = 10
     MAX_CALLBACK_WORKERS = 4
     TOPIC_TO_SCHEMA = {
         "newly_registered_fqdn": {
@@ -308,10 +307,8 @@ class OpenIntelZoneStreamUtil:
         self.topics = topics
 
         # Concurrency
-        self._lock = Lock()
         self._stop_event = Event()
         self._receiver_thread: Optional[Thread] = None
-        self._writer_thread: Optional[Thread] = None
         self._atexit_registered = False
 
         # IPC/process
@@ -319,6 +316,7 @@ class OpenIntelZoneStreamUtil:
         self._cmd_queue: Optional[Queue] = None   # parent -> child
         self._data_queue: Optional[Queue] = None  # child -> parent
         self._proc: Optional[mp.Process] = None
+        self._running = False
 
         # Callback
         self._callback = callback
@@ -327,16 +325,22 @@ class OpenIntelZoneStreamUtil:
             thread_name_prefix=f"{self.__class__.__name__}-cb"
         ) if callback is not None else None
 
-        # Parent-side buffers
-        self._running = False
-        self.message_cache: dict[str, list[dict]] = {
-            t: [] for t in self.topics
-        }
-
         # Database
         self.db_path = self.io_helper.raw / "openintel_zone_stream.sqlite"
-        self.db: Optional[SqliteDatabase] = None
-        self.topic_tables: Optional[dict[str, SqliteTable]] = None
+        self.db: Optional[SqliteDatabase] = SqliteDatabase(
+            self.db_path,
+            logger=self.io_helper.logger,
+            offload_to_worker=True,
+            write_buffering=True,
+        )
+        self.topic_tables: Optional[dict[str, SqliteTable]] = {
+            topic: self.db.register_table(
+                topic,
+                schema=self.TOPIC_TO_SCHEMA[topic],
+                table_constraints=self.TOPIC_TO_CONSTRAINTS[topic],
+                indices=self.TOPIC_TO_INDICES[topic],
+            ) for topic in self.topics
+        }
 
     @staticmethod
     def _child_entry(topics: list[str], data_q: Queue, cmd_q: Queue):
@@ -384,15 +388,6 @@ class OpenIntelZoneStreamUtil:
             daemon=True,
         )
         self._receiver_thread.start()
-
-        # Writer: writes buffers to DB every WRITE_INTERVAL_SEC
-        self.io_helper.logger.info("Starting writer thread")
-        self._writer_thread = Thread(
-            target=self._writer_loop,
-            name=f"{OpenIntelZoneStreamUtil.__name__}-writer",
-            daemon=True,
-        )
-        self._writer_thread.start()
 
         if not self._atexit_registered:
             atexit.register(self._atexit_cleanup)
@@ -453,14 +448,6 @@ class OpenIntelZoneStreamUtil:
         except Exception:
             pass
 
-        # Signal writer thread to stop
-        self._stop_event.set()
-
-        # Join writer thread
-        self.io_helper.logger.info("Stopping writer thread")
-        if self._writer_thread and self._writer_thread.is_alive():
-            self._writer_thread.join(timeout=self.WRITE_INTERVAL_SEC + 5.0)
-
         # Join child
         self.io_helper.logger.info("Waiting for child process to stop")
         if self._proc is not None:
@@ -471,6 +458,16 @@ class OpenIntelZoneStreamUtil:
                 )
                 self._proc.terminate()
                 self._proc.join(timeout=5.0)
+
+        # Close DB
+        try:
+            if self.db is not None:
+                self.io_helper.logger.info("Closing database")
+                self.db.close()
+        except Exception:
+            pass
+        self.db = None
+        self.topic_tables = None
 
         self.io_helper.logger.info(
             "Stopped Zone Stream listener and flushed caches to database"
@@ -540,61 +537,18 @@ class OpenIntelZoneStreamUtil:
             if msg.is_notify:
                 if ZoneStreamMethod.get_method(msg) == ZoneStreamMethod.BATCH:
                     topic_map = (msg.kwargs or {}).get("topic_map", {})
-                    with self._lock:
-                        for topic, batch in topic_map.items():
-                            if topic in self.message_cache and batch:
-                                self.message_cache[topic].extend(batch)
-                                # Dispatch callback if any
-                                self._dispatch_cb(topic, batch)
+                    for topic, batch in topic_map.items():
+                        if not batch:
+                            continue
 
-    def _writer_loop(self):
-        self.db = SqliteDatabase(
-            self.db_path,
-            logger=self.io_helper.logger,
-            offload_to_worker=True,
-        )
-        self.topic_tables = {
-            topic: self.db.register_table(
-                topic,
-                schema=self.TOPIC_TO_SCHEMA[topic],
-                table_constraints=self.TOPIC_TO_CONSTRAINTS[topic],
-                indices=self.TOPIC_TO_INDICES[topic],
-            ) for topic in self.topics
-        }
+                        df = pd.DataFrame(batch)
+                        # Missing columns -> NA
+                        for col in self.TOPIC_TO_SCHEMA[topic].keys():
+                            if col not in df.columns:
+                                df[col] = pd.NA
+                        # Reorder
+                        df = df[list(self.TOPIC_TO_SCHEMA[topic].keys())]
+                        self.topic_tables[topic].insert_df(df)
 
-        try:
-            while True:
-                if self._stop_event.wait(timeout=self.WRITE_INTERVAL_SEC):
-                    # True => stop event set
-                    break
-                # False => timeout
-                self._flush_all()
-
-            # Final blocking flush on shutdown
-            self._flush_all(block=True)
-        finally:
-            self.db.close()
-
-    def _write_to_db(self, topic: str, block: bool = False):
-        with self._lock:
-            cache = self.message_cache.get(topic, [])
-            if not cache:
-                return
-
-            df = pd.DataFrame(cache)
-            # Ensure all schema columns exist; missing -> NA
-            for col in self.TOPIC_TO_SCHEMA[topic].keys():
-                if col not in df.columns:
-                    df[col] = pd.NA
-            # Reorder
-            df = df[list(self.TOPIC_TO_SCHEMA[topic].keys())]
-
-            self.topic_tables[topic].insert_df(df, block=block)
-            self.message_cache[topic] = []
-
-    def _flush_all(self, block: bool = False):
-        for t in list(self.topics):
-            try:
-                self._write_to_db(t, block=block)
-            except Exception as e:
-                self.io_helper.logger.error(f"[{t}] flush failed: {e}")
+                        # Dispatch callback if any
+                        self._dispatch_cb(topic, batch)
