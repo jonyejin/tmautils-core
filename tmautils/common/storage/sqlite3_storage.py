@@ -6,8 +6,11 @@ import numpy as np
 from pathlib import Path
 from logging import Logger
 from contextlib import contextmanager
+import time
 
+from .sqlite3_helpers import SqliteWorkerHelper
 from ..utils import try_convert_ip
+from ..types import *
 
 
 # Context-manager to locally register adapters/converters
@@ -40,8 +43,8 @@ class SqliteTable:
     It tries to verify that the table schema matches the provided schema.
 
     Args:
-        conn (sqlite3.Connection):
-            SQLite connection object.
+        conn (sqlite3.Connection | None):
+            An active SQLite connection. If using a worker process, this should be None.
 
         table_name (str):
             Name of the table to create or manage.
@@ -60,6 +63,10 @@ class SqliteTable:
 
         logger (Logger | None):
             Optional logger for logging messages. If None, no logging will be performed.
+
+        worker (SqliteWorkerHelper | None):
+            Optional worker helper for offloading database operations to a separate process.
+            If provided, `conn` must be None.
     """
 
     # List of allowed SQLite qualifiers
@@ -128,17 +135,20 @@ class SqliteTable:
 
     def __init__(
         self,
-        conn: sqlite3.Connection,
+        conn: Optional[sqlite3.Connection],
         table_name: str,
         schema: dict[str, Type[Any]],
         qualifiers: dict[str, str] | None = None,
         table_constraints: list[str] | None = None,
         indices: list[list[str]] | None = None,
         logger: Logger | None = None,
+        worker: Optional[SqliteWorkerHelper] = None,
     ):
         self.conn = conn
         self.table_name = table_name
         self.schema = schema
+        self.logger = logger
+        self._worker = worker
 
         def _normalize(text: str):
             return " ".join(text.split()).lower().strip()
@@ -148,15 +158,22 @@ class SqliteTable:
             col_name: _normalize(qualifier_sql)
             for col_name, qualifier_sql in self.qualifiers.items()
         }
-
-        self.table_constraints = table_constraints or []
         self.table_constraints = [
-            _normalize(tc) for tc in self.table_constraints
+            _normalize(tc) for tc in (table_constraints or [])
         ]
-
         self.indices = indices or []
-        self.logger = logger
-        self._create_verify_table()
+
+        if self._worker is None:
+            if self.conn is None:
+                raise ValueError("conn must be provided if not using a worker")
+            self._create_verify_table()
+        else:
+            if self.conn is not None:
+                raise ValueError("conn must be None when using a worker")
+            if self.logger:
+                self.logger.info(
+                    f"Registered proxy table '{self.table_name}' (backed by worker process)"
+                )
 
     def _create_verify_table(self):
         # Build column definitions
@@ -318,6 +335,8 @@ class SqliteTable:
         df: pd.DataFrame,
         if_exists: str = "abort",
         cast_columns_to_schema: bool = True,
+        *,
+        block: bool = False,
     ):
         """
         Insert a pandas DataFrame into the table, converting types as needed.
@@ -338,6 +357,28 @@ class SqliteTable:
                 Whether to cast DataFrame columns to match the table schema types.
                 Default is True, which will attempt to convert DataFrame types to match the schema.
         """
+        if df is None or df.empty or not df.notna().any().any():
+            if self.logger:
+                self.logger.info(
+                    f"DataFrame is empty or None, nothing to insert into '{self.table_name}'."
+                )
+            return
+
+        if self._worker is not None:
+            kwargs = {
+                "if_exists": if_exists,
+                "cast_columns_to_schema": cast_columns_to_schema,
+            }
+            self._worker.insert_df(self.table_name, df, block=block, **kwargs)
+            if self.logger:
+                self.logger.info(
+                    f"Inserted {len(df)} rows into table '{self.table_name}' "
+                    f"via worker with block={block}."
+                )
+            return
+
+        start_time = time.perf_counter()
+
         # Map if_exists to SQLite conflict clauses
         if_exists_map = {
             "fail": "INSERT OR FAIL",
@@ -380,13 +421,17 @@ class SqliteTable:
 
         if self.logger:
             self.logger.info(
-                f"Inserted {len(df)} rows into table '{self.table_name}'."
+                f"Inserted {len(df)} rows into table '{self.table_name}' "
+                f"in {time.perf_counter() - start_time:.2f} seconds."
             )
 
     def query_all(self):
         """
         Query every row/column in the table and return a DataFrame.
         """
+        if self._worker is not None:
+            return self._worker.query_all(self.table_name)
+
         cols = ", ".join(self.schema.keys())
         sql = f"SELECT {cols} FROM {self.table_name};"
         return self.query(sql)
@@ -410,6 +455,11 @@ class SqliteTable:
             df (pd.DataFrame):
                 A single DataFrame with the results.
         """
+        if self._worker is not None:
+            return self._worker.query(self.table_name, sql, params=params)
+
+        start_time = time.perf_counter()
+
         # We need to somehow identify the requested columns.
         # Here, we briefly execute the query and then close the cursor to get the result schema.
         with _sqlite3_conversion_ctx():
@@ -459,7 +509,8 @@ class SqliteTable:
 
         if self.logger:
             self.logger.info(
-                f"Executed query: {sql} with params: {params}, returned {len(df)} rows."
+                f"Executed query: {sql} with params: {params}, returned {len(df)} rows "
+                f"in {time.perf_counter() - start_time:.2f} seconds."
             )
 
         return df
@@ -480,7 +531,19 @@ class SqliteDatabase:
         uri (bool):
             If True, `db_path` is treated as a URI. Default is False.
 
-        **connect_kwargs:
+        cache_kb (int):
+            Size of the SQLite page cache in kilobytes.
+            Default is 256,000 KB (256 MB). Minimum is 2,000 KB (2 MB).
+
+        logger (Logger | None):
+            Optional logger for logging messages. If None, no logging will be performed.
+
+        offload_to_worker (bool):
+            Whether to offload database operations to a separate worker process.
+            This can help avoid blocking the main thread during long-running operations.
+            Default is False.
+
+        **kwargs:
             Additional keyword arguments to pass to `sqlite3.connect()`.
     """
 
@@ -494,23 +557,52 @@ class SqliteDatabase:
         uri: bool = False,
         cache_kb: int = CACHE_KB_DEFAULT,
         logger: Logger | None = None,
-        **connect_kwargs
+        *,
+        offload_to_worker: bool = False,
+        **kwargs
     ):
         self.path = Path(db_path).resolve()
-
-        self.conn = self._connect_with_conversion(
-            self.path, uri=uri, **connect_kwargs
-        )
-        if cache_kb > self.CACHE_KB_MIN:
-            self.conn.execute(f"PRAGMA cache_size=-{cache_kb};")
-        if wal:
-            self.conn.execute("PRAGMA journal_mode=WAL;")
-
-        self.tables: dict[str, SqliteTable] = {}
-
         self.logger = logger
-        if self.logger:
-            self.logger.info(f"Connected to SQLite database at {db_path}")
+        self.tables: dict[str, SqliteTable] = {}
+        self.conn: Optional[sqlite3.Connection] = None
+
+        # Offloading
+        self._offload_to_worker = offload_to_worker
+        self._is_worker = kwargs.pop("is_worker", False)
+        self._worker: Optional[SqliteWorkerHelper] = None
+
+        if self._is_worker:
+            self._offload_to_worker = False  # Do not offload from a worker
+
+        if self._offload_to_worker:
+            db_init_kwargs = {
+                "db_path": str(self.path),
+                "wal": wal,
+                "uri": uri,
+                "cache_kb": cache_kb,
+                "logger": self.logger,
+                "offload_to_worker": False,  # Do not offload further
+                "is_worker": True,
+                **kwargs,
+            }
+            self._worker = SqliteWorkerHelper(db_init_kwargs)
+            self._worker.start()
+            if self.logger:
+                self.logger.info(
+                    f"Connected to SQLite database at {db_path} via worker process"
+                )
+        else:
+            self.conn = self._connect_with_conversion(
+                self.path, uri=uri, **kwargs
+            )
+            if cache_kb > self.CACHE_KB_MIN:
+                self.conn.execute(f"PRAGMA cache_size=-{cache_kb};")
+            if wal:
+                self.conn.execute("PRAGMA journal_mode=WAL;")
+            if self.logger:
+                self.logger.info(
+                    f"Connected to SQLite database at {db_path} directly"
+                )
 
     def _connect_with_conversion(self, db_path: str, **kwargs):
         with _sqlite3_conversion_ctx():
@@ -554,14 +646,29 @@ class SqliteDatabase:
 
         if table_name in self.tables:
             return self.tables[table_name]
+
+        if self._offload_to_worker:
+            if self._worker is None:
+                raise RuntimeError("Worker process not initialized.")
+            self._worker.register_table(
+                table_def={
+                    "table_name": table_name,
+                    "schema": schema,
+                    "qualifiers": qualifiers,
+                    "table_constraints": table_constraints,
+                    "indices": indices,
+                }
+            )
+
         table = SqliteTable(
-            self.conn,
+            self.conn,  # None if offloaded
             table_name,
             schema,
             qualifiers=qualifiers,
             table_constraints=table_constraints,
             indices=indices,
             logger=self.logger,
+            worker=self._worker,  # None if not offloaded
         )
         self.tables[table_name] = table
 
@@ -576,6 +683,18 @@ class SqliteDatabase:
         """
         Close the database connection.
         """
+
+        if self._offload_to_worker and self._worker:
+            if self.logger:
+                self.logger.info(
+                    f"Closing SQLite database worker for {self.path}"
+                )
+            self._worker.close()
+            self._worker = None
+            if self.logger:
+                self.logger.info(
+                    f"Closed SQLite database worker for {self.path}"
+                )
 
         if self.conn:
             self.conn.close()
