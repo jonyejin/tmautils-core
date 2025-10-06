@@ -3,8 +3,10 @@ import socket
 import cryptography.x509 as x509
 import certifi
 import asyncio
+import contextlib
 
 from tmautils.common import *
+
 
 def _build_ctx(*, verify: bool, use_certifi: bool):
     if verify:
@@ -17,12 +19,13 @@ def _build_ctx(*, verify: bool, use_certifi: bool):
         ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
+
 def get_cert(
     host: str | IPAddress,
     port: int = 443,
     *,
     sni: Optional[str] = None,
-    timeout: float = 5.0,
+    timeout: float = 8.0,
     verify: bool = True,
     use_certifi: bool = True,
 ):
@@ -71,7 +74,8 @@ async def get_cert_async(
     port: int = 443,
     *,
     sni: Optional[str] = None,
-    timeout: float = 5.0,
+    timeout: float = 8.0,
+    ssl_handshake_timeout: float = 5.0,
     verify: bool = True,
     use_certifi: bool = True,
 ):
@@ -87,23 +91,29 @@ async def get_cert_async(
 
     writer = None
     try:
-        # Make TCP + TLS connection
-        _, writer = await asyncio.wait_for(
-            asyncio.open_connection(
-                connect_host, port, ssl=ctx, server_hostname=server_hostname
-            ),
-            timeout=timeout,
-        )
-
-        sslobj: ssl.SSLObject | None = writer.get_extra_info("ssl_object")
-        if sslobj is None:
-            raise RuntimeError("TLS handshake did not complete")
-        der = sslobj.getpeercert(binary_form=True)
-        return x509.load_der_x509_certificate(der)
-    finally:
-        if writer is not None:
-            writer.close()
+        async with asyncio.timeout(timeout):
             try:
-                await writer.wait_closed()
-            except Exception:
-                pass
+                _, writer = await asyncio.open_connection(
+                    connect_host,
+                    port,
+                    ssl=ctx,
+                    server_hostname=server_hostname,
+                    ssl_handshake_timeout=ssl_handshake_timeout,
+                )
+
+                sslobj: ssl.SSLObject | None = writer.get_extra_info(
+                    "ssl_object"
+                )
+                if sslobj is None:
+                    raise RuntimeError("TLS handshake did not complete")
+                der = sslobj.getpeercert(binary_form=True)
+                return x509.load_der_x509_certificate(der)
+            finally:
+                if writer is not None:
+                    writer.close()
+                    with contextlib.suppress(Exception):
+                        await writer.wait_closed()
+    except asyncio.TimeoutError:
+        raise TimeoutError(
+            f"get_cert_async() for {host}:{port} timed out after {timeout}s"
+        )
