@@ -7,6 +7,9 @@ from pathlib import Path
 from logging import Logger
 from contextlib import contextmanager
 import time
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import warnings
 
 from .sqlite3_helpers import SqliteWorkerHelper
 from ..utils import try_convert_ip
@@ -43,8 +46,8 @@ class SqliteTable:
     It tries to verify that the table schema matches the provided schema.
 
     Args:
-        conn (sqlite3.Connection | None):
-            An active SQLite connection. If using a worker process, this should be None.
+        db (SqliteDatabase):
+            The parent `SqliteDatabase` instance managing the connection.
 
         table_name (str):
             Name of the table to create or manage.
@@ -135,7 +138,7 @@ class SqliteTable:
 
     def __init__(
         self,
-        conn: Optional[sqlite3.Connection],
+        db: "SqliteDatabase",
         table_name: str,
         schema: dict[str, Type[Any]],
         qualifiers: dict[str, str] | None = None,
@@ -144,11 +147,24 @@ class SqliteTable:
         logger: Logger | None = None,
         worker: Optional[SqliteWorkerHelper] = None,
     ):
-        self.conn = conn
+        self.conn = db.conn
         self.table_name = table_name
         self.schema = schema
         self.logger = logger
         self._worker = worker
+
+        # Inherit write buffering settings from the database
+        self._write_buffering = db._write_buffering
+        self._write_buf_flush_interval_sec = db._write_buf_flush_interval_sec
+        self._write_buf_row_threshold = db._write_buf_row_threshold
+        self._write_buf_flush_on_query = db._write_buf_flush_on_query
+        self._writer_exec = db._writer_exec
+        self._writer_conn = db._writer_conn
+        self._writer_buf: list[pd.DataFrame] = []
+        self._writer_kwargs: Dict[str, Any] = {}
+        self._writer_rows_since_flush = 0
+        self._writer_last_flush = time.time()
+        self._writer_lock = threading.Lock()
 
         def _normalize(text: str):
             return " ".join(text.split()).lower().strip()
@@ -165,7 +181,7 @@ class SqliteTable:
 
         if self._worker is None:
             if self.conn is None:
-                raise ValueError("conn must be provided if not using a worker")
+                raise ValueError("conn cannot be None when not using a worker")
             self._create_verify_table()
         else:
             if self.conn is not None:
@@ -330,13 +346,70 @@ class SqliteTable:
 
         return df
 
+    def _flush_writer_buffer(self, force: bool = False):
+        if not self._write_buffering:
+            if self.logger:
+                self.logger.warning(
+                    "Attempted to flush writer buffer, but write buffering is disabled."
+                )
+            return
+
+        if self._worker is not None:
+            # Worker handles its own buffering
+            return
+
+        with self._writer_lock:
+            over_rows = self._writer_rows_since_flush >= self._write_buf_row_threshold
+            over_time = (
+                time.time() - self._writer_last_flush
+            ) >= self._write_buf_flush_interval_sec
+            need_flush = force or over_rows or over_time
+            if not need_flush:
+                return
+
+            dfs_to_merge = [
+                df for df in self._writer_buf
+                if df is not None and not df.empty and df.notna().any().any()
+            ]
+
+            if dfs_to_merge:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=FutureWarning)
+                    df_merged = pd.concat(dfs_to_merge, ignore_index=True)
+                kwargs = self._writer_kwargs or {}
+
+            self._writer_buf = []
+            self._writer_kwargs = {}
+            self._writer_rows_since_flush = 0
+            self._writer_last_flush = time.time()
+
+            if not dfs_to_merge:
+                # Nothing to flush
+                return
+
+        kwargs["_flush_call"] = True
+        if self._writer_exec is not None:
+            self._writer_exec.submit(
+                self.insert_df, df_merged, **kwargs
+            ).result()
+        else:
+            # Fallback in case executor is somehow missing
+            self.insert_df(df_merged, **kwargs)
+
+        if self.logger:
+            self.logger.info(
+                f"Flushed {len(df_merged)} buffered rows to table '{self.table_name}'."
+            )
+
     def insert_df(
         self,
         df: pd.DataFrame,
         if_exists: str = "abort",
         cast_columns_to_schema: bool = True,
         *,
-        block: bool = False,
+        wait_for_worker: bool = False,
+        force_flush: bool = False,
+        _flush_call: bool = False,  # internal
     ):
         """
         Insert a pandas DataFrame into the table, converting types as needed.
@@ -356,6 +429,14 @@ class SqliteTable:
             cast_columns_to_schema (bool):
                 Whether to cast DataFrame columns to match the table schema types.
                 Default is True, which will attempt to convert DataFrame types to match the schema.
+
+            wait_for_worker (bool):
+                If using a worker process, whether to block until the insert is complete.
+                Default is False, which will enqueue the insert and return immediately.
+
+            force_flush (bool):
+                If write buffering is enabled, whether to force a flush of the buffer after this insert.
+                Default is False.
         """
         if df is None or df.empty or not df.notna().any().any():
             if self.logger:
@@ -368,15 +449,41 @@ class SqliteTable:
             kwargs = {
                 "if_exists": if_exists,
                 "cast_columns_to_schema": cast_columns_to_schema,
+                "force_flush": force_flush,
             }
-            self._worker.insert_df(self.table_name, df, block=block, **kwargs)
+            self._worker.insert_df(
+                self.table_name, df, block=wait_for_worker, **kwargs
+            )
             if self.logger:
                 self.logger.info(
                     f"Inserted {len(df)} rows into table '{self.table_name}' "
-                    f"via worker with block={block}."
+                    f"via worker with wait_for_worker={wait_for_worker}."
                 )
             return
 
+        # Once we are here, we are NOT using a worker
+        if self._write_buffering and not _flush_call:
+            # We are being called from the main thread.
+
+            # If the call options differ from the current buffer, flush first.
+            if self._writer_kwargs and (
+                self._writer_kwargs["if_exists"] != if_exists or
+                self._writer_kwargs["cast_columns_to_schema"] != cast_columns_to_schema
+            ):
+                self._flush_writer_buffer(force=True)
+
+            # Buffer the DataFrame and flush if needed.
+            with self._writer_lock:
+                self._writer_buf.append(df)
+                self._writer_rows_since_flush += len(df)
+                self._writer_kwargs = {
+                    "if_exists": if_exists,
+                    "cast_columns_to_schema": cast_columns_to_schema,
+                }
+            self._flush_writer_buffer(force=force_flush)
+            return
+
+        # Once we are here, we are actually inserting into the DB
         start_time = time.perf_counter()
 
         # Map if_exists to SQLite conflict clauses
@@ -415,9 +522,10 @@ class SqliteTable:
                 yield row
 
         # Insert with conversion context
+        write_conn = self._writer_conn if _flush_call and self._writer_conn else self.conn
         with _sqlite3_conversion_ctx():
-            with self.conn:
-                self.conn.executemany(stmt, _gen_rows())
+            with write_conn:
+                write_conn.executemany(stmt, _gen_rows())
 
         if self.logger:
             self.logger.info(
@@ -457,6 +565,9 @@ class SqliteTable:
         """
         if self._worker is not None:
             return self._worker.query(self.table_name, sql, params=params)
+
+        if self._write_buffering and self._write_buf_flush_on_query:
+            self._flush_writer_buffer(force=True)
 
         start_time = time.perf_counter()
 
@@ -543,12 +654,39 @@ class SqliteDatabase:
             This can help avoid blocking the main thread during long-running operations.
             Default is False.
 
+        write_buffering (bool):
+            Whether to enable write buffering for insert operations.
+            When enabled, insert operations are buffered and written to the database
+            in batches, which can improve performance for high-frequency inserts.
+            Default is False.
+
+        write_buf_flush_interval_sec (float):
+            If write buffering is enabled, the interval in seconds at which to flush
+            the write buffer to the database.
+            Default is 30.0 seconds.
+            Minimum is 1.0 second.
+
+        write_buf_row_threshold (int):
+            If write buffering is enabled, the number of rows in the each table's buffer
+            that will trigger a flush to the database.
+            Default is 1,000 rows.
+
+        write_buf_flush_on_query (bool):
+            If write buffering is enabled, whether to flush the write buffer before
+            executing any query.
+            This ensures that queries see the most up-to-date data.
+            Default is True.
+
         **kwargs:
             Additional keyword arguments to pass to `sqlite3.connect()`.
     """
 
     CACHE_KB_MIN = 2_000
     CACHE_KB_DEFAULT = 256_000
+    WRITE_BUF_FLUSH_INTERVAL_SEC_MIN = 1.0
+    WRITER_STOP_TIMEOUT_SEC = 2.0
+    WRITER_TICK_INTERVAL_SEC = WRITER_STOP_TIMEOUT_SEC / 2
+    WRITER_TICK_INTERVAL_SEC_MIN = 0.1
 
     def __init__(
         self,
@@ -559,10 +697,18 @@ class SqliteDatabase:
         logger: Logger | None = None,
         *,
         offload_to_worker: bool = False,
+        write_buffering: bool = False,
+        write_buf_flush_interval_sec: float = 30.0,
+        write_buf_row_threshold: int = 1_000,
+        write_buf_flush_on_query: bool = True,
         **kwargs
     ):
         self.path = Path(db_path).resolve()
+        self.wal = wal
+        self.uri = uri
+        self.cache_kb = max(cache_kb, self.CACHE_KB_MIN)
         self.logger = logger
+        self._init_kwargs = kwargs
         self.tables: dict[str, SqliteTable] = {}
         self.conn: Optional[sqlite3.Connection] = None
 
@@ -571,9 +717,22 @@ class SqliteDatabase:
         self._is_worker = kwargs.pop("is_worker", False)
         self._worker: Optional[SqliteWorkerHelper] = None
 
+        # Buffering
+        self._write_buffering = write_buffering
+        self._write_buf_flush_interval_sec = max(
+            self.WRITE_BUF_FLUSH_INTERVAL_SEC_MIN, write_buf_flush_interval_sec
+        )
+        self._write_buf_row_threshold = write_buf_row_threshold
+        self._write_buf_flush_on_query = write_buf_flush_on_query
+        self._writer_exec: Optional[ThreadPoolExecutor] = None
+        self._writer_conn: Optional[sqlite3.Connection] = None
+        self._writer_ticker: Optional[threading.Thread] = None
+        self._writer_last_flush: float = time.time()
+        self._writer_stop: threading.Event = threading.Event()
+
+        # Offload to worker process if requested
         if self._is_worker:
             self._offload_to_worker = False  # Do not offload from a worker
-
         if self._offload_to_worker:
             db_init_kwargs = {
                 "db_path": str(self.path),
@@ -583,6 +742,10 @@ class SqliteDatabase:
                 "logger": self.logger,
                 "offload_to_worker": False,  # Do not offload further
                 "is_worker": True,
+                "write_buffering": write_buffering,
+                "write_buf_flush_interval_sec": write_buf_flush_interval_sec,
+                "write_buf_row_threshold": write_buf_row_threshold,
+                "write_buf_flush_on_query": write_buf_flush_on_query,
                 **kwargs,
             }
             self._worker = SqliteWorkerHelper(db_init_kwargs)
@@ -591,18 +754,95 @@ class SqliteDatabase:
                 self.logger.info(
                     f"Connected to SQLite database at {db_path} via worker process"
                 )
-        else:
-            self.conn = self._connect_with_conversion(
-                self.path, uri=uri, **kwargs
+            return
+
+        # From here on, we are not offloading to a worker
+
+        # Set up buffering if enabled
+        if self._write_buffering:
+            self._start_writer()
+
+        # Set up connection
+        self.conn = self._open_conn()
+        if self.logger:
+            self.logger.info(
+                f"Connected to SQLite database at {db_path} directly"
             )
-            if cache_kb > self.CACHE_KB_MIN:
-                self.conn.execute(f"PRAGMA cache_size=-{cache_kb};")
-            if wal:
-                self.conn.execute("PRAGMA journal_mode=WAL;")
+
+    def _open_conn(self):
+        conn = self._connect_with_conversion(
+            self.path, uri=self.uri, **self._init_kwargs
+        )
+        conn.execute(f"PRAGMA cache_size=-{self.cache_kb};")
+        if self.wal:
+            conn.execute("PRAGMA journal_mode=WAL;")
+        return conn
+
+    def _start_writer(self):
+        self._writer_exec = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix=f"{self.__class__.__name__}-writer"
+        )
+        self._writer_conn = self._writer_exec.submit(
+            self._open_conn
+        ).result()
+        self._writer_stop.clear()
+        self._writer_ticker = threading.Thread(
+            target=self._writer_tick_loop,
+            name=f"{self.__class__.__name__}-writer-ticker",
+            daemon=True,
+        )
+        self._writer_ticker.start()
+        if self.logger:
+            self.logger.info("Started SQLite writer thread")
+
+    def _writer_tick_loop(self):
+        effective_sleep = max(
+            self.WRITER_TICK_INTERVAL_SEC_MIN,
+            min(
+                self.WRITER_TICK_INTERVAL_SEC,
+                self._write_buf_flush_interval_sec / 2,
+            )
+        )
+        while not self._writer_stop.is_set():
+            time.sleep(effective_sleep)
+            if (time.time() - self._writer_last_flush) < self._write_buf_flush_interval_sec:
+                continue
+            for table in self.tables.values():
+                table._flush_writer_buffer()
+            self._writer_last_flush = time.time()
+
+    def _stop_writer(self):
+        for table in self.tables.values():
+            try:
+                table._flush_writer_buffer(force=True)
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(
+                        f"Error flushing writer buffer for table '{table.table_name}': {e}"
+                    )
+
+        try:
+            self._writer_stop.set()
+            if self._writer_ticker and self._writer_ticker.is_alive():
+                self._writer_ticker.join(timeout=self.WRITER_STOP_TIMEOUT_SEC)
+        except Exception as e:
             if self.logger:
-                self.logger.info(
-                    f"Connected to SQLite database at {db_path} directly"
-                )
+                self.logger.error(f"Error stopping writer ticker thread: {e}")
+
+        if self._writer_exec:
+            try:
+                self._writer_exec.submit(
+                    self._writer_conn.close
+                ).result(timeout=self.WRITER_STOP_TIMEOUT_SEC)
+            except Exception as e:
+                if self.logger:
+                    self.logger.error(f"Error closing writer connection: {e}")
+            self._writer_exec.shutdown(wait=True)
+
+        self._writer_exec = None
+        self._writer_conn = None
+        self._writer_ticker = None
 
     def _connect_with_conversion(self, db_path: str, **kwargs):
         with _sqlite3_conversion_ctx():
@@ -661,7 +901,7 @@ class SqliteDatabase:
             )
 
         table = SqliteTable(
-            self.conn,  # None if offloaded
+            self,
             table_name,
             schema,
             qualifiers=qualifiers,
@@ -684,6 +924,9 @@ class SqliteDatabase:
         Close the database connection.
         """
 
+        if self._write_buffering and not self._offload_to_worker:
+            self._stop_writer()
+
         if self._offload_to_worker and self._worker:
             if self.logger:
                 self.logger.info(
@@ -697,6 +940,10 @@ class SqliteDatabase:
                 )
 
         if self.conn:
+            if self.wal:
+                # Checkpoint WAL to flush all changes to the main DB
+                # Do it here since this is the last connection to close
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
             self.conn.close()
             self.conn = None
             if self.logger:
