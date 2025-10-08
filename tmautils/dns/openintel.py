@@ -542,10 +542,27 @@ class OpenIntelZoneStreamUtil:
                             continue
 
                         df = pd.DataFrame(batch)
+
                         # Missing columns -> NA
                         for col in self.TOPIC_TO_SCHEMA[topic].keys():
                             if col not in df.columns:
                                 df[col] = pd.NA
+
+                        # Sometimes integers are sent as raw bytes, fix them here
+                        # (assume little-endian 64-bit)
+                        for col, typ in self.TOPIC_TO_SCHEMA[topic].items():
+                            if typ is int and col in df.columns:
+                                mask_bytes = df[col].apply(
+                                    lambda v: isinstance(v, bytes)
+                                )
+                                if mask_bytes.any():
+                                    df.loc[mask_bytes, col] = df.loc[mask_bytes, col].apply(
+                                        lambda b: int.from_bytes(b, "little")
+                                    )
+                                df[col] = pd.to_numeric(
+                                    df[col], errors="coerce"
+                                ).astype("Int64")
+
                         # Reorder
                         df = df[list(self.TOPIC_TO_SCHEMA[topic].keys())]
                         self.topic_tables[topic].insert_df(df)
