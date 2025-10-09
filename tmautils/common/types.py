@@ -5,10 +5,9 @@ from typing import (
     Literal, Dict, List, Tuple,
     TypeVar, TYPE_CHECKING,
 )
-from ipaddress import IPv4Address, IPv6Address
-
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
+from pathlib import Path
 from dataclasses import dataclass, asdict, field
-from tldextract import extract
 
 IPAddress = Union[IPv4Address, IPv6Address]
 
@@ -37,6 +36,7 @@ class FQDN:
 
     @property
     def registered_domain(self):
+        from tldextract import extract
         return extract(
             self.name,
             include_psl_private_domains=True

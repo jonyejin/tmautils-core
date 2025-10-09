@@ -4,7 +4,6 @@ from threading import Thread, Event
 import rel
 import atexit
 import multiprocessing as mp
-from multiprocessing.queues import Queue
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
@@ -26,8 +25,8 @@ class OpenIntelZoneStreamWorker:
     def __init__(
         self,
         topics: list[str],
-        data_q: Queue,
-        cmd_q: Queue,
+        data_q: mp.Queue,
+        cmd_q: mp.Queue,
     ):
         from collections import deque
 
@@ -313,8 +312,8 @@ class OpenIntelZoneStreamUtil:
 
         # IPC/process
         self._ctx = mp.get_context("spawn")
-        self._cmd_queue: Optional[Queue] = None   # parent -> child
-        self._data_queue: Optional[Queue] = None  # child -> parent
+        self._cmd_queue: Optional[mp.Queue] = None   # parent -> child
+        self._data_queue: Optional[mp.Queue] = None  # child -> parent
         self._proc: Optional[mp.Process] = None
         self._running = False
 
@@ -343,7 +342,7 @@ class OpenIntelZoneStreamUtil:
         }
 
     @staticmethod
-    def _child_entry(topics: list[str], data_q: Queue, cmd_q: Queue):
+    def _child_entry(topics: list[str], data_q: mp.Queue, cmd_q: mp.Queue):
         # Ignore SIGINT in child
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
