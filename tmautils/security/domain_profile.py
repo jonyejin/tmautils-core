@@ -6,6 +6,7 @@ from dns.rdatatype import RdataType
 from ssl import SSLCertVerificationError
 import warnings
 import multiprocessing as mp
+from multiprocessing.synchronize import Event
 import threading
 import contextlib
 import time
@@ -19,7 +20,6 @@ _T = TypeVar("_T")
 
 
 class DomainProfileMethod(IpcMethodBase, StrEnum):
-    STOP = "stop"
     GET_CERT = "get_cert"
     GET_DNS = "get_dns"
     GET_CERT_DNS = "get_cert_dns"
@@ -28,20 +28,20 @@ class DomainProfileMethod(IpcMethodBase, StrEnum):
 class DomainProfileWorker:
     SERVICE = "domain_profile"
     MAX_CONCURRENCY = 64
+    GET_TIMEOUT = 0.5
 
     def __init__(
         self,
         cmd_q: mp.Queue,
         rsp_q: mp.Queue,
+        shutdown_event: Event,
         *,
         working_root: str,
         dns_util_kwargs: Optional[dict] = None,
     ):
         self.cmd_q = cmd_q
         self.rsp_q = rsp_q
-
-        self.running = threading.Event()
-        self.running.set()
+        self.shutdown_event = shutdown_event
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._sem: Optional[asyncio.Semaphore] = None
@@ -93,23 +93,21 @@ class DomainProfileWorker:
                 self.rsp_q.put(IpcMsg.status(IpcStatusCode.STOPPED))
 
     def _cmd_loop(self):
-        while self.running.is_set():
-            try:
-                msg = self.cmd_q.get(timeout=0.5)
-            except Exception:
-                continue
-
-            if not isinstance(msg, IpcMsg) or msg.service != self.SERVICE:
-                continue
-
-            method = DomainProfileMethod.get_method(msg)
-            if method == DomainProfileMethod.STOP:
-                self.running.clear()
+        while True:
+            if self.shutdown_event.is_set():
                 if self._loop is not None:
                     self._loop.call_soon_threadsafe(self._stop_loop)
                 break
 
-            if not msg.is_request or not self._loop:
+            try:
+                msg = self.cmd_q.get(timeout=self.GET_TIMEOUT)
+            except Exception:
+                continue
+
+            if (not isinstance(msg, IpcMsg) or
+                    msg.service != self.SERVICE or
+                    not msg.is_request or
+                    not self._loop):
                 continue
 
             self._loop.call_soon_threadsafe(self._accept_request, msg)
@@ -118,7 +116,8 @@ class DomainProfileWorker:
         for t in list(self._tasks.values()):
             with contextlib.suppress(Exception):
                 t.cancel()
-        self._loop.stop()
+        if self._loop and self._loop.is_running():
+            self._loop.stop()
 
     def _accept_request(self, req: IpcMsg):
         if req.req_id in self._tasks and not self._tasks[req.req_id].done():
@@ -151,14 +150,14 @@ class DomainProfileWorker:
                 else:
                     raise ValueError(f"Unknown method {method}")
 
-                self.rsp_q.put(req.respond_with(ok=True, result=result))
+                await async_put(self.rsp_q, req.respond_with(ok=True, result=result))
         except asyncio.CancelledError as e:
             with contextlib.suppress(Exception):
-                self.rsp_q.put(req.respond_with(ok=False, error=e))
+                await async_put(self.rsp_q, req.respond_with(ok=False, error=e))
             raise
         except Exception as e:
             with contextlib.suppress(Exception):
-                self.rsp_q.put(req.respond_with(ok=False, error=e))
+                await async_put(self.rsp_q, req.respond_with(ok=False, error=e))
 
     async def _get_cert(self, kw: Dict[str, Any]):
         host = kw["host"]
@@ -402,6 +401,9 @@ class DomainProfileUtil:
     DNS_RECORD_TYPES = [
         t[:-8] for t in DNS_OBSERVATION["schema"].keys() if t.endswith("_semhash")
     ]
+    GET_TIMEOUT = 0.5
+    ALL_STOPPED_TIMEOUT = 10.0
+    JOIN_TIMEOUT = 3.0
 
     def __init__(
         self,
@@ -455,9 +457,13 @@ class DomainProfileUtil:
 
         # Worker processes
         self._ctx = mp.get_context("spawn")
-        self._cmd_q: mp.Queue = self._ctx.Queue()
-        self._rsp_q: mp.Queue = self._ctx.Queue()
+        self._cmd_q = self._ctx.Queue()  # Shared command queue
+        self._rsp_q = self._ctx.Queue()  # Shared response queue
         self._workers: list[mp.Process] = []
+        self._shutdown_event = self._ctx.Event()
+        self._stopped_lock = threading.Lock()
+        self._stopped_left = 0  # Workers left to stop
+        self._all_stopped = threading.Event()
         self._closed = False
 
         # IPC
@@ -474,7 +480,9 @@ class DomainProfileUtil:
             p = self._ctx.Process(
                 target=self._child_entry,
                 args=(
-                    self._cmd_q, self._rsp_q,
+                    self._cmd_q,
+                    self._rsp_q,
+                    self._shutdown_event,
                     str(working_root),
                     dns_util_kwargs or {},
                 ),
@@ -483,6 +491,8 @@ class DomainProfileUtil:
             )
             p.start()
             self._workers.append(p)
+        with self._stopped_lock:
+            self._stopped_left = len(self._workers)
 
         # Start response reader
         self._resp_reader_thread = threading.Thread(
@@ -501,13 +511,14 @@ class DomainProfileUtil:
     def _child_entry(
         cmd_q: mp.Queue,
         rsp_q: mp.Queue,
+        shutdown_event: Event,
         working_root: str,
         dns_util_kwargs: Optional[dict] = None,
     ):
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         worker = DomainProfileWorker(
-            cmd_q, rsp_q,
+            cmd_q, rsp_q, shutdown_event,
             working_root=working_root,
             dns_util_kwargs=dns_util_kwargs or {},
         )
@@ -522,7 +533,7 @@ class DomainProfileUtil:
     def _resp_read_loop(self):
         while not self._closed:
             try:
-                msg = self._rsp_q.get(timeout=0.5)
+                msg = self._rsp_q.get(timeout=self.GET_TIMEOUT)
             except Exception:
                 continue
 
@@ -530,7 +541,13 @@ class DomainProfileUtil:
                 continue
 
             if msg.is_status:
-                self.io_helper.logger.debug(
+                if msg.status_code == IpcStatusCode.STOPPED:
+                    # Keep track of how many workers left to stop
+                    with self._stopped_lock:
+                        self._stopped_left = max(0, self._stopped_left - 1)
+                        if self._stopped_left == 0:
+                            self._all_stopped.set()
+                self.io_helper.logger.info(
                     f"Received status from worker PID {msg.sender_pid}: {msg.status_code}"
                 )
                 continue
@@ -578,6 +595,11 @@ class DomainProfileUtil:
                 loop.call_soon_threadsafe(fut.set_exception, e)
 
     def _rpc_async(self, method: DomainProfileMethod, **kwargs):
+        if self._closed:
+            raise RuntimeError(
+                "DomainProfileUtil is closed, cannot make new requests"
+            )
+
         loop = asyncio.get_running_loop()
         req_id = self._next_id()
         fut: asyncio.Future = loop.create_future()
@@ -801,22 +823,24 @@ class DomainProfileUtil:
             self.grab_cert_dns_async(host, port)
         )
 
+    def get_all_certs(self):
+        obs_df = self.cert_obs_table.query_all()
+        info_df = self.cert_info_table.query_all()
+        return self._cert_join(obs_df, info_df)
+
+    def get_all_dns(self):
+        obs_df = self.dns_obs_table.query_all()
+        info_df = self.dns_info_table.query_all()
+        return self._dns_join(obs_df, info_df)
+
     async def aclose(self):
         if self._closed:
             return
-        self._closed = True
 
-        # Stop workers
-        for _ in self._workers:
-            try:
-                self._cmd_q.put(
-                    IpcMsg.notify(
-                        DomainProfileWorker.SERVICE,
-                        DomainProfileMethod.STOP
-                    )
-                )
-            except Exception:
-                pass
+        # Signal shutdown to workers
+        self.io_helper.logger.info("Shutting down workers...")
+        with contextlib.suppress(Exception):
+            self._shutdown_event.set()
 
         # Cancel any outstanding waiters
         with self._waiters_lock:
@@ -825,22 +849,30 @@ class DomainProfileUtil:
         for _, (loop, fut, _) in items:
             if not fut.done():
                 loop.call_soon_threadsafe(
-                    fut.set_exception, RuntimeError("DomainProfileUtil closed")
+                    fut.set_exception,
+                    RuntimeError(
+                        "DomainProfileUtil closed before resolving future"
+                    ),
                 )
+
+        # Wait for workers to acknowledge STOPPED
+        self._all_stopped.wait(timeout=self.ALL_STOPPED_TIMEOUT)
 
         # Join workers
         for p in self._workers:
-            p.join(timeout=5)
+            p.join(timeout=self.JOIN_TIMEOUT)
             if p.is_alive():
                 self.io_helper.logger.warning(
                     f"Worker PID {p.pid} did not exit in time, terminating."
                 )
                 with contextlib.suppress(Exception):
                     p.terminate()
+        self.io_helper.logger.info("All workers stopped.")
 
         # Join reader
+        self._closed = True
         if self._resp_reader_thread and self._resp_reader_thread.is_alive():
-            self._resp_reader_thread.join(timeout=1.0)
+            self._resp_reader_thread.join(timeout=self.JOIN_TIMEOUT)
 
         # Close DB
         with contextlib.suppress(Exception):

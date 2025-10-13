@@ -331,9 +331,7 @@ class SqliteWorkerProcess:
 
 class SqliteWorkerHelper:
     QUEUE_MAX_SIZE = 10_000
-    RPC_TIMEOUT = 30.0
-    RPC_TIMEOUT_SQL = 120.0
-    RPC_TIMEOUT_SHUTDOWN = 10.0
+    RPC_TIMEOUT = 10.0
 
     SERVICE = SqliteWorkerProcess.SERVICE
 
@@ -468,7 +466,7 @@ class SqliteWorkerHelper:
         )
 
     def register_table(self, table_def: dict):
-        resp = self._rpc(
+        self._rpc(
             SqliteWorkerMethod.REGISTER_TABLE,
             {"table_def": table_def},
             block=True,
@@ -494,7 +492,6 @@ class SqliteWorkerHelper:
             SqliteWorkerMethod.INSERT_DF,
             payload,
             block=block,
-            timeout=self.RPC_TIMEOUT_SQL if block else None,
         )
 
     def query_all(self, table_name: str) -> pd.DataFrame:
@@ -502,7 +499,6 @@ class SqliteWorkerHelper:
             SqliteWorkerMethod.QUERY_ALL,
             {"table": table_name},
             block=True,
-            timeout=self.RPC_TIMEOUT_SQL,
         )
         return pd.read_pickle(io.BytesIO(resp.result))
 
@@ -511,7 +507,6 @@ class SqliteWorkerHelper:
             SqliteWorkerMethod.QUERY,
             {"table": table_name, "sql": sql, "kwargs": kwargs},
             block=True,
-            timeout=self.RPC_TIMEOUT_SQL,
         )
         return pd.read_pickle(io.BytesIO(resp.result))
 
@@ -524,7 +519,7 @@ class SqliteWorkerHelper:
                 SqliteWorkerMethod.SHUTDOWN,
                 {},
                 block=True,
-                timeout=self.RPC_TIMEOUT_SHUTDOWN,
+                timeout=self.RPC_TIMEOUT,
             )
         except Exception:
             if self.worker_proc and self.worker_proc.is_alive():
@@ -533,6 +528,6 @@ class SqliteWorkerHelper:
 
         self._closed = True
         if self.worker_proc:
-            self.worker_proc.join(timeout=self.RPC_TIMEOUT_SHUTDOWN)
+            self.worker_proc.join(timeout=self.RPC_TIMEOUT)
         if self.resp_reader_thread.is_alive():
             self.resp_reader_thread.join(timeout=1.0)
