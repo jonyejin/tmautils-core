@@ -38,6 +38,7 @@ class DomainProfileWorker:
         *,
         working_root: str,
         dns_util_kwargs: Optional[dict] = None,
+        logging_config: Optional[LogConfig] = None,
     ):
         self.cmd_q = cmd_q
         self.rsp_q = rsp_q
@@ -54,6 +55,11 @@ class DomainProfileWorker:
             working_root=Path(dns_working_root),
             **dns_kwargs,
         )
+
+        self.logger = None
+        if logging_config is not None:
+            self._log_helper = LogHelper(logging_config)
+            self.logger = self._log_helper.logger
 
     def run(self):
         self._loop = asyncio.new_event_loop()
@@ -93,6 +99,9 @@ class DomainProfileWorker:
                 self.rsp_q.put(IpcMsg.status(IpcStatusCode.STOPPED))
 
     def _cmd_loop(self):
+        if self.logger:
+            self.logger.info("Started command loop")
+
         while True:
             if self.shutdown_event.is_set():
                 if self._loop is not None:
@@ -112,9 +121,14 @@ class DomainProfileWorker:
 
             self._loop.call_soon_threadsafe(self._accept_request, msg)
 
+        if self.logger:
+            self.logger.info("Exiting command loop")
+
     def _stop_loop(self):
         for t in list(self._tasks.values()):
             with contextlib.suppress(Exception):
+                if self.logger:
+                    self.logger.info(f"Cancelling task {t.get_name()}")
                 t.cancel()
         if self._loop and self._loop.is_running():
             self._loop.stop()
@@ -483,8 +497,9 @@ class DomainProfileUtil:
                     self._cmd_q,
                     self._rsp_q,
                     self._shutdown_event,
-                    str(working_root),
+                    str(self.io_helper.working_root),
                     dns_util_kwargs or {},
+                    self.io_helper.get_worker_logging_config(),
                 ),
                 daemon=False,
                 name=f"{self.__class__.__name__}-worker-{i}"
@@ -514,13 +529,15 @@ class DomainProfileUtil:
         shutdown_event: Event,
         working_root: str,
         dns_util_kwargs: Optional[dict] = None,
+        logging_config: Optional[LogConfig] = None,
     ):
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         worker = DomainProfileWorker(
             cmd_q, rsp_q, shutdown_event,
             working_root=working_root,
-            dns_util_kwargs=dns_util_kwargs or {},
+            dns_util_kwargs=dns_util_kwargs,
+            logging_config=logging_config,
         )
         worker.run()
 
@@ -541,15 +558,18 @@ class DomainProfileUtil:
                 continue
 
             if msg.is_status:
+                self.io_helper.logger.info(
+                    f"Received status from worker PID {msg.sender_pid}: {msg.status_code}"
+                )
                 if msg.status_code == IpcStatusCode.STOPPED:
                     # Keep track of how many workers left to stop
                     with self._stopped_lock:
                         self._stopped_left = max(0, self._stopped_left - 1)
+                        self.io_helper.logger.info(
+                            f"Workers left to stop: {self._stopped_left}"
+                        )
                         if self._stopped_left == 0:
                             self._all_stopped.set()
-                self.io_helper.logger.info(
-                    f"Received status from worker PID {msg.sender_pid}: {msg.status_code}"
-                )
                 continue
 
             if not msg.is_response or msg.req_id is None:
@@ -856,7 +876,10 @@ class DomainProfileUtil:
                 )
 
         # Wait for workers to acknowledge STOPPED
-        self._all_stopped.wait(timeout=self.ALL_STOPPED_TIMEOUT)
+        if not self._all_stopped.wait(timeout=self.ALL_STOPPED_TIMEOUT):
+            self.io_helper.logger.warning(
+                "Timed out waiting for all workers to acknowledge STOPPED."
+            )
 
         # Join workers
         for p in self._workers:

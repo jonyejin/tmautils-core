@@ -1,7 +1,7 @@
 from enum import Enum, StrEnum
 from typing import (
     Union, Any, Optional,
-    Callable, Awaitable,
+    Callable, Awaitable, Iterable,
     Literal, Dict, List, Tuple,
     TypeVar, TYPE_CHECKING,
 )
