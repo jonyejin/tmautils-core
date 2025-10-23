@@ -48,6 +48,7 @@ class DomainProfileWorker:
         self._sem: Optional[asyncio.Semaphore] = None
         self._cmd_thread: Optional[threading.Thread] = None
         self._tasks: Dict[int, asyncio.Task] = {}  # req_id -> task
+        self._async_helper = AsyncHelper()
 
         dns_kwargs = dict(dns_util_kwargs or {})
         dns_working_root = dns_kwargs.pop("working_root", working_root)
@@ -56,10 +57,10 @@ class DomainProfileWorker:
             **dns_kwargs,
         )
 
-        self.logger = None
-        if logging_config is not None:
-            self._log_helper = LogHelper(logging_config)
-            self.logger = self._log_helper.logger
+        self._log_helper = (
+            LogHelper(logging_config) if logging_config else None
+        )
+        self.logger = get_logger_from_helper(self._log_helper)
 
     def run(self):
         self._loop = asyncio.new_event_loop()
@@ -96,22 +97,31 @@ class DomainProfileWorker:
                 )
             self._loop.close()
             with contextlib.suppress(Exception):
-                self.rsp_q.put(IpcMsg.status(IpcStatusCode.STOPPED))
+                self._async_helper.mpq_put_sync(
+                    self.rsp_q, IpcMsg.status(IpcStatusCode.STOPPED), timeout=0.5
+                )
 
     def _cmd_loop(self):
-        if self.logger:
-            self.logger.info("Started command loop")
+        self.logger.info("Started command loop")
 
         while True:
             if self.shutdown_event.is_set():
-                if self._loop is not None:
-                    self._loop.call_soon_threadsafe(self._stop_loop)
+                self.logger.info("Shutdown event set, exiting command loop")
                 break
 
             try:
-                msg = self.cmd_q.get(timeout=self.GET_TIMEOUT)
+                msg = self.cmd_q.get()
+            except (EOFError, OSError) as exc:
+                self.logger.info(
+                    f"Command queue closed ({exc}), exiting command loop"
+                )
+                break
             except Exception:
                 continue
+
+            if msg is None:
+                self.logger.info("Received sentinel, exiting command loop")
+                break
 
             if (not isinstance(msg, IpcMsg) or
                     msg.service != self.SERVICE or
@@ -121,17 +131,18 @@ class DomainProfileWorker:
 
             self._loop.call_soon_threadsafe(self._accept_request, msg)
 
-        if self.logger:
-            self.logger.info("Exiting command loop")
+        # Stop the event loop
+        if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._stop_loop)
 
     def _stop_loop(self):
         for t in list(self._tasks.values()):
             with contextlib.suppress(Exception):
-                if self.logger:
-                    self.logger.info(f"Cancelling task {t.get_name()}")
+                self.logger.info(f"Cancelling task {t.get_name()}")
                 t.cancel()
         if self._loop and self._loop.is_running():
             self._loop.stop()
+        self.logger.info("Stopped event loop")
 
     def _accept_request(self, req: IpcMsg):
         if req.req_id in self._tasks and not self._tasks[req.req_id].done():
@@ -164,14 +175,20 @@ class DomainProfileWorker:
                 else:
                     raise ValueError(f"Unknown method {method}")
 
-                await async_put(self.rsp_q, req.respond_with(ok=True, result=result))
+            await self._async_helper.mpq_put(
+                self.rsp_q, req.respond_with(ok=True, result=result)
+            )
         except asyncio.CancelledError as e:
             with contextlib.suppress(Exception):
-                await async_put(self.rsp_q, req.respond_with(ok=False, error=e))
+                await self._async_helper.mpq_put(
+                    self.rsp_q, req.respond_with(ok=False, error=e)
+                )
             raise
         except Exception as e:
             with contextlib.suppress(Exception):
-                await async_put(self.rsp_q, req.respond_with(ok=False, error=e))
+                await self._async_helper.mpq_put(
+                    self.rsp_q, req.respond_with(ok=False, error=e)
+                )
 
     async def _get_cert(self, kw: Dict[str, Any]):
         host = kw["host"]
@@ -440,7 +457,7 @@ class DomainProfileUtil:
 
         self.db = SqliteDatabase(
             self.db_path,
-            logger=self.io_helper.logger,
+            log_helper=self.io_helper.log_helper,
             offload_to_worker=True,
             write_buffering=True,
         )
@@ -488,6 +505,7 @@ class DomainProfileUtil:
                                   asyncio.Future,
                                   DomainProfileMethod]] = {}
         self._waiters_lock = threading.Lock()
+        self._async_helper = AsyncHelper()
 
         # Start workers
         for i in range(max(1, int(num_workers))):
@@ -595,26 +613,11 @@ class DomainProfileUtil:
 
             # Handle result
             try:
-                if method == DomainProfileMethod.GET_CERT:
-                    res_df = self._handle_cert_result(msg.result)
-                    loop.call_soon_threadsafe(fut.set_result, res_df)
-                elif method == DomainProfileMethod.GET_DNS:
-                    res_df = self._handle_dns_result(msg.result)
-                    loop.call_soon_threadsafe(fut.set_result, res_df)
-                elif method == DomainProfileMethod.GET_CERT_DNS:
-                    cert_df, dns_df = self._handle_cert_dns_result(msg.result)
-                    loop.call_soon_threadsafe(
-                        fut.set_result, (cert_df, dns_df)
-                    )
-                else:
-                    loop.call_soon_threadsafe(
-                        fut.set_exception,
-                        RuntimeError(f"Unknown method in response: {method}")
-                    )
+                loop.call_soon_threadsafe(fut.set_result, msg.result)
             except Exception as e:
                 loop.call_soon_threadsafe(fut.set_exception, e)
 
-    def _rpc_async(self, method: DomainProfileMethod, **kwargs):
+    async def _rpc(self, method: DomainProfileMethod, **kwargs):
         if self._closed:
             raise RuntimeError(
                 "DomainProfileUtil is closed, cannot make new requests"
@@ -633,8 +636,9 @@ class DomainProfileUtil:
             method=method,
             **kwargs,
         )
-        self._cmd_q.put(req)
-        return fut
+        await self._async_helper.mpq_put(self._cmd_q, req)
+
+        return await fut
 
     def _handle_cert_result(self, result: dict):
         cert_info = result.get("cert_info") or {}
@@ -754,12 +758,13 @@ class DomainProfileUtil:
         Returns:
             A single-row DataFrame with the obtained certificate information.
         """
-        return await self._rpc_async(
+        result = await self._rpc(
             DomainProfileMethod.GET_CERT,
             host=host,
             port=port,
             sni=sni,
         )
+        return await asyncio.to_thread(self._handle_cert_result, result)
 
     def grab_cert(
         self,
@@ -788,10 +793,11 @@ class DomainProfileUtil:
             A single-row DataFrame with the stored DNS information.
         """
 
-        return await self._rpc_async(
+        result = await self._rpc(
             DomainProfileMethod.GET_DNS,
             host=host,
         )
+        return await asyncio.to_thread(self._handle_dns_result, result)
 
     def grab_dns(self, host: str):
         """
@@ -824,11 +830,12 @@ class DomainProfileUtil:
             The second element is a single-row DataFrame with the stored DNS information.
         """
 
-        return await self._rpc_async(
+        result = await self._rpc(
             DomainProfileMethod.GET_CERT_DNS,
             host=host,
             port=port,
         )
+        return await asyncio.to_thread(self._handle_cert_dns_result, result)
 
     def grab_cert_dns(
         self,
@@ -861,6 +868,16 @@ class DomainProfileUtil:
         self.io_helper.logger.info("Shutting down workers...")
         with contextlib.suppress(Exception):
             self._shutdown_event.set()
+            if self._cmd_q is not None:
+                # Send sentinel to all workers
+                for _ in self._workers:
+                    self._async_helper.mpq_put_sync(
+                        self._cmd_q, None, timeout=0.5
+                    )
+                # Close command queue
+                self._cmd_q.close()
+                self._cmd_q.cancel_join_thread()
+                self._cmd_q = None
 
         # Cancel any outstanding waiters
         with self._waiters_lock:

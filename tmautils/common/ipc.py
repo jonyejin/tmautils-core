@@ -1,4 +1,3 @@
-import multiprocessing as mp
 import uuid
 import time
 import os
@@ -224,16 +223,3 @@ def raise_from_payload(payload: dict):
     except Exception:
         exc_cls = RuntimeError
     raise exc_cls(f"{msg}\nRemote traceback:\n{tb}")
-
-
-async def async_put(
-    q: "mp.Queue",
-    item: Any,
-    timeout: Optional[float] = None,
-):
-    """
-    Asynchronously put an item into a multiprocessing.Queue.
-    This function uses asyncio.to_thread to run the blocking put operation in a separate thread, so it doesn't block the event loop.
-    """
-    import asyncio
-    await asyncio.to_thread(q.put, item, timeout=timeout)

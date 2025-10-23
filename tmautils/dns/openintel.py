@@ -27,6 +27,8 @@ class OpenIntelZoneStreamWorker:
         topics: list[str],
         data_q: mp.Queue,
         cmd_q: mp.Queue,
+        *,
+        logging_config: Optional[LogConfig] = None,
     ):
         from collections import deque
 
@@ -44,6 +46,11 @@ class OpenIntelZoneStreamWorker:
         self.sender_thr: Optional[Thread] = None
         self.cmd_thr: Optional[Thread] = None
 
+        self._async_helper = AsyncHelper()
+        self._log_helper = LogHelper(
+            logging_config) if logging_config else None
+        self.logger = get_logger_from_helper(self._log_helper)
+
     def _sender_loop(self):
         while self.running.is_set() or self.send_q:
             if not self.send_q:
@@ -59,7 +66,8 @@ class OpenIntelZoneStreamWorker:
                 topic_map.setdefault(topic, []).append(msg)
                 total += 1
 
-            self.data_q.put(
+            self._async_helper.mpq_put_sync(
+                self.data_q,
                 IpcMsg.notify(
                     self.SERVICE,
                     ZoneStreamMethod.BATCH,
@@ -80,17 +88,13 @@ class OpenIntelZoneStreamWorker:
                 continue
 
             if ZoneStreamMethod.get_method(msg) == ZoneStreamMethod.STOP:
+                self.logger.info("Received STOP notification from parent")
                 self.shutdown()
                 break
 
     def _on_open_factory(self, topic):
         def _on_open(ws):
-            self.data_q.put(
-                IpcMsg.log(
-                    logging.INFO,
-                    f"[{topic}] WebSocket opened: {ws.url}"
-                )
-            )
+            self.logger.info(f"[{topic}] WebSocket opened: {ws.url}")
 
         return _on_open
 
@@ -101,12 +105,7 @@ class OpenIntelZoneStreamWorker:
             try:
                 msg = json.loads(message)
             except Exception as e:
-                self.data_q.put(
-                    IpcMsg.log(
-                        logging.ERROR,
-                        f"[{topic}] JSON decode error: {e}"
-                    )
-                )
+                self.logger.error(f"[{topic}] JSON decode error: {e}")
                 return
             msg["msg_timestamp"] = pd.Timestamp.now(tz="UTC").timestamp()
             self.send_q.append((topic, msg))
@@ -116,22 +115,14 @@ class OpenIntelZoneStreamWorker:
 
     def _on_error_factory(self, topic):
         def _on_error(ws, error: Exception):
-            self.data_q.put(
-                IpcMsg.log(
-                    logging.ERROR,
-                    f"[{topic}] WebSocket error: {error}"
-                )
-            )
+            self.logger.error(f"[{topic}] WebSocket error: {error}")
 
         return _on_error
 
     def _on_close_factory(self, topic):
         def _on_close(ws, code, msg):
-            self.data_q.put(
-                IpcMsg.log(
-                    logging.INFO,
-                    f"[{topic}] WebSocket closed, code={code}, msg={msg}"
-                )
+            self.logger.info(
+                f"[{topic}] WebSocket closed, code={code}, msg={msg}"
             )
 
         return _on_close
@@ -159,6 +150,18 @@ class OpenIntelZoneStreamWorker:
 
     def run(self):
         try:
+            # Command thread
+            self.cmd_thr = Thread(
+                target=self._cmd_loop,
+                name=f"{self.__class__.__name__}-cmd",
+                daemon=True,
+            )
+            self.cmd_thr.start()
+
+            self.logger.info(
+                f"Starting WebSocket listeners for topics: {self.topics}"
+            )
+
             for topic in self.topics:
                 ws = WebSocketApp(
                     self.WS_URL.format(topic=topic),
@@ -181,22 +184,13 @@ class OpenIntelZoneStreamWorker:
             )
             self.sender_thr.start()
 
-            # Command thread
-            self.cmd_thr = Thread(
-                target=self._cmd_loop,
-                name=f"{self.__class__.__name__}-cmd",
-                daemon=True,
+            self._async_helper.mpq_put_sync(
+                self.data_q, IpcMsg.status(IpcStatusCode.READY)
             )
-            self.cmd_thr.start()
-
-            self.data_q.put(IpcMsg.status(IpcStatusCode.READY))
             rel.dispatch()
         except Exception as e:
-            self.data_q.put(
-                IpcMsg.log(
-                    logging.ERROR,
-                    f"Error starting WebSocket listeners: {e}\n"
-                )
+            self.logger.exception(
+                f"Error starting WebSocket listeners: {e}"
             )
         finally:
             self.shutdown()
@@ -207,7 +201,9 @@ class OpenIntelZoneStreamWorker:
                     self.cmd_thr.join(timeout=self.THREAD_JOIN_TIMEOUT_SEC)
             except Exception:
                 pass
-            self.data_q.put(IpcMsg.status(IpcStatusCode.STOPPED))
+            self._async_helper.mpq_put_sync(
+                self.data_q, IpcMsg.status(IpcStatusCode.STOPPED)
+            )
 
 
 class OpenIntelZoneStreamUtil:
@@ -241,6 +237,7 @@ class OpenIntelZoneStreamUtil:
     """
 
     MAX_CALLBACK_WORKERS = 4
+    STOP_TIMEOUT_SEC = 10.0
     TOPIC_TO_SCHEMA = {
         "newly_registered_fqdn": {
             "msg_timestamp":    float,
@@ -309,6 +306,8 @@ class OpenIntelZoneStreamUtil:
         self._stop_event = Event()
         self._receiver_thread: Optional[Thread] = None
         self._atexit_registered = False
+        self._async_helper = AsyncHelper()
+        self._child_stopped = Event()
 
         # IPC/process
         self._ctx = mp.get_context("spawn")
@@ -328,7 +327,7 @@ class OpenIntelZoneStreamUtil:
         self.db_path = self.io_helper.raw / "openintel_zone_stream.sqlite"
         self.db: Optional[SqliteDatabase] = SqliteDatabase(
             self.db_path,
-            logger=self.io_helper.logger,
+            log_helper=self.io_helper.log_helper,
             offload_to_worker=True,
             write_buffering=True,
         )
@@ -342,12 +341,22 @@ class OpenIntelZoneStreamUtil:
         }
 
     @staticmethod
-    def _child_entry(topics: list[str], data_q: mp.Queue, cmd_q: mp.Queue):
+    def _child_entry(
+        topics: list[str],
+        data_q: mp.Queue,
+        cmd_q: mp.Queue,
+        logging_config: Optional[LogConfig] = None,
+    ):
         # Ignore SIGINT in child
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-        OpenIntelZoneStreamWorker(topics, data_q, cmd_q).run()
+        OpenIntelZoneStreamWorker(
+            topics,
+            data_q,
+            cmd_q,
+            logging_config=logging_config,
+        ).run()
 
     def start(self):
         """
@@ -360,6 +369,7 @@ class OpenIntelZoneStreamUtil:
 
         self.io_helper.logger.info("Starting Zone Stream listener")
         self._stop_event.clear()
+        self._child_stopped.clear()
 
         # Queues
         self._data_queue = self._ctx.Queue()
@@ -374,8 +384,8 @@ class OpenIntelZoneStreamUtil:
                 self.topics,
                 self._data_queue,
                 self._cmd_queue,
+                self.io_helper.get_worker_logging_config(),
             ),
-            daemon=True,
         )
         self._proc.start()
 
@@ -393,6 +403,7 @@ class OpenIntelZoneStreamUtil:
             self._atexit_registered = True
 
         self._running = True
+
         self.io_helper.logger.info(
             f"Started Zone Stream listener for topics: {self.topics}"
         )
@@ -411,30 +422,31 @@ class OpenIntelZoneStreamUtil:
         # Ask child to stop
         try:
             if self._cmd_queue:
-                self._cmd_queue.put(
+                self._async_helper.mpq_put_sync(
+                    self._cmd_queue,
                     IpcMsg.notify(
                         OpenIntelZoneStreamWorker.SERVICE,
                         ZoneStreamMethod.STOP
                     ),
                     timeout=0.5
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            self.io_helper.logger.warning(
+                f"Failed to signal child process to stop: {exc}"
+            )
 
-        # "Fake" status update in case child is unresponsive or already stopped
-        try:
-            if self._data_queue:
-                self._data_queue.put(
-                    IpcMsg.status(IpcStatusCode.STOPPED),
-                    timeout=0.5
-                )
-        except Exception:
-            pass
+        if not self._child_stopped.wait(timeout=self.STOP_TIMEOUT_SEC):
+            self.io_helper.logger.warning(
+                "Timed out waiting for child process to stop"
+            )
+
+        self._stop_event.set()  # Signal receiver to stop
 
         # Join receiver thread
         self.io_helper.logger.info("Stopping receiver thread")
         if self._receiver_thread and self._receiver_thread.is_alive():
             self._receiver_thread.join(timeout=5.0)
+        self._receiver_thread = None
 
         # Shut down callback pool
         try:
@@ -450,13 +462,14 @@ class OpenIntelZoneStreamUtil:
         # Join child
         self.io_helper.logger.info("Waiting for child process to stop")
         if self._proc is not None:
-            self._proc.join(timeout=10.0)
+            self._proc.join(timeout=self.STOP_TIMEOUT_SEC)
             if self._proc.is_alive():
                 self.io_helper.logger.warning(
                     "Child unresponsive; terminating."
                 )
                 self._proc.terminate()
                 self._proc.join(timeout=5.0)
+        self._proc = None
 
         # Close DB
         try:
@@ -467,6 +480,8 @@ class OpenIntelZoneStreamUtil:
             pass
         self.db = None
         self.topic_tables = None
+        self._cmd_queue = None
+        self._data_queue = None
 
         self.io_helper.logger.info(
             "Stopped Zone Stream listener and flushed caches to database"
@@ -503,19 +518,15 @@ class OpenIntelZoneStreamUtil:
 
         while not self._stop_event.is_set():
             try:
-                msg = self._data_queue.get()
+                msg = self._async_helper.mpq_get_sync(
+                    self._data_queue,
+                    timeout=0.5,
+                )
             except Exception:
                 continue
 
             if not isinstance(msg, IpcMsg):
                 self.io_helper.logger.warning(f"Invalid IPC message: {msg}")
-                continue
-
-            if msg.is_log:
-                self.io_helper.logger.log(
-                    msg.level or logging.INFO,
-                    msg.message,
-                )
                 continue
 
             if msg.is_status:
@@ -524,6 +535,8 @@ class OpenIntelZoneStreamUtil:
                     f"Child status: {st.value if st else st}"
                 )
                 if st == IpcStatusCode.STOPPED:
+                    self._child_stopped.set()
+                    self._stop_event.set()
                     break  # Stop since child stopped
                 continue
 
