@@ -52,7 +52,7 @@ class IpInfoCarrierUtil:
         # Initialize SqliteDatabase and register the table
         self.db = SqliteDatabase(
             self.db_path,
-            logger=self.io_helper.logger,
+            log_helper=self.io_helper.log_helper,
         )
         self.ipinfo_carrier_table: SqliteTable = self.db.register_table(
             "ipinfo_carrier",
@@ -85,7 +85,7 @@ class IpInfoCarrierUtil:
         self.lpm_helper = SqliteLpmTrieHelper(
             self.db.path,
             self.ipinfo_carrier_table,
-            logger=self.io_helper.logger,
+            log_helper=self.io_helper.log_helper,
         )
 
         self.io_helper.logger.info(

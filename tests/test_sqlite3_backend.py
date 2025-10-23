@@ -10,19 +10,19 @@ import pytest
 from tmautils.common import SqliteDatabase
 
 
-Mode = namedtuple("Mode", "offload buffering flush_on_query label")
+Mode = namedtuple("Mode", "offload buffering label")
 
 # Baseline direct, no buffering
-MODE_DIRECT = Mode(False, False, False, "direct")
+MODE_DIRECT = Mode(False, False, "direct")
 
 # Exercise IPC path without buffering
-MODE_WORKER = Mode(True,  False, False, "worker")
+MODE_WORKER = Mode(True,  False, "worker")
 
-# Smoke buffered path (flush on query makes reads deterministic)
-MODE_BUFFERED_DIRECT = Mode(False, True,  True,  "buffered_direct")
+# Smoke buffered path (per-query flush keeps reads deterministic)
+MODE_BUFFERED_DIRECT = Mode(False, True,  "buffered_direct")
 
 # Exercise buffered path through worker as well
-MODE_BUFFERED_WORKER = Mode(True,  True,  True,  "buffered_worker")
+MODE_BUFFERED_WORKER = Mode(True,  True,  "buffered_worker")
 
 # Groups
 CRUD_MODES = [MODE_DIRECT, MODE_WORKER, MODE_BUFFERED_WORKER]
@@ -37,7 +37,7 @@ DDL_MODES = [MODE_DIRECT]  # schema/indices once is enough
 #   - If buffering is enabled, we set:
 #       * a huge row_threshold (so inserts won’t auto-flush)
 #       * a huge flush interval (so the background ticker won’t kick in)
-#     and then rely on either `flush_on_query` or `force_flush=True` in tests.
+#     and then rely on either per-query `flush_before_query` or `force_flush=True` in tests.
 # ----------------------------------------------------------------------
 @pytest.fixture
 def db_maker(tmp_path):
@@ -55,7 +55,6 @@ def db_maker(tmp_path):
             uri=False,
             offload_to_worker=mode.offload,
             write_buffering=mode.buffering,
-            write_buf_flush_on_query=mode.flush_on_query,
             write_buf_row_threshold=row_threshold,
             write_buf_flush_interval_sec=flush_interval,
         )
@@ -95,7 +94,7 @@ def test_single_table_crud(db_maker, mode):
         "name": ["Alice", "Bob"]
     })
     # In worker modes, this blocks on the RPC return.
-    # In buffered modes with flush_on_query=True, the later query forces a flush.
+    # Buffered modes rely on per-query flush_before_query=True (the default) to get fresh data.
     users.insert_df(df_insert, wait_for_worker=True)
 
     df_all = users.query_all()

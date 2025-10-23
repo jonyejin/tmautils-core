@@ -345,7 +345,7 @@ class IpInfoPrivacyUtil:
         # Initialize SqliteDatabase and register the table
         self.db = SqliteDatabase(
             self.db_path,
-            logger=self.io_helper.logger,
+            log_helper=self.io_helper.log_helper,
         )
         self.ipinfo_privacy_table: SqliteTable = self.db.register_table(
             "ipinfo_privacy",
@@ -379,7 +379,7 @@ class IpInfoPrivacyUtil:
         self.lpm_helper = SqliteLpmTrieHelper(
             self.db.path,
             self.ipinfo_privacy_table,
-            logger=self.io_helper.logger,
+            log_helper=self.io_helper.log_helper,
         )
 
         self.io_helper.logger.info(

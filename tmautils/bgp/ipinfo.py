@@ -55,7 +55,7 @@ class IPInfoLiteUtil:
         is_initialized = self.db_path.exists()
         self.db = SqliteDatabase(
             self.db_path,
-            logger=self.io_helper.logger,
+            log_helper=self.io_helper.log_helper,
         )
         self.ipinfo_lite_table: SqliteTable = self.db.register_table(
             "ipinfo_lite",
@@ -90,7 +90,7 @@ class IPInfoLiteUtil:
         self.lpm_helper = SqliteLpmTrieHelper(
             self.db.path,
             self.ipinfo_lite_table,
-            logger=self.io_helper.logger,
+            log_helper=self.io_helper.log_helper,
         )
 
         self.io_helper.logger.info(

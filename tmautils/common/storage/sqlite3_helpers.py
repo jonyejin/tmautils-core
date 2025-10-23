@@ -2,7 +2,6 @@ from pathlib import Path
 import multiprocessing as mp
 from multiprocessing.connection import Connection
 from ipaddress import ip_address
-from logging import Logger
 import pandas as pd
 import threading
 from queue import Queue, Empty
@@ -10,6 +9,7 @@ import io
 
 from ..types import *
 from ..ipc import *
+from ..io import LogConfig, LogHelper, get_logger_from_helper
 
 if TYPE_CHECKING:
     from .sqlite3_storage import SqliteDatabase, SqliteTable  # noqa: F401 (type-only)
@@ -41,8 +41,8 @@ class SqliteLpmTrieHelper:
             The name of the column containing the prefix length of the network.
             Default is `prefix_length`.
 
-        logger (Logger | None):
-            An optional logger instance for logging messages. If not provided, no logging will occur.
+        log_helper (LogHelper | None):
+            An optional LogHelper instance for logging.
     """
 
     def __init__(
@@ -52,13 +52,15 @@ class SqliteLpmTrieHelper:
         version_col: str = 'version',
         network_start_col: str = 'network_start',
         prefix_length_col: str = 'prefix_length',
-        logger: Logger | None = None,
+        log_helper: Optional[LogHelper] = None,
     ):
         self.db_path = db_path.expanduser().resolve(strict=True)
         self.table = table
         self.table_name = table.table_name
         self.key_cols = (version_col, network_start_col, prefix_length_col)
-        self.logger = logger
+        self.log_helper = log_helper
+        self.logger = get_logger_from_helper(self.log_helper)
+        self._poll_lock = threading.Lock()
         self._trie_pipe = None
         self._trie_ready = False
         self.trie4 = None
@@ -66,10 +68,9 @@ class SqliteLpmTrieHelper:
 
         self.start_trie_build_process()
 
-        if self.logger:
-            self.logger.info(
-                f"Initialized LPM Trie helper for {self.table_name} with keys {self.key_cols}"
-            )
+        self.logger.info(
+            f"Initialized LPM Trie helper for {self.table_name} with keys {self.key_cols}"
+        )
 
     def start_trie_build_process(self):
         ctx = mp.get_context("spawn")
@@ -81,12 +82,12 @@ class SqliteLpmTrieHelper:
                 str(self.db_path),
                 self.table_name,
                 self.key_cols,
+                self.log_helper.get_worker_config() if self.log_helper else None,
             ),
             daemon=True,
         )
         child.start()
-        if self.logger:
-            self.logger.info(f"Started process {child.pid} to build LPM tries")
+        self.logger.info(f"Started process {child.pid} to build LPM tries")
 
     @staticmethod
     def _build_process(
@@ -94,20 +95,28 @@ class SqliteLpmTrieHelper:
         db_path: str,
         table_name: str,
         key_cols: tuple[str, ...],
+        log_config: Optional[LogConfig],
     ):
         from ipaddress import ip_network
         from pytricia import PyTricia
         import pandas as pd
-        from .sqlite3_storage import SqliteDatabase, _sqlite3_conversion_ctx
+        from .sqlite3_storage import SqliteDatabase
+
+        log_helper = LogHelper(log_config) if log_config else None
+        logger = get_logger_from_helper(log_helper)
 
         # Gather primary keys from the database
-        db = SqliteDatabase(db_path)
-        with _sqlite3_conversion_ctx():
-            df = pd.read_sql_query(
-                f"SELECT {', '.join(key_cols)} FROM {table_name}",
-                db.conn,
-            )
+        db = SqliteDatabase(db_path, log_helper=log_helper)
+        df = pd.read_sql_query(
+            f"SELECT {', '.join(key_cols)} FROM {table_name}",
+            db.conn,
+        )
         del db
+
+        logger.info(
+            f"Building LPM tries from {len(df)} entries "
+            f"in table '{table_name}'"
+        )
 
         trie4 = PyTricia(32)
         trie6 = PyTricia(128)
@@ -120,32 +129,31 @@ class SqliteLpmTrieHelper:
         # Freeze and send tries to the parent process
         trie4.freeze()
         trie6.freeze()
-        pipe_conn.send(trie4)
-        pipe_conn.send(trie6)
+        pipe_conn.send((trie4, trie6))
         pipe_conn.close()
 
-    def _poll_ready(self):
-        if self._trie_ready or not self._trie_pipe:
-            # If already ready or pipe failed, do nothing
-            return
+        logger.info("LPM tries built and sent to parent process")
 
-        if self._trie_pipe.poll():
-            try:
-                # Receive the tries
-                self.trie4 = self._trie_pipe.recv()
-                self.trie6 = self._trie_pipe.recv()
-                # Thaw the tries to make them usable
-                self.trie4.thaw()
-                self.trie6.thaw()
-                self._trie_ready = True
-                if self.logger:
+    def _poll_ready(self):
+        with self._poll_lock:
+            if self._trie_ready or not self._trie_pipe:
+                # If already ready or pipe failed, do nothing
+                return
+
+            if self._trie_pipe.poll():
+                try:
+                    # Receive the tries
+                    self.trie4, self.trie6 = self._trie_pipe.recv()
+                    # Thaw the tries to make them usable
+                    self.trie4.thaw()
+                    self.trie6.thaw()
+                    self._trie_ready = True
                     self.logger.info("LPM tries ready")
-            except EOFError:
-                if self.logger:
+                except EOFError:
                     self.logger.error("Failed to receive tries from the pipe")
-            finally:
-                self._trie_pipe.close()
-                self._trie_pipe = None
+                finally:
+                    self._trie_pipe.close()
+                    self._trie_pipe = None
 
     def lookup(self, ip: str | IPAddress) -> pd.Series:
         """
@@ -208,11 +216,20 @@ class SqliteWorkerMethod(IpcMethodBase, StrEnum):
 class SqliteWorkerProcess:
     SERVICE = "sqlite_worker"
 
-    def __init__(self, cmd_q: mp.Queue, rsp_q: mp.Queue):
+    def __init__(
+        self,
+        cmd_q: mp.Queue,
+        rsp_q: mp.Queue,
+        log_config: Optional[LogConfig]
+    ):
         self.cmd_q = cmd_q
         self.rsp_q = rsp_q
         self.db: Optional[SqliteDatabase] = None
         self._initialized = False
+
+        # Worker-side logging setup
+        self.log_helper = LogHelper(log_config) if log_config else None
+        self.logger = get_logger_from_helper(self.log_helper)
 
         self.cmd_handlers: dict[SqliteWorkerMethod, Callable[..., Any]] = {
             SqliteWorkerMethod.INIT: self.handle_init,
@@ -225,11 +242,14 @@ class SqliteWorkerProcess:
 
     def handle_init(self, **kwargs):
         db_init_kwargs: dict = kwargs["db_init_kwargs"]
+
         # Do not re-offload
         db_init_kwargs["is_worker"] = True
         db_init_kwargs["offload_to_worker"] = False
-        # Remove logger (we will log over IPC)
-        db_init_kwargs["logger"] = None
+
+        # Logging
+        if self.log_helper is not None:
+            db_init_kwargs["log_helper"] = self.log_helper
 
         from .sqlite3_storage import SqliteDatabase
         self.db = SqliteDatabase(**db_init_kwargs)
@@ -338,12 +358,18 @@ class SqliteWorkerHelper:
     def __init__(self, db_init_kwargs: dict):
         self.db_init_kwargs = dict(db_init_kwargs)
 
-        # Remove logger from init kwargs (not picklable)
-        self.logger: Optional[Logger] = self.db_init_kwargs.pop("logger", None)
+        # Remove log_helper from init kwargs (not picklable)
+        self.log_helper: Optional[LogHelper] = self.db_init_kwargs.pop(
+            "log_helper", None
+        )
+        self.logger = get_logger_from_helper(self.log_helper)
 
         self._ctx = mp.get_context("spawn")
         self.cmd_q = self._ctx.Queue(maxsize=self.QUEUE_MAX_SIZE)
         self.rsp_q = self._ctx.Queue()
+        self.worker_log_config: Optional[LogConfig] = (
+            self.log_helper.get_worker_config() if self.log_helper else None
+        )
         self.worker_proc: Optional[mp.Process] = None
 
         self.req_id = 0
@@ -365,12 +391,16 @@ class SqliteWorkerHelper:
             return rid
 
     @staticmethod
-    def _child_entry(cmd_q: mp.Queue, rsp_q: mp.Queue):
+    def _child_entry(
+        cmd_q: mp.Queue,
+        rsp_q: mp.Queue,
+        log_config: Optional[LogConfig]
+    ):
         # Ignore SIGINT in the child process to avoid KeyboardInterrupt
         import signal
         signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-        worker = SqliteWorkerProcess(cmd_q, rsp_q)
+        worker = SqliteWorkerProcess(cmd_q, rsp_q, log_config)
         worker.run()
 
     def _resp_read_loop(self):
@@ -381,23 +411,20 @@ class SqliteWorkerHelper:
                 # Timeout, loop again
                 continue
             except (EOFError, BrokenPipeError, OSError) as e:
-                if self.logger:
-                    self.logger.error(
-                        f"Response queue closed/broken: {e}. Exiting reader thread."
-                    )
+                self.logger.error(
+                    f"Response queue closed/broken: {e}. Exiting reader thread."
+                )
                 break
             except Exception as e:
-                if self.logger:
-                    self.logger.error(
-                        f"Error reading from response queue: {e}"
-                    )
+                self.logger.error(
+                    f"Error reading from response queue: {e}"
+                )
                 continue
 
             if not isinstance(msg, IpcMsg) or not msg.is_response or msg.req_id is None:
-                if self.logger:
-                    self.logger.error(
-                        f"Received invalid message on response queue, ignoring: {msg}"
-                    )
+                self.logger.error(
+                    f"Received invalid message on response queue, ignoring: {msg}"
+                )
                 continue
 
             with self.waiters_lock:
@@ -439,7 +466,7 @@ class SqliteWorkerHelper:
             return resp
         except Empty:
             raise TimeoutError(
-                f"Blocing RPC call {method} timed out after {timeout} seconds"
+                f"Blocking RPC call {method} timed out after {timeout} seconds"
             )
         finally:
             with self.waiters_lock:
@@ -451,7 +478,7 @@ class SqliteWorkerHelper:
 
         self.worker_proc = self._ctx.Process(
             target=self._child_entry,
-            args=(self.cmd_q, self.rsp_q),
+            args=(self.cmd_q, self.rsp_q, self.worker_log_config),
             daemon=False,
         )
         self.worker_proc.start()

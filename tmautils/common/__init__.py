@@ -13,9 +13,12 @@ from .io import (
     gzip_file,
     gunzip_file,
     IOHelper,
-    LogRotationMode,
+)
+from .logging import (
     LogConfig,
     LogHelper,
+    LogRotationMode,
+    get_logger_from_helper,
 )
 from .storage.sqlite3_storage import SqliteDatabase, SqliteTable
 from .storage.sqlite3_helpers import SqliteLpmTrieHelper
