@@ -20,9 +20,9 @@ class AsyncDnsPythonUtil:
     Asynchronous DNS resolver using dnspython library.
 
     Args:
-        nameservers (list[str]):
+        nameservers (list[str] | None):
             List of DNS nameservers to use for resolution.
-            Defaults to ["127.0.0.1"].
+            If None, system default nameservers will be used.
 
         max_concurrent_requests (int):
             Maximum number of concurrent DNS requests.
@@ -52,7 +52,7 @@ class AsyncDnsPythonUtil:
 
     def __init__(
         self,
-        nameservers: list[str] = ["127.0.0.1"],
+        nameservers: Optional[list[str]] = None,
         max_concurrent_requests: int = 500,
         cachesize: int = 500000,
         working_root: Path | None = None,
@@ -68,10 +68,10 @@ class AsyncDnsPythonUtil:
             **kwargs,
         )
 
-        # Set up resolver parameters
-        self.resolver = dns.asyncresolver.Resolver(configure=False)
-        self.resolver.nameservers = nameservers
-        self.resolver.retry_servfail = True  # Not sure if we need this
+        self.resolver = dns.asyncresolver.get_default_resolver()
+        # Set custom nameservers if provided
+        if nameservers is not None:
+            self.resolver.nameservers = nameservers
         self.resolver.cache = LRUCache(max_size=cachesize)
         self.io_helper.logger.info(
             f"Initialized DNS resolver with nameservers: {nameservers},"
