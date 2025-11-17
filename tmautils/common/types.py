@@ -3,7 +3,8 @@ from typing import (
     Union, Any, Optional,
     Callable, Awaitable, Iterable,
     Literal, Dict, List, Tuple,
-    TypeVar, TYPE_CHECKING,
+    Type, TypeVar, TYPE_CHECKING,
+    ClassVar,
 )
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from pathlib import Path
