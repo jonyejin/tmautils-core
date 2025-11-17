@@ -10,6 +10,9 @@ from multiprocessing.synchronize import Event
 import threading
 import contextlib
 import time
+import pyarrow as pa
+from pydantic import BaseModel
+from concurrent.futures import ThreadPoolExecutor, Future
 
 from tmautils.common import *
 from tmautils.dns import AsyncDnsPythonUtil, dns_msg_semantic_hash
@@ -264,6 +267,7 @@ class DomainProfileWorker:
             "host": host,
             "port": port,
             "sni": sni,
+            "effective_host": sni if sni else host,
             "cert_info": cert_info,
             "cert_obs": cert_obs,
         }
@@ -312,10 +316,126 @@ class DomainProfileWorker:
         return cert_res, dns_res
 
 
+class CertInfoModel(BaseModel):
+    fingerprint: str
+    raw_cert: Optional[bytes] = None
+    version: Optional[int] = None
+    subject: Optional[str] = None
+    issuer: Optional[str] = None
+    serial_number: Optional[str] = None
+    not_valid_before: Optional[float] = None
+    not_valid_after: Optional[float] = None
+    signature_algorithm: Optional[str] = None
+    hash_algorithm: Optional[str] = None
+
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("fingerprint", pa.string()),
+        pa.field("raw_cert", pa.binary()),
+        pa.field("version", pa.int64()),
+        pa.field("subject", pa.string()),
+        pa.field("issuer", pa.string()),
+        pa.field("serial_number", pa.string()),
+        pa.field("not_valid_before", pa.timestamp("us")),
+        pa.field("not_valid_after", pa.timestamp("us")),
+        pa.field("signature_algorithm", pa.string()),
+        pa.field("hash_algorithm", pa.string()),
+    ])
+
+
+class CertObservationModel(BaseModel):
+    timestamp: float
+    host: str
+    port: int
+    sni: Optional[str] = None
+    effective_host: str
+    fingerprint: Optional[str] = None
+    valid: bool = False
+    error: Optional[str] = None
+
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("timestamp", pa.timestamp("us")),
+        pa.field("host", pa.string()),
+        pa.field("port", pa.int64()),
+        pa.field("sni", pa.string()),
+        pa.field("effective_host", pa.string()),
+        pa.field("fingerprint", pa.string()),
+        pa.field("valid", pa.bool_()),
+        pa.field("error", pa.string()),
+    ])
+
+
+class DnsInfoModel(BaseModel):
+    hash: str
+    wire_bytes: bytes
+
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("hash", pa.string()),
+        pa.field("wire_bytes", pa.binary()),
+    ])
+
+
+class DnsObservationModel(BaseModel):
+    timestamp: float
+    host: str
+    A_semhash: Optional[str] = None
+    A_expiry: Optional[float] = None
+    AAAA_semhash: Optional[str] = None
+    AAAA_expiry: Optional[float] = None
+    CAA_semhash: Optional[str] = None
+    CAA_expiry: Optional[float] = None
+    CNAME_semhash: Optional[str] = None
+    CNAME_expiry: Optional[float] = None
+    DMARC_semhash: Optional[str] = None
+    DMARC_expiry: Optional[float] = None
+    DNSKEY_semhash: Optional[str] = None
+    DNSKEY_expiry: Optional[float] = None
+    DS_semhash: Optional[str] = None
+    DS_expiry: Optional[float] = None
+    MX_semhash: Optional[str] = None
+    MX_expiry: Optional[float] = None
+    NS_semhash: Optional[str] = None
+    NS_expiry: Optional[float] = None
+    SOA_semhash: Optional[str] = None
+    SOA_expiry: Optional[float] = None
+    SPF_semhash: Optional[str] = None
+    SPF_expiry: Optional[float] = None
+    TXT_semhash: Optional[str] = None
+    TXT_expiry: Optional[float] = None
+
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("timestamp", pa.timestamp("us")),
+        pa.field("host", pa.string()),
+        pa.field("A_semhash", pa.string()),
+        pa.field("A_expiry", pa.timestamp("us")),
+        pa.field("AAAA_semhash", pa.string()),
+        pa.field("AAAA_expiry", pa.timestamp("us")),
+        pa.field("CAA_semhash", pa.string()),
+        pa.field("CAA_expiry", pa.timestamp("us")),
+        pa.field("CNAME_semhash", pa.string()),
+        pa.field("CNAME_expiry", pa.timestamp("us")),
+        pa.field("DMARC_semhash", pa.string()),
+        pa.field("DMARC_expiry", pa.timestamp("us")),
+        pa.field("DNSKEY_semhash", pa.string()),
+        pa.field("DNSKEY_expiry", pa.timestamp("us")),
+        pa.field("DS_semhash", pa.string()),
+        pa.field("DS_expiry", pa.timestamp("us")),
+        pa.field("MX_semhash", pa.string()),
+        pa.field("MX_expiry", pa.timestamp("us")),
+        pa.field("NS_semhash", pa.string()),
+        pa.field("NS_expiry", pa.timestamp("us")),
+        pa.field("SOA_semhash", pa.string()),
+        pa.field("SOA_expiry", pa.timestamp("us")),
+        pa.field("SPF_semhash", pa.string()),
+        pa.field("SPF_expiry", pa.timestamp("us")),
+        pa.field("TXT_semhash", pa.string()),
+        pa.field("TXT_expiry", pa.timestamp("us")),
+    ])
+
+
 class DomainProfileUtil:
     """
     Utility to grab and store TLS certificate and DNS information for domains.
-    Stores data in a SQLite database with two tables: `cert_store` and `dns_store`.
+    Backed by DuckLake tables/views defined in `domain_profile.sql`.
     For clean shutdown, call `aclose()` (async) or `close()` (sync).
 
     Args:
@@ -343,98 +463,13 @@ class DomainProfileUtil:
             See their documentation for more details.
     """
 
-    CERT_OBSERVATION = {
-        "schema": {
-            "timestamp": float,
-            "host": str,
-            "port": int,
-            "sni": str,
-            "fingerprint": str,
-            "valid": bool,
-            "error": str,
-        },
-        "constraints": [
-            "PRIMARY KEY (timestamp, host, port, sni)",
-            "FOREIGN KEY (fingerprint) REFERENCES cert_info(fingerprint)",
-        ],
-        "indices": [
-            ["host"], ["fingerprint"], ["timestamp"], ["sni"],
-        ],
-    }
-    CERT_INFO = {
-        "schema": {
-            "fingerprint": str,
-            "raw_cert": bytes,
-            "version": int,
-            "subject": str,
-            "issuer": str,
-            "serial_number": str,
-            "not_valid_before": float,
-            "not_valid_after": float,
-            "signature_algorithm": str,
-            "hash_algorithm": str,
-        },
-        "constraints": [
-            "PRIMARY KEY (fingerprint)",
-        ],
-        "indices": [
-            ["subject"], ["issuer"], ["not_valid_after"],
-        ],
-    }
-    DNS_OBSERVATION = {
-        "schema": {
-            "timestamp": float,
-            "host": str,
-            "A_semhash": str, "A_expiry": float,
-            "AAAA_semhash": str, "AAAA_expiry": float,
-            "CNAME_semhash": str, "CNAME_expiry": float,
-            "CAA_semhash": str, "CAA_expiry": float,
-            "DMARC_semhash": str, "DMARC_expiry": float,
-            "DNSKEY_semhash": str, "DNSKEY_expiry": float,
-            "DS_semhash": str, "DS_expiry": float,
-            "MX_semhash": str, "MX_expiry": float,
-            "NS_semhash": str, "NS_expiry": float,
-            "SOA_semhash": str, "SOA_expiry": float,
-            "SPF_semhash": str, "SPF_expiry": float,
-            "TXT_semhash": str, "TXT_expiry": float,
-        },
-        "constraints": [
-            "PRIMARY KEY (timestamp, host)",
-            "FOREIGN KEY (A_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (AAAA_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (CNAME_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (CAA_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (DMARC_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (DNSKEY_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (DS_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (MX_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (NS_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (SOA_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (SPF_semhash) REFERENCES dns_info(hash)",
-            "FOREIGN KEY (TXT_semhash) REFERENCES dns_info(hash)",
-        ],
-        "indices": [
-            ["host"], ["timestamp"],
-        ],
-    }
-    DNS_INFO = {
-        "schema": {
-            "hash": str,
-            "wire_bytes": bytes,
-        },
-        "constraints": [
-            "PRIMARY KEY (hash)",
-        ],
-        "indices": [
-            ["hash"],
-        ],
-    }
-    DNS_RECORD_TYPES = [
-        t[:-8] for t in DNS_OBSERVATION["schema"].keys() if t.endswith("_semhash")
-    ]
     GET_TIMEOUT = 0.5
     ALL_STOPPED_TIMEOUT = 10.0
     JOIN_TIMEOUT = 3.0
+
+    # Default batching thresholds
+    DEFAULT_ROW_THRESH = 10000
+    DEFAULT_TIME_THRESH_SEC = 300.0  # 5 minutes
 
     def __init__(
         self,
@@ -442,6 +477,9 @@ class DomainProfileUtil:
         data_dir: Path | None = None,
         num_workers: int = 1,
         dns_util_kwargs: dict | None = None,
+        *,
+        row_thresh: Optional[int] = None,
+        time_thresh_sec: Optional[float] = None,
         **kwargs
     ):
         # Initialize IoHelper
@@ -453,38 +491,61 @@ class DomainProfileUtil:
             working_root=working_root,
             **kwargs,
         )
-        self.db_path = self.io_helper.raw / "domain.sqlite"
 
-        self.db = SqliteDatabase(
-            self.db_path,
-            log_helper=self.io_helper.log_helper,
-            offload_to_worker=True,
-            write_buffering=True,
+        # DuckLake paths + schema
+        catalog_path = (self.io_helper.raw / "catalog.sqlite").resolve()
+        data_path = (self.io_helper.raw / "data").resolve()
+        data_path.mkdir(parents=True, exist_ok=True)
+        schema_sql_path = Path(__file__).with_name("domain_profile.sql")
+        schema_sql = Path(schema_sql_path).read_text(encoding="utf-8")
+
+        # DuckLake connection
+        self.lake = DuckLakeStore(log_helper=self.io_helper.log_helper)
+        self.lake.attach_lake(
+            alias="lake",
+            catalog_path=f"sqlite:{catalog_path}",
+            data_path=str(data_path),
+            options=["META_JOURNAL_MODE 'WAL'", "META_BUSY_TIMEOUT 500"],
+            extensions=("sqlite",),
+            schema_sql=schema_sql,
         )
-        self.cert_info_table = self.db.register_table(
-            "cert_info",
-            schema=self.CERT_INFO["schema"],
-            table_constraints=self.CERT_INFO["constraints"],
-            indices=self.CERT_INFO["indices"],
+
+        # Tables etc.
+        self._tables_to_models: dict[str, type[BaseModel]] = {
+            "cert_info": CertInfoModel,
+            "cert_observation": CertObservationModel,
+            "dns_info": DnsInfoModel,
+            "dns_observation": DnsObservationModel,
+        }
+        self._dns_record_types = [
+            "A", "AAAA", "CAA", "CNAME", "DMARC", "DNSKEY",
+            "DS", "MX", "NS", "SOA", "SPF", "TXT",
+        ]
+
+        # Write-buffering
+        import random
+        if row_thresh is None:
+            row_thresh = int(
+                self.DEFAULT_ROW_THRESH * random.uniform(0.75, 1.25)
+            )
+        self._row_thresh = row_thresh
+        if time_thresh_sec is None:
+            time_thresh_sec = (
+                self.DEFAULT_TIME_THRESH_SEC * random.uniform(0.75, 1.25)
+            )
+        self._time_thresh_sec = time_thresh_sec
+        self._last_flush_ts = {
+            table: time.monotonic() for table in self._tables_to_models
+        }
+        self._write_buffer: dict[str, list[dict]] = {
+            table: [] for table in self._tables_to_models
+        }
+        self._buffer_lock = threading.Lock()
+        self._flush_exec: ThreadPoolExecutor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"{self.__class__.__name__}-flush"
         )
-        self.cert_obs_table = self.db.register_table(
-            "cert_observation",
-            schema=self.CERT_OBSERVATION["schema"],
-            table_constraints=self.CERT_OBSERVATION["constraints"],
-            indices=self.CERT_OBSERVATION["indices"],
-        )
-        self.dns_info_table = self.db.register_table(
-            "dns_info",
-            schema=self.DNS_INFO["schema"],
-            table_constraints=self.DNS_INFO["constraints"],
-            indices=self.DNS_INFO["indices"],
-        )
-        self.dns_obs_table = self.db.register_table(
-            "dns_observation",
-            schema=self.DNS_OBSERVATION["schema"],
-            table_constraints=self.DNS_OBSERVATION["constraints"],
-            indices=self.DNS_OBSERVATION["indices"],
-        )
+        self._flush_future: Optional[Future] = None
+        self._flush_lock = threading.Lock()
 
         # Worker processes
         self._ctx = mp.get_context("spawn")
@@ -536,8 +597,10 @@ class DomainProfileUtil:
         self._resp_reader_thread.start()
 
         self.io_helper.logger.info(
-            f"{self.__class__.__name__} initialized with DB at {self.db_path} "
-            f"and {num_workers} worker(s)."
+            f"{self.__class__.__name__} initialized "
+            f"(DuckLake at {catalog_path}, data {data_path}) "
+            f"with {num_workers} worker(s), "
+            f"buffer thresholds rows={self._row_thresh}, time={self._time_thresh_sec}s."
         )
 
     @staticmethod
@@ -564,6 +627,61 @@ class DomainProfileUtil:
             rid = self._req_id
             self._req_id += 1
             return rid
+
+    def _schedule_flush(self, force: bool = False):
+        with self._flush_lock:
+            if self._flush_future and not self._flush_future.done():
+                # Flush already in progress
+                return
+
+            now = time.monotonic()
+            should_flush = force
+            if not should_flush:
+                for table in self._tables_to_models.keys():
+                    if (now - self._last_flush_ts[table]) >= self._time_thresh_sec:
+                        should_flush = True
+                        break
+                    if len(self._write_buffer[table]) >= self._row_thresh:
+                        should_flush = True
+                        break
+            if not should_flush:
+                return
+
+            with self._buffer_lock:
+                snapshot: dict[str, list[dict]] = {
+                    t: self._write_buffer[t] for t in self._tables_to_models
+                }
+                for t in self._tables_to_models:
+                    self._write_buffer[t] = []
+
+            # Submit background flush job
+            self._flush_future = self._flush_exec.submit(
+                self._flush_worker, snapshot, now
+            )
+
+    def _flush_worker(self, snapshot: dict[str, list[dict]], ts_now: float):
+        insert_modes = {
+            "cert_info": ("insert_ignore", ["fingerprint"]),
+            "cert_observation": ("append", None),
+            "dns_info": ("insert_ignore", ["hash"]),
+            "dns_observation": ("append", None),
+        }
+
+        for table, rows in snapshot.items():
+            if not rows:
+                continue
+            try:
+                model = self._tables_to_models[table]
+                mode, key_cols = insert_modes[table]
+                self.lake.insert_records(
+                    table, rows, model,
+                    mode=mode, key_cols=key_cols, retry_on_lock=True,
+                )
+                self._last_flush_ts[table] = ts_now
+            except Exception as e:
+                self.io_helper.logger.error(
+                    f"Flush for table '{table}' failed: {e}"
+                )
 
     def _resp_read_loop(self):
         while not self._closed:
@@ -640,105 +758,121 @@ class DomainProfileUtil:
 
         return await fut
 
-    def _handle_cert_result(self, result: dict):
+    def _cert_join_df(self, obs_df: pd.DataFrame, info_df: pd.DataFrame):
+        return obs_df.merge(info_df, on="fingerprint", how="left")
+
+    def _dns_join_df(self, obs_df: pd.DataFrame, info_df: pd.DataFrame):
+        for col in self._dns_record_types:
+            if col not in obs_df.columns:
+                obs_df[col] = None
+        if info_df.empty:
+            return obs_df
+        wire_bytes_map = info_df.set_index("hash")["wire_bytes"]
+        for col in [c for c in obs_df.columns if c.endswith("_semhash")]:
+            obs_df[col.replace("_semhash", "")] = obs_df[col].map(
+                wire_bytes_map
+            )
+        return obs_df.drop(
+            columns=[c for c in obs_df.columns if c.endswith("_semhash")],
+            errors="ignore"
+        )
+
+    def _handle_cert_result(self, result: dict, *, return_result: bool):
         cert_info = result.get("cert_info") or {}
         fingerprint = cert_info.get("fingerprint")
         if fingerprint:
-            cert_info_df = pd.DataFrame.from_records(
-                [cert_info],
-                columns=self.CERT_INFO["schema"].keys(),
-            )
-            self.cert_info_table.insert_df(cert_info_df, if_exists="ignore")
-        else:
-            cert_info_df = pd.DataFrame(
-                columns=self.CERT_INFO["schema"].keys()
-            )
+            with self._buffer_lock:
+                self._write_buffer["cert_info"].append(cert_info)
 
         cert_obs = {
             "timestamp": float(result.get("timestamp", time.time())),
             "host": result.get("host"),
             "port": int(result.get("port", 443)),
             "sni": result.get("sni"),
+            "effective_host": result.get("effective_host"),
             "fingerprint": fingerprint,
             "valid": bool((result.get("cert_obs") or {}).get("valid", False)),
             "error": (result.get("cert_obs") or {}).get("error"),
         }
-        cert_obs_df = pd.DataFrame.from_records(
-            [cert_obs],
-            columns=self.CERT_OBSERVATION["schema"].keys(),
+        with self._buffer_lock:
+            self._write_buffer["cert_observation"].append(cert_obs)
+
+        # Flush if needed (in the background)
+        self._schedule_flush()
+
+        if not return_result:
+            return None
+
+        info_df = (
+            pd.DataFrame.from_records(
+                [cert_info], columns=list(CertInfoModel.model_fields.keys())
+            ) if fingerprint else
+            pd.DataFrame(columns=list(CertInfoModel.model_fields.keys()))
         )
-        self.cert_obs_table.insert_df(cert_obs_df)
-
-        return self._cert_join(cert_obs_df, cert_info_df)
-
-    def _cert_join(self, obs_df: pd.DataFrame, info_df: pd.DataFrame):
-        return obs_df.merge(
-            info_df,
-            on="fingerprint",
-            how="left",
+        obs_df = pd.DataFrame.from_records(
+            [cert_obs], columns=list(CertObservationModel.model_fields.keys())
         )
+        return self._cert_join_df(obs_df, info_df)
 
-    def _handle_dns_result(self, result: dict):
+    def _handle_dns_result(self, result: dict, *, return_result: bool):
         dns_info = result.get("dns_info") or {}
         if dns_info:
-            dns_info_df = pd.DataFrame.from_records(
-                [{"hash": h, "wire_bytes": b} for h, b in dns_info.items()],
-                columns=self.DNS_INFO["schema"].keys(),
-            )
-            self.dns_info_table.insert_df(dns_info_df, if_exists="ignore")
-        else:
-            dns_info_df = pd.DataFrame(columns=self.DNS_INFO["schema"].keys())
+            with self._buffer_lock:
+                self._write_buffer["dns_info"].extend(
+                    {"hash": h, "wire_bytes": b} for h, b in dns_info.items()
+                )
 
         dns_obs = result.get("dns_obs") or {}
         obs_row = {
             "timestamp": float(result.get("timestamp", time.time())),
             "host": result.get("host"),
         }
-        for t in self.DNS_RECORD_TYPES:
+        for t in self._dns_record_types:
             obs_row[f"{t}_semhash"] = dns_obs.get(f"{t}_semhash")
             obs_row[f"{t}_expiry"] = dns_obs.get(f"{t}_expiry")
+        with self._buffer_lock:
+            self._write_buffer["dns_observation"].append(obs_row)
 
-        dns_obs_df = pd.DataFrame.from_records(
-            [obs_row],
-            columns=self.DNS_OBSERVATION["schema"].keys()
+        # Flush if needed (in the background)
+        self._schedule_flush()
+
+        if not return_result:
+            return None
+
+        info_df = (
+            pd.DataFrame.from_records(
+                [{"hash": h, "wire_bytes": b} for h, b in dns_info.items()],
+                columns=list(DnsInfoModel.model_fields.keys())
+            ) if dns_info else
+            pd.DataFrame(columns=list(DnsInfoModel.model_fields.keys()))
         )
-        self.dns_obs_table.insert_df(dns_obs_df)
+        obs_df = pd.DataFrame.from_records(
+            [obs_row], columns=list(DnsObservationModel.model_fields.keys())
+        )
+        return self._dns_join_df(obs_df, info_df)
 
-        return self._dns_join(dns_obs_df, dns_info_df)
-
-    def _dns_join(self, obs_df: pd.DataFrame, info_df: pd.DataFrame):
-        for col in self.DNS_RECORD_TYPES:
-            obs_df[col] = pd.Series([None] * len(obs_df), dtype="object")
-
-        if info_df.empty:
-            return obs_df
-
-        wire_bytes_map = info_df.set_index("hash")["wire_bytes"]
-
-        # Map all _semhash columns to wire_bytes
-        for col in [c for c in obs_df.columns if c.endswith("_semhash")]:
-            obs_df[col.replace("_semhash", "")] = obs_df[col].map(
-                wire_bytes_map
-            )
-
-        # Drop all _semhash columns
-        obs_df = obs_df.drop(
-            columns=[c for c in obs_df.columns if c.endswith("_semhash")])
-
-        return obs_df
-
-    def _handle_cert_dns_result(self, result: tuple[dict, dict]):
+    def _handle_cert_dns_result(
+        self, result: tuple[dict, dict], *, return_result: bool
+    ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
         cert_result, dns_result = result
-        return self._handle_cert_result(cert_result), self._handle_dns_result(dns_result)
+        maybe_cert_df = self._handle_cert_result(
+            cert_result, return_result=return_result
+        )
+        maybe_dns_df = self._handle_dns_result(
+            dns_result, return_result=return_result
+        )
+        return maybe_cert_df, maybe_dns_df
 
     async def grab_cert_async(
         self,
         host: str,
         port: int = 443,
         sni: Optional[str] = None,
-    ) -> pd.DataFrame:
+        *,
+        return_result: bool = True,
+    ) -> pd.DataFrame | None:
         """
-        Grab the TLS certificate from a host:port, store it in the database, and return the stored row.
+        Grab the TLS certificate from a host:port, store it in the database, and return the stored row if requested.
         For a sync version, use `grab_cert()`.
 
         Args:
@@ -755,8 +889,15 @@ class DomainProfileUtil:
                 If None, the `host` value will be used.
                 Default is None.
 
+            return_result (bool):
+                If True, return a single-row DataFrame with the obtained certificate information.
+                If False, return None.
+                Default is True.
+
         Returns:
-            A single-row DataFrame with the obtained certificate information.
+            If `return_result` is True, a single-row DataFrame containing the joined
+            certificate observation and info.
+            If `return_result` is False, None.
         """
         result = await self._rpc(
             DomainProfileMethod.GET_CERT,
@@ -764,105 +905,101 @@ class DomainProfileUtil:
             port=port,
             sni=sni,
         )
-        return await asyncio.to_thread(self._handle_cert_result, result)
+        return await asyncio.to_thread(
+            self._handle_cert_result, result, return_result=return_result
+        )
 
     def grab_cert(
         self,
         host: str,
         port: int = 443,
         sni: Optional[str] = None,
+        *,
+        return_result: bool = True,
     ):
-        """
-        Synchronous wrapper for `grab_cert_async()`.
-        """
-
         return run_coro_sync(
-            self.grab_cert_async(host, port, sni=sni)
+            self.grab_cert_async(
+                host, port, sni=sni,
+                return_result=return_result
+            )
         )
 
-    async def grab_dns_async(self, host: str) -> pd.DataFrame:
+    async def grab_dns_async(
+        self,
+        host: str,
+        *,
+        return_result: bool = True
+    ) -> pd.DataFrame | None:
         """
-        Grab DNS records for a host, store them in the database, and return the stored row.
-        This is an async function. For a sync version, use `grab_dns()`.
-
-        Args:
-            host (str):
-                The hostname to resolve.
-
-        Returns:
-            A single-row DataFrame with the stored DNS information.
+        Grab DNS records for a host, buffer them for bulk write,
+        and optionally return a single-row DataFrame of the observation joined with info.
         """
-
-        result = await self._rpc(
-            DomainProfileMethod.GET_DNS,
-            host=host,
+        result = await self._rpc(DomainProfileMethod.GET_DNS, host=host)
+        return await asyncio.to_thread(
+            self._handle_dns_result, result, return_result=return_result
         )
-        return await asyncio.to_thread(self._handle_dns_result, result)
 
-    def grab_dns(self, host: str):
-        """
-        Synchronous wrapper for `grab_dns_async()`.
-        """
-
-        return run_coro_sync(self.grab_dns_async(host))
+    def grab_dns(self, host: str, *, return_result: bool = True):
+        return run_coro_sync(self.grab_dns_async(host, return_result=return_result))
 
     async def grab_cert_dns_async(
         self,
         host: str,
         port: int = 443,
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        *,
+        return_result: bool = True,
+    ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
         """
-        Grab both the TLS certificate and DNS records for a host, store them in the database,
-        and return them.
-        This is an async function. For a sync version, use `grab_cert_dns()`.
-
-        Args:
-            host (str):
-                The hostname to connect to and resolve.
-
-            port (int):
-                The TCP port to connect to for the TLS certificate.
-                Default is 443.
-
-        Returns:
-            A tuple of two elements.
-            The first element is either a single-row DataFrame with the stored certificate information.
-            The second element is a single-row DataFrame with the stored DNS information.
+        Grab both the TLS certificate and DNS records for a host, buffer them for bulk write,
+        and optionally return the shaped DataFrames.
         """
-
         result = await self._rpc(
             DomainProfileMethod.GET_CERT_DNS,
             host=host,
             port=port,
         )
-        return await asyncio.to_thread(self._handle_cert_dns_result, result)
+        return await asyncio.to_thread(
+            self._handle_cert_dns_result, result, return_result=return_result
+        )
 
     def grab_cert_dns(
         self,
         host: str,
         port: int = 443,
+        *,
+        return_result: bool = True,
     ):
-        """
-        Synchronous wrapper for `grab_cert_dns_async()`.
-        """
-
-        return run_coro_sync(
-            self.grab_cert_dns_async(host, port)
-        )
+        return run_coro_sync(self.grab_cert_dns_async(host, port, return_result=return_result))
 
     def get_all_certs(self):
-        obs_df = self.cert_obs_table.query_all()
-        info_df = self.cert_info_table.query_all()
-        return self._cert_join(obs_df, info_df)
+        return self.lake.query_df("SELECT * FROM lake.cert_join_view;")
 
     def get_all_dns(self):
-        obs_df = self.dns_obs_table.query_all()
-        info_df = self.dns_info_table.query_all()
-        return self._dns_join(obs_df, info_df)
+        return self.lake.query_df("SELECT * FROM lake.dns_join_view;")
 
     async def aclose(self):
         if self._closed:
             return
+
+        # Flush buffered rows before shutdown
+        with contextlib.suppress(Exception):
+            self._schedule_flush(force=True)
+            with self._flush_lock:
+                fut = self._flush_future
+            if fut is not None:
+                try:
+                    fut.result(timeout=15.0)
+                    self.io_helper.logger.info(
+                        "Flushed buffered rows before shutdown."
+                    )
+                except Exception:
+                    self.io_helper.logger.error(
+                        "Final flush before shutdown failed."
+                    )
+            else:
+                self.io_helper.logger.info(
+                    "No buffered rows to flush before shutdown."
+                )
 
         # Signal shutdown to workers
         self.io_helper.logger.info("Shutting down workers...")
@@ -914,9 +1051,14 @@ class DomainProfileUtil:
         if self._resp_reader_thread and self._resp_reader_thread.is_alive():
             self._resp_reader_thread.join(timeout=self.JOIN_TIMEOUT)
 
-        # Close DB
+        # Stop flush executor
         with contextlib.suppress(Exception):
-            self.db.close()
+            self._flush_exec.shutdown(wait=True, cancel_futures=False)
+        self.io_helper.logger.info("Closed DuckLake and flush executor.")
+
+        # Close DuckLake
+        with contextlib.suppress(Exception):
+            self.lake.close()
 
     def close(self):
         return run_coro_sync(self.aclose())
