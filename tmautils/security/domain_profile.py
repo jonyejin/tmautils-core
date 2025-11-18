@@ -12,14 +12,11 @@ import contextlib
 import time
 import pyarrow as pa
 from pydantic import BaseModel
-from concurrent.futures import ThreadPoolExecutor, Future
 
 from tmautils.common import *
 from tmautils.dns import AsyncDnsPythonUtil, dns_msg_semantic_hash
 
 from .cert import get_cert_async
-
-_T = TypeVar("_T")
 
 
 class DomainProfileMethod(IpcMethodBase, StrEnum):
@@ -60,10 +57,8 @@ class DomainProfileWorker:
             **dns_kwargs,
         )
 
-        self._log_helper = (
-            LogHelper(logging_config) if logging_config else None
-        )
-        self.logger = get_logger_from_helper(self._log_helper)
+        log_helper = LogHelper(logging_config) if logging_config else None
+        self.logger = get_logger_from_helper(log_helper)
 
     def run(self):
         self._loop = asyncio.new_event_loop()
@@ -458,6 +453,18 @@ class DomainProfileUtil:
             there is no need to pass it here (it will be set to the same value as the
             `working_root` parameter of this class).
 
+        row_thresh (int):
+            Row threshold for DuckLakeBufferedWriter batching.
+            Default is 10,000.
+
+        time_thresh_sec (float):
+            Time threshold (in seconds) for DuckLakeBufferedWriter batching.
+            Default is 240.0 seconds.
+
+        jitter (float):
+            Jitter factor for DuckLakeBufferedWriter batching.
+            Default is 0.2.
+
         **kwargs:
             Additional keyword arguments for IOHelper and AsyncDnsPythonUtil.
             See their documentation for more details.
@@ -469,7 +476,13 @@ class DomainProfileUtil:
 
     # Default batching thresholds
     DEFAULT_ROW_THRESH = 10000
-    DEFAULT_TIME_THRESH_SEC = 300.0  # 5 minutes
+    DEFAULT_TIME_THRESH_SEC = 240.0
+    DEFAULT_JITTER = 0.2
+
+    DNS_RECORD_TYPES = [
+        "A", "AAAA", "CAA", "CNAME", "DMARC", "DNSKEY",
+        "DS", "MX", "NS", "SOA", "SPF", "TXT",
+    ]
 
     def __init__(
         self,
@@ -478,8 +491,9 @@ class DomainProfileUtil:
         num_workers: int = 1,
         dns_util_kwargs: dict | None = None,
         *,
-        row_thresh: Optional[int] = None,
-        time_thresh_sec: Optional[float] = None,
+        row_thresh: int = DEFAULT_ROW_THRESH,
+        time_thresh_sec: float = DEFAULT_TIME_THRESH_SEC,
+        jitter: float = DEFAULT_JITTER,
         **kwargs
     ):
         # Initialize IoHelper
@@ -500,8 +514,8 @@ class DomainProfileUtil:
         schema_sql = Path(schema_sql_path).read_text(encoding="utf-8")
 
         # DuckLake connection
-        self.lake = DuckLakeStore(log_helper=self.io_helper.log_helper)
-        self.lake.attach_lake(
+        self._lake = DuckLakeStore(log_helper=self.io_helper.log_helper)
+        self._lake.attach_lake(
             alias="lake",
             catalog_path=f"sqlite:{catalog_path}",
             data_path=str(data_path),
@@ -510,42 +524,35 @@ class DomainProfileUtil:
             schema_sql=schema_sql,
         )
 
-        # Tables etc.
-        self._tables_to_models: dict[str, type[BaseModel]] = {
-            "cert_info": CertInfoModel,
-            "cert_observation": CertObservationModel,
-            "dns_info": DnsInfoModel,
-            "dns_observation": DnsObservationModel,
+        # Buffered writer for DuckLake
+        table_configs: dict[str, DuckTableConfig] = {
+            "cert_info": DuckTableConfig(
+                model=CertInfoModel,
+                mode=DuckWriteMode.INSERT_IGNORE,
+                key_cols=["fingerprint"],
+            ),
+            "cert_observation": DuckTableConfig(
+                model=CertObservationModel,
+                mode=DuckWriteMode.APPEND,
+            ),
+            "dns_info": DuckTableConfig(
+                model=DnsInfoModel,
+                mode=DuckWriteMode.INSERT_IGNORE,
+                key_cols=["hash"],
+            ),
+            "dns_observation": DuckTableConfig(
+                model=DnsObservationModel,
+                mode=DuckWriteMode.APPEND,
+            ),
         }
-        self._dns_record_types = [
-            "A", "AAAA", "CAA", "CNAME", "DMARC", "DNSKEY",
-            "DS", "MX", "NS", "SOA", "SPF", "TXT",
-        ]
-
-        # Write-buffering
-        import random
-        if row_thresh is None:
-            row_thresh = int(
-                self.DEFAULT_ROW_THRESH * random.uniform(0.75, 1.25)
-            )
-        self._row_thresh = row_thresh
-        if time_thresh_sec is None:
-            time_thresh_sec = (
-                self.DEFAULT_TIME_THRESH_SEC * random.uniform(0.75, 1.25)
-            )
-        self._time_thresh_sec = time_thresh_sec
-        self._last_flush_ts = {
-            table: time.monotonic() for table in self._tables_to_models
-        }
-        self._write_buffer: dict[str, list[dict]] = {
-            table: [] for table in self._tables_to_models
-        }
-        self._buffer_lock = threading.Lock()
-        self._flush_exec: ThreadPoolExecutor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix=f"{self.__class__.__name__}-flush"
+        self._writer = DuckLakeBufferedWriter(
+            lake=self._lake,
+            table_configs=table_configs,
+            row_thresh=row_thresh,
+            time_thresh_sec=time_thresh_sec,
+            jitter=jitter,
+            log_helper=self.io_helper.log_helper,
         )
-        self._flush_future: Optional[Future] = None
-        self._flush_lock = threading.Lock()
 
         # Worker processes
         self._ctx = mp.get_context("spawn")
@@ -599,8 +606,7 @@ class DomainProfileUtil:
         self.io_helper.logger.info(
             f"{self.__class__.__name__} initialized "
             f"(DuckLake at {catalog_path}, data {data_path}) "
-            f"with {num_workers} worker(s), "
-            f"buffer thresholds rows={self._row_thresh}, time={self._time_thresh_sec}s."
+            f"with {num_workers} worker(s)."
         )
 
     @staticmethod
@@ -627,61 +633,6 @@ class DomainProfileUtil:
             rid = self._req_id
             self._req_id += 1
             return rid
-
-    def _schedule_flush(self, force: bool = False):
-        with self._flush_lock:
-            if self._flush_future and not self._flush_future.done():
-                # Flush already in progress
-                return
-
-            now = time.monotonic()
-            should_flush = force
-            if not should_flush:
-                for table in self._tables_to_models.keys():
-                    if (now - self._last_flush_ts[table]) >= self._time_thresh_sec:
-                        should_flush = True
-                        break
-                    if len(self._write_buffer[table]) >= self._row_thresh:
-                        should_flush = True
-                        break
-            if not should_flush:
-                return
-
-            with self._buffer_lock:
-                snapshot: dict[str, list[dict]] = {
-                    t: self._write_buffer[t] for t in self._tables_to_models
-                }
-                for t in self._tables_to_models:
-                    self._write_buffer[t] = []
-
-            # Submit background flush job
-            self._flush_future = self._flush_exec.submit(
-                self._flush_worker, snapshot, now
-            )
-
-    def _flush_worker(self, snapshot: dict[str, list[dict]], ts_now: float):
-        insert_modes = {
-            "cert_info": ("insert_ignore", ["fingerprint"]),
-            "cert_observation": ("append", None),
-            "dns_info": ("insert_ignore", ["hash"]),
-            "dns_observation": ("append", None),
-        }
-
-        for table, rows in snapshot.items():
-            if not rows:
-                continue
-            try:
-                model = self._tables_to_models[table]
-                mode, key_cols = insert_modes[table]
-                self.lake.insert_records(
-                    table, rows, model,
-                    mode=mode, key_cols=key_cols, retry_on_lock=True,
-                )
-                self._last_flush_ts[table] = ts_now
-            except Exception as e:
-                self.io_helper.logger.error(
-                    f"Flush for table '{table}' failed: {e}"
-                )
 
     def _resp_read_loop(self):
         while not self._closed:
@@ -762,7 +713,7 @@ class DomainProfileUtil:
         return obs_df.merge(info_df, on="fingerprint", how="left")
 
     def _dns_join_df(self, obs_df: pd.DataFrame, info_df: pd.DataFrame):
-        for col in self._dns_record_types:
+        for col in self.DNS_RECORD_TYPES:
             if col not in obs_df.columns:
                 obs_df[col] = None
         if info_df.empty:
@@ -781,8 +732,7 @@ class DomainProfileUtil:
         cert_info = result.get("cert_info") or {}
         fingerprint = cert_info.get("fingerprint")
         if fingerprint:
-            with self._buffer_lock:
-                self._write_buffer["cert_info"].append(cert_info)
+            self._writer.add_row("cert_info", cert_info)
 
         cert_obs = {
             "timestamp": float(result.get("timestamp", time.time())),
@@ -794,11 +744,7 @@ class DomainProfileUtil:
             "valid": bool((result.get("cert_obs") or {}).get("valid", False)),
             "error": (result.get("cert_obs") or {}).get("error"),
         }
-        with self._buffer_lock:
-            self._write_buffer["cert_observation"].append(cert_obs)
-
-        # Flush if needed (in the background)
-        self._schedule_flush()
+        self._writer.add_row("cert_observation", cert_obs)
 
         if not return_result:
             return None
@@ -817,24 +763,20 @@ class DomainProfileUtil:
     def _handle_dns_result(self, result: dict, *, return_result: bool):
         dns_info = result.get("dns_info") or {}
         if dns_info:
-            with self._buffer_lock:
-                self._write_buffer["dns_info"].extend(
-                    {"hash": h, "wire_bytes": b} for h, b in dns_info.items()
-                )
+            self._writer.add_rows(
+                "dns_info",
+                [{"hash": h, "wire_bytes": b} for h, b in dns_info.items()],
+            )
 
         dns_obs = result.get("dns_obs") or {}
         obs_row = {
             "timestamp": float(result.get("timestamp", time.time())),
             "host": result.get("host"),
         }
-        for t in self._dns_record_types:
+        for t in self.DNS_RECORD_TYPES:
             obs_row[f"{t}_semhash"] = dns_obs.get(f"{t}_semhash")
             obs_row[f"{t}_expiry"] = dns_obs.get(f"{t}_expiry")
-        with self._buffer_lock:
-            self._write_buffer["dns_observation"].append(obs_row)
-
-        # Flush if needed (in the background)
-        self._schedule_flush()
+        self._writer.add_row("dns_observation", obs_row)
 
         if not return_result:
             return None
@@ -917,6 +859,9 @@ class DomainProfileUtil:
         *,
         return_result: bool = True,
     ):
+        """
+        Synchronous version of `grab_cert_async()`.
+        """
         return run_coro_sync(
             self.grab_cert_async(
                 host, port, sni=sni,
@@ -931,8 +876,22 @@ class DomainProfileUtil:
         return_result: bool = True
     ) -> pd.DataFrame | None:
         """
-        Grab DNS records for a host, buffer them for bulk write,
-        and optionally return a single-row DataFrame of the observation joined with info.
+        Grab DNS records for a host and optionally return
+        a single-row DataFrame of the observation joined with info.
+
+        Args:
+            host (str):
+                The hostname to resolve.
+
+            return_result (bool):
+                If True, return a single-row DataFrame with the obtained DNS information.
+                If False, return None.
+                Default is True.
+
+        Returns:
+            If `return_result` is True, a single-row DataFrame containing the joined
+            DNS observation and info.
+            If `return_result` is False, None.
         """
         result = await self._rpc(DomainProfileMethod.GET_DNS, host=host)
         return await asyncio.to_thread(
@@ -940,6 +899,9 @@ class DomainProfileUtil:
         )
 
     def grab_dns(self, host: str, *, return_result: bool = True):
+        """
+        Synchronous version of `grab_dns_async()`.
+        """
         return run_coro_sync(self.grab_dns_async(host, return_result=return_result))
 
     async def grab_cert_dns_async(
@@ -950,8 +912,27 @@ class DomainProfileUtil:
         return_result: bool = True,
     ) -> tuple[pd.DataFrame | None, pd.DataFrame | None]:
         """
-        Grab both the TLS certificate and DNS records for a host, buffer them for bulk write,
-        and optionally return the shaped DataFrames.
+        Grab both the TLS certificate and DNS records for a host
+        and optionally return the joined DataFrames.
+
+        Args:
+            host (str):
+                The hostname to connect to and resolve.
+
+            port (int):
+                The TCP port to connect to for the TLS certificate.
+                Default is 443.
+
+            return_result (bool):
+                If True, return a tuple of DataFrames:
+                (certificate observation + info, DNS observation + info).
+                If False, return (None, None).
+                Default is True.
+
+        Returns:
+            If `return_result` is True, a tuple of DataFrames containing the joined
+            certificate observation + info and DNS observation + info.
+            If `return_result` is False, (None, None).
         """
         result = await self._rpc(
             DomainProfileMethod.GET_CERT_DNS,
@@ -969,37 +950,26 @@ class DomainProfileUtil:
         *,
         return_result: bool = True,
     ):
+        """
+        Synchronous version of `grab_cert_dns_async()`.
+        """
         return run_coro_sync(self.grab_cert_dns_async(host, port, return_result=return_result))
 
     def get_all_certs(self):
-        return self.lake.query_df("SELECT * FROM lake.cert_join_view;")
+        """
+        Return a DataFrame of all stored certificate observations joined with info.
+        """
+        return self._lake.query_df("SELECT * FROM lake.cert_join_view;")
 
     def get_all_dns(self):
-        return self.lake.query_df("SELECT * FROM lake.dns_join_view;")
+        """
+        Return a DataFrame of all stored DNS observations joined with info.
+        """
+        return self._lake.query_df("SELECT * FROM lake.dns_join_view;")
 
     async def aclose(self):
         if self._closed:
             return
-
-        # Flush buffered rows before shutdown
-        with contextlib.suppress(Exception):
-            self._schedule_flush(force=True)
-            with self._flush_lock:
-                fut = self._flush_future
-            if fut is not None:
-                try:
-                    fut.result(timeout=15.0)
-                    self.io_helper.logger.info(
-                        "Flushed buffered rows before shutdown."
-                    )
-                except Exception:
-                    self.io_helper.logger.error(
-                        "Final flush before shutdown failed."
-                    )
-            else:
-                self.io_helper.logger.info(
-                    "No buffered rows to flush before shutdown."
-                )
 
         # Signal shutdown to workers
         self.io_helper.logger.info("Shutting down workers...")
@@ -1051,14 +1021,16 @@ class DomainProfileUtil:
         if self._resp_reader_thread and self._resp_reader_thread.is_alive():
             self._resp_reader_thread.join(timeout=self.JOIN_TIMEOUT)
 
-        # Stop flush executor
+        # Flush buffered rows before shutdown
         with contextlib.suppress(Exception):
-            self._flush_exec.shutdown(wait=True, cancel_futures=False)
-        self.io_helper.logger.info("Closed DuckLake and flush executor.")
+            self._writer.close()
+            self.io_helper.logger.info(
+                "Flushed buffered rows before shutdown."
+            )
 
         # Close DuckLake
         with contextlib.suppress(Exception):
-            self.lake.close()
+            self._lake.close()
 
     def close(self):
         return run_coro_sync(self.aclose())
