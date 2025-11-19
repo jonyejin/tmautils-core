@@ -26,6 +26,7 @@ from .db.ducklake import (
     DuckLakeStore, DuckWriteMode, DuckTableConfig, DuckLakeBufferedWriter,
     pydantic_to_arrow
 )
+from .db.duckdb_helpers import DuckDbInetLpmIndex
 from .ipc import (
     IpcMsgType, IpcStatusCode, IpcMethodBase, IpcMsg,
     except_to_payload, raise_from_payload,
