@@ -4,6 +4,10 @@ import duckdb
 import pyarrow as pa
 from pydantic import BaseModel
 import time
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait
+from uuid import uuid4
 
 from ..types import *
 from ..io import LogHelper, get_logger_from_helper
@@ -642,7 +646,6 @@ class DuckLakeStore:
                 Whether to retry on transient lock errors (default: True).
         """
         def _once():
-            from uuid import uuid4
             if data is None or data.num_rows == 0:
                 return
 
@@ -855,6 +858,17 @@ class DuckTableConfig:
         )
 
 
+class _TableBuffer:
+    def __init__(self, name: str, config: DuckTableConfig):
+        self.name = name
+        self.config = config
+        self.lock = threading.Lock()
+        # The following fields are protected by self.lock
+        self.buffer: List[dict] = []
+        self.last_flush_ts: float = time.monotonic()
+        self.is_flushing = False
+
+
 class DuckLakeBufferedWriter:
     """
     Buffered writer for DuckLake tables using DuckLakeStore.
@@ -903,34 +917,25 @@ class DuckLakeBufferedWriter:
         log_helper: Optional[LogHelper] = None,
     ):
         self._lake = lake
-        self._table_configs = table_configs
         self._logger = get_logger_from_helper(log_helper)
+        self._base_row_thresh = row_thresh
+        self._base_time_thresh = time_thresh_sec
+        self._jitter = jitter
 
-        import random
-        jitter_mult = random.uniform(1 - jitter, 1 + jitter)
-        self._row_thresh = int(row_thresh * jitter_mult)
-        self._time_thresh_sec = time_thresh_sec * jitter_mult
-
-        now = time.monotonic()
-        self._write_buffer: Dict[str, List[dict]] = {
-            t: [] for t in table_configs
-        }
-        self._last_flush_ts: Dict[str, float] = {
-            t: now for t in table_configs
+        # Initialize per-table buffers
+        self._tables: Dict[str, _TableBuffer] = {
+            name: _TableBuffer(name, cfg)
+            for name, cfg in table_configs.items()
         }
 
-        import threading
-        from concurrent.futures import ThreadPoolExecutor, Future
-        self._buffer_lock = threading.Lock()
-        self._flush_lock = threading.Lock()
-        self._flush_future: Optional[Future] = None
+        # Thread pool for flush tasks
         self._exec = ThreadPoolExecutor(
             max_workers=max_workers,
             thread_name_prefix=f"{self.__class__.__name__}-worker"
         )
         self._closed = False
 
-        # Background timer thread for time-based flushes
+        # Timer thread
         self._timer_thread = threading.Thread(
             target=self._timer_loop,
             name=f"{self.__class__.__name__}-timer",
@@ -941,89 +946,58 @@ class DuckLakeBufferedWriter:
         self._logger.info(
             "DuckLakeBufferedWriter initialized with row_thresh=%d, "
             "time_thresh_sec=%.2f, max_workers=%d.",
-            self._row_thresh, self._time_thresh_sec, max_workers
+            self._base_row_thresh, self._base_time_thresh, max_workers
         )
 
+    def _get_thresholds_dynamic(self):
+        if self._jitter <= 0:
+            return self._base_row_thresh, self._base_time_thresh
+
+        mult = random.uniform(1.0 - self._jitter, 1.0 + self._jitter)
+        return int(self._base_row_thresh * mult), self._base_time_thresh * mult
+
     def _timer_loop(self):
+        # Check more frequently than the threshold to catch timeouts accurately
         interval = max(
-            1.0,
-            min(self._time_thresh_sec / 2, self.FINAL_FLUSH_TIMEOUT_SEC / 2)
+            0.1,
+            min(self._base_time_thresh / 4, self.FINAL_FLUSH_TIMEOUT_SEC / 2)
         )
+
         while not self._closed:
             time.sleep(interval)
             if self._closed:
                 break
+
             try:
-                self._schedule_flush()
+                self._check_time_thresholds()
             except Exception:
                 self._logger.error(
                     "DuckLakeBufferedWriter timer-loop flush failed.",
                     exc_info=True,
                 )
 
-    def _schedule_flush(self, force: bool = False):
-        with self._flush_lock:
-            if self._flush_future and not self._flush_future.done():
-                # Already flushing
-                return
+    def _check_time_thresholds(self):
+        _, time_thresh = self._get_thresholds_dynamic()
 
-            now = time.monotonic()
-            tables_to_flush: List[str] = []
-            with self._buffer_lock:
-                for table, rows in self._write_buffer.items():
-                    if not rows:
-                        continue
-                    if force:
-                        tables_to_flush.append(table)
-                        continue
-                    if (now - self._last_flush_ts[table]) >= self._time_thresh_sec:
-                        tables_to_flush.append(table)
-                        continue
-                    if len(rows) >= self._row_thresh:
-                        tables_to_flush.append(table)
-
-                if not tables_to_flush:
-                    return
-
-                snapshot: Dict[str, List[dict]] = {
-                    t: self._write_buffer[t] for t in tables_to_flush
-                }
-                for t in tables_to_flush:
-                    self._write_buffer[t] = []
-
-            self._flush_future = self._exec.submit(
-                self._flush_worker, snapshot, now
-            )
-
-    def _flush_worker(self, snapshot: Dict[str, List[dict]], ts_now: float):
-        for table, rows in snapshot.items():
-            if not rows:
+        for tb in self._tables.values():
+            # Check without lock first.
+            # Dirty read is acceptable here because
+            # we either double-check inside the lock, or will try again later.
+            if tb.is_flushing or not tb.buffer:
                 continue
-            cfg = self._table_configs[table]
-            try:
-                self._lake.insert_records(
-                    table,
-                    rows,
-                    cfg.model,
-                    mode=cfg.mode,
-                    key_cols=cfg.key_cols,
-                    retry_on_lock=True,
-                )
-                with self._buffer_lock:
-                    self._last_flush_ts[table] = ts_now
-                self._logger.debug(
-                    "DuckLakeBufferedWriter: flushed %d rows to table '%s'.",
-                    len(rows), table
-                )
-            except Exception as e:
-                self._logger.error(
-                    "DuckLakeBufferedWriter: flush for table '%s' failed: %s. "
-                    "Re-buffering rows for retry.", table, e
-                )
-                # Put rows back at the front for order preservation
-                with self._buffer_lock:
-                    existing = self._write_buffer.get(table, [])
-                    self._write_buffer[table] = rows + existing
+
+            should_flush = False
+            now = time.monotonic()
+            with tb.lock:
+                if not tb.is_flushing and tb.buffer:
+                    if (now - tb.last_flush_ts) >= time_thresh:
+                        should_flush = True
+                        tb.is_flushing = True
+                        rows_to_flush = tb.buffer
+                        tb.buffer = []
+
+            if should_flush:
+                self._exec.submit(self._flush_task, tb, rows_to_flush, now)
 
     def add_row(self, table: str, row: dict):
         """
@@ -1038,59 +1012,124 @@ class DuckLakeBufferedWriter:
 
         if self._closed:
             raise RuntimeError(
-                "DuckLakeBufferedWriter is closed; cannot add rows.")
+                "DuckLakeBufferedWriter is closed; cannot add rows."
+            )
         if not rows:
             return
-        if table not in self._write_buffer:
+
+        tb = self._tables.get(table)
+        if not tb:
             raise KeyError(f"Unknown table '{table}'")
 
-        with self._buffer_lock:
-            self._write_buffer[table].extend(rows)
-        self._schedule_flush()
+        row_thresh, _ = self._get_thresholds_dynamic()
+        should_flush = False
+        rows_to_flush = None
+        with tb.lock:
+            tb.buffer.extend(rows)
 
-    def flush(self, force: bool = True, timeout: Optional[float] = None):
-        """
-        Flush buffered rows to DuckLake.
+            if not tb.is_flushing and len(tb.buffer) >= row_thresh:
+                should_flush = True
+                tb.is_flushing = True
+                rows_to_flush = tb.buffer
+                tb.buffer = []
 
-        If force=True, this will keep scheduling flushes until no buffered rows
-        remain (or no more flushes can be scheduled).
+        if should_flush:
+            self._exec.submit(
+                self._flush_task, tb, rows_to_flush, time.monotonic()
+            )
+
+    def _flush_task(self, tb: _TableBuffer, rows: List[dict], start_ts: float):
+        try:
+            self._lake.insert_records(
+                tb.name,
+                rows,
+                tb.config.model,
+                mode=tb.config.mode,
+                key_cols=tb.config.key_cols,
+                retry_on_lock=True,
+            )
+
+            with tb.lock:
+                tb.last_flush_ts = start_ts
+                tb.is_flushing = False
+
+            self._logger.debug(
+                "DuckLakeBufferedWriter: flushed %d rows to table '%s'.",
+                len(rows), tb.name
+            )
+
+        except Exception as e:
+            self._logger.error(
+                "DuckLakeBufferedWriter: flush for table '%s' failed: %s. "
+                "Re-buffering rows for retry.", tb.name, e
+            )
+
+            # Put rows back at the front for order preservation
+            with tb.lock:
+                tb.buffer = rows + tb.buffer
+                tb.is_flushing = False
+
+    def flush(self, timeout: Optional[float] = None):
         """
-        # We may need multiple iterations if there was an in-flight flush when
-        # this was called and additional rows were added afterwards.
+        Force flushes all tables and waits for completion.
+
+        Iterates until all buffers are empty and no flushes are in-flight.
+        """
+        start_time = time.monotonic()
+
         while True:
-            self._schedule_flush(force=force)
-            with self._flush_lock:
-                fut = self._flush_future
-            if fut is None:
-                # Nothing scheduled => either no buffered rows
-                # or we already flushed everything.
+            # Timeout check
+            if timeout is not None:
+                elapsed = time.monotonic() - start_time
+                if elapsed > timeout:
+                    self._logger.warning(
+                        "Flush timed out with data remaining."
+                    )
+                    break
+                remaining_time = timeout - elapsed
+            else:
+                remaining_time = None
+
+            pending_count = 0
+            futures = []
+            for tb in self._tables.values():
+                with tb.lock:
+                    # Buffer has data and not flushing => schedule flush
+                    if tb.buffer and not tb.is_flushing:
+                        tb.is_flushing = True
+                        data = tb.buffer
+                        tb.buffer = []
+
+                        f = self._exec.submit(
+                            self._flush_task, tb, data, time.monotonic()
+                        )
+                        futures.append(f)
+                        pending_count += 1
+
+                    # Currently flushing, regardless of buffer state => pending
+                    elif tb.is_flushing:
+                        pending_count += 1
+
+            if pending_count == 0:
                 break
 
-            # Wait for the current flush to complete.
-            fut.result(timeout=timeout)
-
-            # Check if any rows remain; if not, we are done.
-            with self._buffer_lock:
-                any_left = any(
-                    self._write_buffer[t] for t in self._write_buffer
-                )
-            if not any_left:
-                break
+            if futures:
+                # We scheduled some flushes; wait for them.
+                wait(futures, timeout=remaining_time)
+            else:
+                # Someone else is flushing; poll
+                time.sleep(0.1)
 
     def close(self):
-        """
-        Close the DuckLakeBufferedWriter, flushing any remaining buffered rows.
-        """
-
         if self._closed:
             return
-
         self._closed = True
+
         try:
-            self.flush(force=True, timeout=self.FINAL_FLUSH_TIMEOUT_SEC)
+            self.flush(timeout=self.FINAL_FLUSH_TIMEOUT_SEC)
         except Exception:
             self._logger.error(
                 "Final DuckLakeBufferedWriter flush failed.", exc_info=True
             )
 
-        self._exec.shutdown(wait=True, cancel_futures=False)
+        self._exec.shutdown(wait=True)
