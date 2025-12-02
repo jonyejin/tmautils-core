@@ -1,8 +1,11 @@
-from enum import StrEnum
+from typing import Optional
+from enum import Enum, StrEnum
+from ipaddress import IPv4Address, IPv6Address
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from tmautils.common import *
+from tmautils.common import FQDN, DomainAFSupport
+
 
 #######
 # Enums
@@ -106,7 +109,7 @@ class UsedDnsRecord:
     @property
     def used_aaaa(self):
         return self.used_address.version == 6
-    
+
     @property
     def af_support(self):
         if self.has_a and self.has_aaaa:

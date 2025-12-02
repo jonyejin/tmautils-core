@@ -1,8 +1,10 @@
+from typing import Any, Dict, Optional, Tuple
+from dataclasses import dataclass
 import duckdb
 from pytricia import PyTricia
+from ipaddress import ip_network
 
-from ..types import *
-
+from tmautils.common import IPAddress
 
 @dataclass
 class DuckDbInetLpmIndex:
@@ -47,7 +49,7 @@ class DuckDbInetLpmIndex:
         Before calling this, you must ensure that the relation contains
         the network column as `prefix/mask` strings
         (the `/mask` suffix can be omitted for `/32` IPv4 and `/128` IPv6 addresses).
-        Example correct strings: `127.0.0.1`, `192.168.1.0/24`, `2001:db8::/32`.
+        Example correct strings: `127.0.0.1`, `192.168.1.0/24`, `2001:db8::/32`, `::1`.
         One of the ways to do this is by casting a DuckDB INET column to VARCHAR.
 
         Args:

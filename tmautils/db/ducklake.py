@@ -1,148 +1,22 @@
-import math
+from typing import (
+    Any, Callable, Dict, List, Optional, TypeVar, Tuple,
+    Iterable, Type,
+)
 import contextlib
 import duckdb
 import pyarrow as pa
 from pydantic import BaseModel
-import time
-import random
-import threading
-from concurrent.futures import ThreadPoolExecutor, wait
 from uuid import uuid4
+from dataclasses import dataclass
 
-from ..types import *
-from ..io import LogHelper, get_logger_from_helper
+from tmautils.common import LogHelper, get_logger_from_helper
+from .base import (
+    pydantic_to_arrow, _quote_ident, _quote_literal,
+    _validate_write_mode,
+    ArrowBackend, WriteMode, TableConfig,
+)
 
 _T = TypeVar("_T")
-
-
-def _quote_ident(name: str):
-    if not isinstance(name, str):
-        raise TypeError("identifier must be a string")
-    return '"' + name.replace('"', '""') + '"'
-
-
-def _quote_literal(s: str) -> str:
-    if not isinstance(s, str):
-        raise TypeError("literal must be a string")
-    return "'" + s.replace("'", "''") + "'"
-
-
-def _to_arrow_array_ts(values, typ: pa.DataType) -> pa.Array:
-    unit = typ.unit  # e.g., 's', 'ms', 'us', 'ns'
-    scale = {
-        's': 1, 'ms': 1_000, 'us': 1_000_000, 'ns': 1_000_000_000
-    }[unit]
-    conv: List[Optional[int]] = []
-    for v in values:
-        if v is None:
-            conv.append(None)
-        elif isinstance(v, (int, float)):
-            if not math.isfinite(v):
-                conv.append(None)
-            else:
-                conv.append(int(round(float(v) * scale)))
-        else:
-            # Fix your data!
-            raise ValueError(
-                f"Cannot convert value '{v}' of type '{type(v)}' to timestamp: "
-                f"expected int/float epoch seconds or None."
-            )
-    return pa.array(conv, type=typ)
-
-
-def _to_arrow_array(values, typ: pa.DataType) -> pa.Array:
-    if pa.types.is_timestamp(typ):
-        return _to_arrow_array_ts(values, typ)
-    return pa.array(values, type=typ)
-
-
-def _verify_names_match(model_cls: Type[BaseModel], sch: pa.Schema):
-    model_fields = list(model_cls.model_fields.keys())
-    schema_fields = [f.name for f in sch]
-    if set(model_fields) != set(schema_fields):
-        raise ValueError(
-            "Pydantic model field names do not match ARROW_SCHEMA.\n"
-            f"Model fields: {sorted(model_fields)}\n"
-            f"Schema fields: {sorted(schema_fields)}"
-        )
-
-
-def pydantic_to_arrow(
-    items: List[BaseModel],
-    model_cls: Type[BaseModel]
-) -> Optional[pa.Table]:
-    """
-    Convert a list of Pydantic model instances to a PyArrow Table.
-
-    Args:
-        items (List[BaseModel]):
-            List of Pydantic model instances to convert.
-
-        model_cls (Type[BaseModel]):
-            The Pydantic model class corresponding to the instances.
-
-    Returns:
-        A PyArrow Table representing the data, or None if the input list is empty.
-    """
-    if not items:
-        return None
-
-    # Extract schema and do sanity checks
-    if not hasattr(model_cls, "ARROW_SCHEMA"):
-        raise ValueError("Model must have ARROW_SCHEMA attribute")
-    schema: pa.Schema = model_cls.ARROW_SCHEMA
-    if not isinstance(schema, pa.Schema):
-        raise ValueError(
-            "Model.ARROW_SCHEMA must be a pyarrow.Schema instance"
-        )
-    _verify_names_match(model_cls, schema)
-
-    cols = []
-    for field in schema:
-        name = field.name
-        vals = [getattr(item, name) for item in items]
-        cols.append(_to_arrow_array(vals, field.type))
-    return pa.Table.from_arrays(cols, schema=schema)
-
-
-class DuckWriteMode(StrEnum):
-    APPEND = "append"
-    INSERT_IGNORE = "insert_ignore"
-    UPSERT = "upsert"
-
-
-def _validate_write_mode(
-    mode: DuckWriteMode,
-    *,
-    table: Optional[pa.Table] = None,
-    model_cls: Optional[Type[BaseModel]] = None,
-    key_cols: Optional[List[str]] = None,
-):
-    if mode == DuckWriteMode.APPEND:
-        # Nothing to do?
-        return
-
-    if mode in {
-        DuckWriteMode.INSERT_IGNORE,
-        DuckWriteMode.UPSERT,
-    }:
-        if not key_cols:
-            raise ValueError(f"mode='{mode}' requires key_cols")
-        if table is None and model_cls is None:
-            raise ValueError(
-                f"mode='{mode}' requires either table or model_cls to validate key_cols"
-            )
-
-        if table is not None:
-            fields = set(table.schema.names)
-        else:
-            fields = set(model_cls.model_fields.keys())
-
-        invalid = sorted([c for c in key_cols if c not in fields])
-        if invalid:
-            raise ValueError(
-                f"key_cols {invalid} not present in table/model fields: {sorted(fields)}"
-            )
 
 
 class DuckLakeStore:
@@ -618,7 +492,7 @@ class DuckLakeStore:
         self,
         table: str, data: pa.Table,
         *,
-        mode: DuckWriteMode = DuckWriteMode.APPEND,
+        mode: WriteMode = WriteMode.APPEND,
         key_cols: list[str] | None = None,
         lake: str | None = None,
         retry_on_lock: bool = True,
@@ -633,8 +507,8 @@ class DuckLakeStore:
             data (pa.Table):
                 The PyArrow Table containing the data to insert.
 
-            mode (DuckWriteMode):
-                The insert mode. Default is DuckWriteMode.APPEND.
+            mode (WriteMode):
+                The insert mode. Default is WriteMode.APPEND.
 
             key_cols (Optional[List[str]]):
                 The key columns for "insert_ignore" and "upsert" modes.
@@ -658,13 +532,13 @@ class DuckLakeStore:
             with self._temp_view(vname, data) as cur:
                 cur.execute("BEGIN")
                 try:
-                    if mode == DuckWriteMode.APPEND:
+                    if mode == WriteMode.APPEND:
                         cur.execute(
                             f"INSERT INTO {fq} BY NAME SELECT * FROM {vname};"
                         )
 
                     # Common parts for insert_ignore and upsert
-                    if mode in {DuckWriteMode.INSERT_IGNORE, DuckWriteMode.UPSERT}:
+                    if mode in {WriteMode.INSERT_IGNORE, WriteMode.UPSERT}:
                         incoming_cols = list(data.schema.names)
                         keys_csv = ", ".join(_quote_ident(k) for k in key_cols)
                         proj_csv = ", ".join(
@@ -679,14 +553,14 @@ class DuckLakeStore:
                                 WHERE __rn = 1
                         )"""
 
-                    if mode == DuckWriteMode.INSERT_IGNORE:
+                    if mode == WriteMode.INSERT_IGNORE:
                         cur.execute(f"""
                             INSERT INTO {fq} BY NAME
                             SELECT {proj_csv}
                             FROM {src} i
                             ANTI JOIN {fq} t USING ({keys_csv});
                         """)
-                    elif mode == DuckWriteMode.UPSERT:
+                    elif mode == WriteMode.UPSERT:
                         non_keys = [
                             c for c in incoming_cols if c not in key_cols]
                         if not non_keys:
@@ -734,7 +608,7 @@ class DuckLakeStore:
         self,
         table: str, items: List[Dict[str, Any]], model_cls: Type[BaseModel],
         *,
-        mode: DuckWriteMode = DuckWriteMode.APPEND,
+        mode: WriteMode = WriteMode.APPEND,
         key_cols: list[str] | None = None,
         lake: Optional[str] = None,
         retry_on_lock: bool = True,
@@ -752,8 +626,8 @@ class DuckLakeStore:
             model_cls (Type[BaseModel]):
                 The Pydantic model class corresponding to the data.
 
-            mode (DuckWriteMode):
-                The insert mode. Default is DuckWriteMode.APPEND.
+            mode (WriteMode):
+                The insert mode. Default is WriteMode.APPEND.
 
             key_cols (Optional[List[str]]):
                 The key columns for "insert_ignore" and "upsert" modes.
@@ -844,292 +718,37 @@ class DuckLakeStore:
     def __exit__(self, exc_type, exc, tb): self.close()
 
 
-@dataclass(frozen=True)
-class DuckTableConfig:
-    model: Type[BaseModel]
-    mode: DuckWriteMode = DuckWriteMode.APPEND
-    key_cols: Optional[List[str]] = None
-
-    def __post_init__(self):
-        _validate_write_mode(
-            self.mode,
-            model_cls=self.model,
-            key_cols=self.key_cols,
-        )
-
-
-class _TableBuffer:
-    def __init__(self, name: str, config: DuckTableConfig):
-        self.name = name
-        self.config = config
-        self.lock = threading.Lock()
-        # The following fields are protected by self.lock
-        self.buffer: List[dict] = []
-        self.last_flush_ts: float = time.monotonic()
-        self.is_flushing = False
-
-
-class DuckLakeBufferedWriter:
+@dataclass
+class DuckLakeBackend(ArrowBackend):
     """
-    Buffered writer for DuckLake tables using DuckLakeStore.
-    Buffers rows in memory and flushes them to DuckLake based on row count
-    or time thresholds.
+    ArrowBackend implementation for DuckLakeStore.
 
     Args:
         lake (DuckLakeStore):
-            The DuckLakeStore instance to use for writing.
+            The DuckLakeStore instance to use.
 
-        table_configs (Dict[str, DuckTableConfig]):
-            A dictionary mapping table names to their DuckTableConfig.
+        lake_alias (Optional[str]):
+            The lake alias to use. If not provided, the default attached lake is used.
 
-        row_thresh (int):
-            The row count threshold for flushing (default: 10,000).
-
-        time_thresh_sec (float):
-            The time threshold in seconds for flushing (default: 60.0).
-
-        jitter (float):
-            The jitter factor to apply to thresholds (default: 0.2).
-            Range is [0.0, 1.0).
-            A value of 0 means no jitter; higher values increase randomness.
-
-        max_workers (int):
-            The maximum number of worker threads for flushing (default: 1).
-
-        log_helper (Optional[LogHelper]):
-            Optional logging helper for logging messages.
+        retry_on_lock (bool):
+            Whether to retry writes on transient lock errors (default: True).
     """
 
-    DEFAULT_ROW_THRESH = 10000
-    DEFAULT_TIME_THRESH_SEC = 60.0
-    DEFAULT_JITTER = 0.2
-    FINAL_FLUSH_TIMEOUT_SEC = 15.0
+    lake: DuckLakeStore
+    lake_alias: Optional[str] = None
+    retry_on_lock: bool = True
 
-    def __init__(
+    def flush_arrow(
         self,
-        lake: DuckLakeStore,
-        table_configs: Dict[str, DuckTableConfig],
-        *,
-        row_thresh: int = DEFAULT_ROW_THRESH,
-        time_thresh_sec: float = DEFAULT_TIME_THRESH_SEC,
-        jitter: float = DEFAULT_JITTER,
-        max_workers: int = 1,
-        log_helper: Optional[LogHelper] = None,
-    ):
-        self._lake = lake
-        self._logger = get_logger_from_helper(log_helper)
-        self._base_row_thresh = row_thresh
-        self._base_time_thresh = time_thresh_sec
-        self._jitter = jitter
-
-        # Initialize per-table buffers
-        self._tables: Dict[str, _TableBuffer] = {
-            name: _TableBuffer(name, cfg)
-            for name, cfg in table_configs.items()
-        }
-
-        # Thread pool for flush tasks
-        self._exec = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix=f"{self.__class__.__name__}-worker"
+        table_name: str,
+        config: TableConfig,
+        data: pa.Table,
+    ) -> None:
+        self.lake.insert_arrow(
+            table_name,
+            data,
+            mode=config.mode,
+            key_cols=config.key_cols,
+            lake=self.lake_alias,
+            retry_on_lock=self.retry_on_lock,
         )
-        self._closed = False
-
-        # Timer thread
-        self._timer_thread = threading.Thread(
-            target=self._timer_loop,
-            name=f"{self.__class__.__name__}-timer",
-            daemon=True,
-        )
-        self._timer_thread.start()
-
-        self._logger.info(
-            "DuckLakeBufferedWriter initialized with row_thresh=%d, "
-            "time_thresh_sec=%.2f, max_workers=%d.",
-            self._base_row_thresh, self._base_time_thresh, max_workers
-        )
-
-    def _get_thresholds_dynamic(self):
-        if self._jitter <= 0:
-            return self._base_row_thresh, self._base_time_thresh
-
-        mult = random.uniform(1.0 - self._jitter, 1.0 + self._jitter)
-        return int(self._base_row_thresh * mult), self._base_time_thresh * mult
-
-    def _timer_loop(self):
-        # Check more frequently than the threshold to catch timeouts accurately
-        interval = max(
-            0.1,
-            min(self._base_time_thresh / 4, self.FINAL_FLUSH_TIMEOUT_SEC / 2)
-        )
-
-        while not self._closed:
-            time.sleep(interval)
-            if self._closed:
-                break
-
-            try:
-                self._check_time_thresholds()
-            except Exception:
-                self._logger.error(
-                    "DuckLakeBufferedWriter timer-loop flush failed.",
-                    exc_info=True,
-                )
-
-    def _check_time_thresholds(self):
-        _, time_thresh = self._get_thresholds_dynamic()
-
-        for tb in self._tables.values():
-            # Check without lock first.
-            # Dirty read is acceptable here because
-            # we either double-check inside the lock, or will try again later.
-            if tb.is_flushing or not tb.buffer:
-                continue
-
-            should_flush = False
-            now = time.monotonic()
-            with tb.lock:
-                if not tb.is_flushing and tb.buffer:
-                    if (now - tb.last_flush_ts) >= time_thresh:
-                        should_flush = True
-                        tb.is_flushing = True
-                        rows_to_flush = tb.buffer
-                        tb.buffer = []
-
-            if should_flush:
-                self._exec.submit(self._flush_task, tb, rows_to_flush, now)
-
-    def add_row(self, table: str, row: dict):
-        """
-        Add a single row to the buffer for the specified table.
-        """
-        self.add_rows(table, [row])
-
-    def add_rows(self, table: str, rows: List[dict]):
-        """
-        Add rows to the buffer for the specified table.
-        """
-
-        if self._closed:
-            raise RuntimeError(
-                "DuckLakeBufferedWriter is closed; cannot add rows."
-            )
-        if not rows:
-            return
-
-        tb = self._tables.get(table)
-        if not tb:
-            raise KeyError(f"Unknown table '{table}'")
-
-        row_thresh, _ = self._get_thresholds_dynamic()
-        should_flush = False
-        rows_to_flush = None
-        with tb.lock:
-            tb.buffer.extend(rows)
-
-            if not tb.is_flushing and len(tb.buffer) >= row_thresh:
-                should_flush = True
-                tb.is_flushing = True
-                rows_to_flush = tb.buffer
-                tb.buffer = []
-
-        if should_flush:
-            self._exec.submit(
-                self._flush_task, tb, rows_to_flush, time.monotonic()
-            )
-
-    def _flush_task(self, tb: _TableBuffer, rows: List[dict], start_ts: float):
-        try:
-            self._lake.insert_records(
-                tb.name,
-                rows,
-                tb.config.model,
-                mode=tb.config.mode,
-                key_cols=tb.config.key_cols,
-                retry_on_lock=True,
-            )
-
-            with tb.lock:
-                tb.last_flush_ts = start_ts
-                tb.is_flushing = False
-
-            self._logger.debug(
-                "DuckLakeBufferedWriter: flushed %d rows to table '%s'.",
-                len(rows), tb.name
-            )
-
-        except Exception as e:
-            self._logger.error(
-                "DuckLakeBufferedWriter: flush for table '%s' failed: %s. "
-                "Re-buffering rows for retry.", tb.name, e
-            )
-
-            # Put rows back at the front for order preservation
-            with tb.lock:
-                tb.buffer = rows + tb.buffer
-                tb.is_flushing = False
-
-    def flush(self, timeout: Optional[float] = None):
-        """
-        Force flushes all tables and waits for completion.
-
-        Iterates until all buffers are empty and no flushes are in-flight.
-        """
-        start_time = time.monotonic()
-
-        while True:
-            # Timeout check
-            if timeout is not None:
-                elapsed = time.monotonic() - start_time
-                if elapsed > timeout:
-                    self._logger.warning(
-                        "Flush timed out with data remaining."
-                    )
-                    break
-                remaining_time = timeout - elapsed
-            else:
-                remaining_time = None
-
-            pending_count = 0
-            futures = []
-            for tb in self._tables.values():
-                with tb.lock:
-                    # Buffer has data and not flushing => schedule flush
-                    if tb.buffer and not tb.is_flushing:
-                        tb.is_flushing = True
-                        data = tb.buffer
-                        tb.buffer = []
-
-                        f = self._exec.submit(
-                            self._flush_task, tb, data, time.monotonic()
-                        )
-                        futures.append(f)
-                        pending_count += 1
-
-                    # Currently flushing, regardless of buffer state => pending
-                    elif tb.is_flushing:
-                        pending_count += 1
-
-            if pending_count == 0:
-                break
-
-            if futures:
-                # We scheduled some flushes; wait for them.
-                wait(futures, timeout=remaining_time)
-            else:
-                # Someone else is flushing; poll
-                time.sleep(0.1)
-
-    def close(self):
-        if self._closed:
-            return
-        self._closed = True
-
-        try:
-            self.flush(timeout=self.FINAL_FLUSH_TIMEOUT_SEC)
-        except Exception:
-            self._logger.error(
-                "Final DuckLakeBufferedWriter flush failed.", exc_info=True
-            )
-
-        self._exec.shutdown(wait=True)

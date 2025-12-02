@@ -1,10 +1,14 @@
+from pathlib import Path
+from ipaddress import ip_address
 import sqlite3
-import re
 from urllib.parse import urlparse
 
-from tmautils.common import *
-from .types import *
+from tmautils.common import IOHelper, gzip_file, gunzip_file, FQDN
 from .openwpm import OpenWpmCrawlUtil
+from .types import (
+    OpenWpmSiteCrawlResult, FirefoxWebResource,
+    FirefoxCrawlFailureReason, UsedDnsRecord, CompletedHttpRequest,
+)
 
 
 class TrancoTopListUtil:

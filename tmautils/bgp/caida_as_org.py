@@ -1,8 +1,9 @@
+from pathlib import Path
 import pandas as pd
 import requests
 import gzip
 
-from tmautils.common import *
+from tmautils.common import IOHelper
 
 
 class CaidaAsOrgInfoUtil:

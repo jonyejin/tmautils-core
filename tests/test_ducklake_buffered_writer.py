@@ -1,3 +1,4 @@
+from typing import ClassVar
 import time
 import threading
 import pytest
@@ -5,22 +6,22 @@ from typing import List, Dict, Any
 from pydantic import BaseModel
 import os
 
-from tmautils.common import DuckLakeBufferedWriter
+import pyarrow as pa
+
+from tmautils.db import BufferedWriter, TableConfig, WriteMode
 
 # --------------------------- Mocks & Stubs ---------------------------
 
 
-class MockDuckTableConfig:
-    def __init__(self, model, key_cols=None, mode="append"):
-        self.model = model
-        self.key_cols = key_cols or []
-        self.mode = mode
-
-
-class MockDuckLakeStore:
+class MockArrowBackend:
     """
-    A thread-safe mock store that simply accumulates rows in memory
-    and allows injecting failures to test retry logic.
+    A thread-safe mock ArrowBackend that accumulates flushed rows in memory
+    and allows injecting failures to test retry / re-buffer logic.
+
+    It mimics the old MockDuckLakeStore surface that tests rely on:
+    - .inserts[table] -> list[dict]
+    - .call_count
+    - .fail_next_n_times
     """
 
     def __init__(self):
@@ -30,18 +31,16 @@ class MockDuckLakeStore:
         self.fail_next_n_times = 0
         self.failure_exception = Exception("Simulated DB Lock Error")
 
-    def insert_records(
+    def flush_arrow(
         self,
-        table: str,
-        rows: List[dict],
-        model: Any,
-        mode: str = "append",
-        key_cols: List[str] = None,
-        retry_on_lock: bool = True
+        table_name: str,
+        config: TableConfig,
+        data: pa.Table,
     ):
-        # Simulate network latency BEFORE checking failure.
-        # This prevents the CPU from burning through 1000 retries in 1ms.
+        # Simulate some latency so retry / timeout tests behave realistically.
         time.sleep(0.01)
+
+        rows: List[dict] = data.to_pylist()
 
         with self.lock:
             self.call_count += 1
@@ -49,39 +48,52 @@ class MockDuckLakeStore:
                 self.fail_next_n_times -= 1
                 raise self.failure_exception
 
-            if table not in self.inserts:
-                self.inserts[table] = []
-            self.inserts[table].extend(rows)
+            if table_name not in self.inserts:
+                self.inserts[table_name] = []
+            self.inserts[table_name].extend(rows)
 
 
 class ItemModel(BaseModel):
     k: int
     v: str
 
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("k", pa.int64()),
+        pa.field("v", pa.string()),
+    ])
+
 # --------------------------- Fixtures ---------------------------
 
 
 @pytest.fixture
-def mock_store():
-    return MockDuckLakeStore()
+def mock_backend():
+    return MockArrowBackend()
 
 
 @pytest.fixture
 def table_configs():
     return {
-        "table_a": MockDuckTableConfig(ItemModel, key_cols=["k"]),
-        "table_b": MockDuckTableConfig(ItemModel, key_cols=["k"]),
+        "table_a": TableConfig(
+            model=ItemModel,
+            key_cols=["k"],
+            mode=WriteMode.APPEND,
+        ),
+        "table_b": TableConfig(
+            model=ItemModel,
+            key_cols=["k"],
+            mode=WriteMode.APPEND,
+        ),
     }
 
 # --------------------------- Tests ---------------------------
 
 
-def test_buffer_accumulates_without_flush(mock_store, table_configs):
+def test_buffer_accumulates_without_flush(mock_backend, table_configs):
     """
     Ensure rows stay in the buffer until thresholds are met.
     """
-    writer = DuckLakeBufferedWriter(
-        mock_store,
+    writer = BufferedWriter(
+        mock_backend,
         table_configs,
         row_thresh=100,
         time_thresh_sec=10.0,
@@ -91,20 +103,20 @@ def test_buffer_accumulates_without_flush(mock_store, table_configs):
     rows = [{"k": i, "v": "x"} for i in range(50)]
     writer.add_rows("table_a", rows)
 
-    assert mock_store.call_count == 0
+    assert mock_backend.call_count == 0
     with writer._tables["table_a"].lock:
         assert len(writer._tables["table_a"].buffer) == 50
 
     writer.close()
-    assert len(mock_store.inserts["table_a"]) == 50
+    assert len(mock_backend.inserts["table_a"]) == 50
 
 
-def test_row_threshold_triggers_flush(mock_store, table_configs):
+def test_row_threshold_triggers_flush(mock_backend, table_configs):
     """
     Ensure hitting row_thresh triggers a background flush.
     """
-    writer = DuckLakeBufferedWriter(
-        mock_store,
+    writer = BufferedWriter(
+        mock_backend,
         table_configs,
         row_thresh=10,
         time_thresh_sec=60.0,
@@ -117,18 +129,18 @@ def test_row_threshold_triggers_flush(mock_store, table_configs):
     # Allow worker thread to pick up the task
     time.sleep(0.2)
 
-    assert mock_store.call_count >= 1
+    assert mock_backend.call_count >= 1
 
     writer.close()
-    assert len(mock_store.inserts["table_a"]) == 15
+    assert len(mock_backend.inserts["table_a"]) == 15
 
 
-def test_time_threshold_triggers_flush(mock_store, table_configs):
+def test_time_threshold_triggers_flush(mock_backend, table_configs):
     """
     Ensure the background timer triggers a flush after time_thresh_sec.
     """
-    writer = DuckLakeBufferedWriter(
-        mock_store,
+    writer = BufferedWriter(
+        mock_backend,
         table_configs,
         row_thresh=1000,
         time_thresh_sec=0.5,
@@ -136,19 +148,19 @@ def test_time_threshold_triggers_flush(mock_store, table_configs):
     )
 
     writer.add_row("table_a", {"k": 1, "v": "t"})
-    assert mock_store.call_count == 0
+    assert mock_backend.call_count == 0
 
     time.sleep(1.0)  # Wait for timer loop
 
-    assert mock_store.call_count >= 1
-    assert len(mock_store.inserts["table_a"]) == 1
+    assert mock_backend.call_count >= 1
+    assert len(mock_backend.inserts["table_a"]) == 1
 
     writer.close()
 
 
-def test_manual_flush_blocks_until_done(mock_store, table_configs):
-    writer = DuckLakeBufferedWriter(
-        mock_store,
+def test_manual_flush_blocks_until_done(mock_backend, table_configs):
+    writer = BufferedWriter(
+        mock_backend,
         table_configs,
         row_thresh=1000,
         time_thresh_sec=60.0
@@ -157,8 +169,8 @@ def test_manual_flush_blocks_until_done(mock_store, table_configs):
     writer.add_row("table_a", {"k": 1, "v": "manual"})
     writer.flush()
 
-    assert mock_store.call_count == 1
-    assert mock_store.inserts["table_a"][0]["v"] == "manual"
+    assert mock_backend.call_count == 1
+    assert mock_backend.inserts["table_a"][0]["v"] == "manual"
 
     with writer._tables["table_a"].lock:
         assert len(writer._tables["table_a"].buffer) == 0
@@ -166,13 +178,13 @@ def test_manual_flush_blocks_until_done(mock_store, table_configs):
     writer.close()
 
 
-def test_concurrency_stress_test(mock_store, table_configs):
+def test_concurrency_stress_test(mock_backend, table_configs):
     """
     Spam multiple tables from multiple threads.
     Verifies granular locking allows throughput and data integrity.
     """
-    writer = DuckLakeBufferedWriter(
-        mock_store,
+    writer = BufferedWriter(
+        mock_backend,
         table_configs,
         row_thresh=50,
         time_thresh_sec=60.0,
@@ -200,21 +212,21 @@ def test_concurrency_stress_test(mock_store, table_configs):
     writer.close()
 
     # Data Integrity is the primary correctness check
-    assert len(mock_store.inserts["table_a"]) == 400
-    assert len(mock_store.inserts["table_b"]) == 400
+    assert len(mock_backend.inserts["table_a"]) == 400
+    assert len(mock_backend.inserts["table_b"]) == 400
 
     # We verify that flushes actually happened (it wasn't just 1 giant flush at close)
     # But we don't enforce a high number, because efficient batching is good.
-    assert mock_store.call_count > 0
+    assert mock_backend.call_count > 0
 
 
-def test_retry_logic_preserves_order_and_data(mock_store, table_configs):
+def test_retry_logic_preserves_order_and_data(mock_backend, table_configs):
     """
-    Simulate a failure. Ensure rows are prepended back to buffer 
+    Simulate a failure. Ensure rows are prepended back to buffer
     and eventually written in correct order.
     """
-    writer = DuckLakeBufferedWriter(
-        mock_store,
+    writer = BufferedWriter(
+        mock_backend,
         table_configs,
         row_thresh=5,
         time_thresh_sec=60.0,
@@ -222,7 +234,7 @@ def test_retry_logic_preserves_order_and_data(mock_store, table_configs):
     )
 
     # Fail the next flush
-    mock_store.fail_next_n_times = 1
+    mock_backend.fail_next_n_times = 1
 
     # Batch 1 triggers flush (5 rows)
     batch1 = [{"k": i, "v": "batch1"} for i in range(5)]
@@ -237,9 +249,9 @@ def test_retry_logic_preserves_order_and_data(mock_store, table_configs):
 
     # 1 fail + 1 success = 2 calls (minimum)
     # Note: Logic might try more times depending on timing, so check >= 2
-    assert mock_store.call_count >= 2
+    assert mock_backend.call_count >= 2
 
-    final_data = mock_store.inserts["table_a"]
+    final_data = mock_backend.inserts["table_a"]
     assert len(final_data) == 7
 
     # Verify Order
@@ -250,13 +262,13 @@ def test_retry_logic_preserves_order_and_data(mock_store, table_configs):
     writer.close()
 
 
-def test_close_timeout_behavior(mock_store, table_configs):
+def test_close_timeout_behavior(mock_backend, table_configs):
     """
     If the store is permanently broken, close() should eventually timeout
     and not hang indefinitely.
     """
-    writer = DuckLakeBufferedWriter(
-        mock_store,
+    writer = BufferedWriter(
+        mock_backend,
         table_configs,
         row_thresh=10
     )
@@ -267,7 +279,7 @@ def test_close_timeout_behavior(mock_store, table_configs):
 
     # Make store fail enough times to exceed the timeout duration.
     # With 0.01s sleep per call, 50 fails = 0.5s > 0.2s timeout.
-    mock_store.fail_next_n_times = 50
+    mock_backend.fail_next_n_times = 50
 
     writer.add_row("table_a", {"k": 1, "v": "doom"})
 

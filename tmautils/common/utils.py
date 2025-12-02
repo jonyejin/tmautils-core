@@ -1,7 +1,8 @@
+from typing import Callable, Union
 from functools import wraps
-from ipaddress import ip_address
+from ipaddress import ip_address, IPv4Address, IPv6Address
 
-from .types import *
+from .types import IPAddress
 
 
 def maybe_apply(fn: Callable):

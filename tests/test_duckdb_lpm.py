@@ -6,7 +6,7 @@ import pytest
 import duckdb
 import pandas as pd
 
-from tmautils.common import DuckDbInetLpmIndex
+from tmautils.db import DuckDbInetLpmIndex
 
 
 def test_duckdb_inet_lpm_index_with_inet_to_varchar_cast():

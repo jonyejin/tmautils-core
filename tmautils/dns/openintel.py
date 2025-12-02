@@ -1,13 +1,20 @@
+from typing import Optional, Callable
+from pathlib import Path
+from enum import StrEnum
 from websocket import WebSocketApp
 import pandas as pd
 from threading import Thread, Event
 import rel
 import atexit
 import multiprocessing as mp
-import logging
 from concurrent.futures import ThreadPoolExecutor
 
-from tmautils.common import *
+from tmautils.common import (
+    IOHelper, AsyncHelper,
+    IpcMethodBase, IpcMsg, IpcStatusCode,
+    LogConfig, LogHelper, get_logger_from_helper,
+)
+from tmautils.db import SqliteDatabase, SqliteTable
 
 
 class ZoneStreamMethod(IpcMethodBase, StrEnum):
@@ -270,7 +277,7 @@ class OpenIntelZoneStreamUtil:
         ],
     }
     TOPIC_TO_INDICES = {
-        "newly_registered_fqdn": [["fqdn"]],
+        "newly_registered_fqdn": [["fqdn"], ["fqdn", "msg_timestamp"]],
         "newly_registered_domain": [["domain"]],
         "confirmed_newly_registered_domain": [["domain"]],
     }

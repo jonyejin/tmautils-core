@@ -1,11 +1,12 @@
+from pathlib import Path
 import sqlite3
 import re
 import logging
 from dataclasses import dataclass
 from dataclasses_json import DataClassJsonMixin
 
-from tmautils.common import *
-from .types import *
+from tmautils.common import IOHelper, gzip_file, import_module_attr
+from .types import OpenWpmSiteCrawlResult
 
 
 @dataclass

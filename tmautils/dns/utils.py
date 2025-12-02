@@ -4,8 +4,6 @@ from dns.rrset import RRset
 import dns.flags
 import hashlib
 
-from tmautils.common import *
-
 
 def dns_msg_semantic_hash(
     msg: QueryMessage,

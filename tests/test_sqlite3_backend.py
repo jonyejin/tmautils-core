@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tmautils.common import SqliteDatabase
+from tmautils.db import SqliteDatabase
 
 
 Mode = namedtuple("Mode", "offload buffering label")

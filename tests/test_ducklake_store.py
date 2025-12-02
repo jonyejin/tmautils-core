@@ -11,7 +11,7 @@ import threading
 import pyarrow as pa
 import pytest
 
-from tmautils.common import DuckLakeStore, pydantic_to_arrow
+from tmautils.db import DuckLakeStore, pydantic_to_arrow
 
 try:
     import duckdb

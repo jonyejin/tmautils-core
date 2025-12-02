@@ -4,4 +4,11 @@ from .tranco import (
     TrancoProcessUtil,
 )
 from .openwpm import OpenWpmCrawlUtil
-from .types import *
+from .types import (
+    HappyEyeballsResult,
+    FirefoxWebResource,
+    FirefoxCrawlFailureReason,
+    UsedDnsRecord,
+    CompletedHttpRequest,
+    OpenWpmSiteCrawlResult,
+)

@@ -1,3 +1,4 @@
+from typing import Optional
 import ssl
 import socket
 import cryptography.x509 as x509
@@ -5,7 +6,7 @@ import certifi
 import asyncio
 import contextlib
 
-from tmautils.common import *
+from tmautils.common import IPAddress
 
 
 def _build_ctx(*, verify: bool, use_certifi: bool):
