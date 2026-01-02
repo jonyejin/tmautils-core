@@ -3,6 +3,7 @@ from .base import (
     WriteMode, TableConfig, ArrowBackend,
 )
 from .bufferedwriter import BufferedWriter
+from .duckdb import DuckDbStore, DuckDbBackend
 from .ducklake import DuckLakeStore, DuckLakeBackend
 from .duckdb_helpers import DuckDbInetLpmIndex
 from .parquet import ParquetBackend

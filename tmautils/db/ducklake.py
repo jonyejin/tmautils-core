@@ -663,7 +663,9 @@ class DuckLakeStore:
     ):
         """
         Perform a checkpoint on the specified DuckLake lake.
-        For options, see DuckLake documentation.
+        If no lake alias is provided, the default attached lake is used.
+
+        For checkpoint options, see DuckLake documentation.
         """
 
         alias = lake or self._get_default_alias()
@@ -700,7 +702,7 @@ class DuckLakeStore:
                 f"{rewrite_delete_threshold});",
                 None
             ))
-        stmts.append(("CHECKPOINT;", None))
+        stmts.append((f"CHECKPOINT {alias_ident};", None))
         self.execute_txn(stmts, retry_on_lock=retry_on_lock)
 
     def close(self):
