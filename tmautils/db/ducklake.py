@@ -15,6 +15,7 @@ from .base import (
     _validate_write_mode,
     ArrowBackend, WriteMode, TableConfig,
 )
+from .sql_schema import generate_create_table_sql
 
 _T = TypeVar("_T")
 
@@ -753,4 +754,48 @@ class DuckLakeBackend(ArrowBackend):
             key_cols=config.key_cols,
             lake=self.lake_alias,
             retry_on_lock=self.retry_on_lock,
+        )
+
+    def ensure_table(
+        self,
+        table_name: str,
+        config: TableConfig,
+        *,
+        if_not_exists: bool = True
+    ) -> None:
+        """
+        Ensure that a SQL table exists for the given TableConfig.
+
+        Generates and executes CREATE TABLE and CREATE INDEX statements based on
+        the model's ARROW_SCHEMA and optional SQL metadata.
+        See `generate_create_table_sql` for details.
+
+        Args:
+            table_name:
+                Name of the table to create
+
+            config:
+                TableConfig with model that has ARROW_SCHEMA
+
+            if_not_exists:
+                Whether to use CREATE TABLE IF NOT EXISTS.
+                Default is True.
+
+        Raises:
+            ValueError:
+                If the model doesn't have ARROW_SCHEMA or SQL generation fails.
+        """
+
+        alias = self.lake_alias or self.lake._get_default_alias()
+        qualified_table_name = f"{alias}.{table_name}"
+
+        sql = generate_create_table_sql(
+            table_name=qualified_table_name,
+            model_cls=config.model,
+            if_not_exists=if_not_exists,
+            dialect="duckdb"
+        )
+        self.lake.execute_txn(
+            [(stmt, None) for stmt in sql],
+            retry_on_lock=self.retry_on_lock
         )

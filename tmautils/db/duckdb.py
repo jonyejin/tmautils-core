@@ -11,6 +11,7 @@ from .base import (
     _quote_ident, _validate_write_mode,
     ArrowBackend, WriteMode, TableConfig,
 )
+from .sql_schema import generate_create_table_sql
 
 
 class DuckDbStore:
@@ -326,3 +327,41 @@ class DuckDbBackend(ArrowBackend):
             mode=config.mode,
             key_cols=config.key_cols,
         )
+
+    def ensure_table(
+        self,
+        table_name: str,
+        config: TableConfig,
+        *,
+        if_not_exists: bool = True
+    ) -> None:
+        """
+        Ensure that a SQL table exists for the given TableConfig.
+
+        Generates and executes CREATE TABLE and CREATE INDEX statements based on
+        the model's ARROW_SCHEMA and optional SQL metadata.
+        See `generate_create_table_sql` for details.
+
+        Args:
+            table_name:
+                Name of the table to create
+
+            config:
+                TableConfig with model that has ARROW_SCHEMA
+
+            if_not_exists:
+                Whether to use CREATE TABLE IF NOT EXISTS.
+                Default is True.
+
+        Raises:
+            ValueError:
+                If the model doesn't have ARROW_SCHEMA or SQL generation fails.
+        """
+
+        sql = generate_create_table_sql(
+            table_name=table_name,
+            model_cls=config.model,
+            if_not_exists=if_not_exists,
+            dialect="duckdb"
+        )
+        self.store.execute_txn([(stmt, None) for stmt in sql])

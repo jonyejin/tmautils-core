@@ -35,6 +35,13 @@ class BufferedWriter:
         table_configs (Dict[str, TableConfig]):
             A mapping of table names to their corresponding TableConfig.
 
+        auto_create_tables (bool):
+            Whether to automatically create SQL tables from model metadata
+            when the backend supports it (e.g., DuckDbBackend, DuckLakeBackend).
+            Uses CREATE TABLE IF NOT EXISTS, so it's safe to use with existing tables.
+            Default is True.
+            Set to False for manual table creation control.
+
         row_thresh (int):
             The number of buffered rows per table that triggers a flush.
             Default is 10,000.
@@ -66,6 +73,7 @@ class BufferedWriter:
         backend: ArrowBackend,
         table_configs: Dict[str, TableConfig],
         *,
+        auto_create_tables: bool = True,
         row_thresh: int = DEFAULT_ROW_THRESH,
         time_thresh_sec: float = DEFAULT_TIME_THRESH_SEC,
         jitter: float = DEFAULT_JITTER,
@@ -84,6 +92,23 @@ class BufferedWriter:
             name: _TableBuffer(name, cfg)
             for name, cfg in table_configs.items()
         }
+
+        # Auto-create tables if backend supports it
+        if auto_create_tables and hasattr(backend, 'ensure_table'):
+            for table_name, config in table_configs.items():
+                try:
+                    backend.ensure_table(table_name, config)
+                    self._logger.debug(
+                        "Auto-created table '%s' from model %s.",
+                        table_name,
+                        config.model.__name__
+                    )
+                except Exception as e:
+                    self._logger.warning(
+                        "Failed to auto-create table '%s': %s. "
+                        "Table may already exist or require manual creation.",
+                        table_name, e
+                    )
 
         # Thread pool for flush tasks
         self._exec = ThreadPoolExecutor(
