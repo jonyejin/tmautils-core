@@ -1,222 +1,103 @@
-from typing import Optional, Callable
+from typing import Optional, Callable, ClassVar
 from pathlib import Path
-from enum import StrEnum
 from websocket import WebSocketApp
-import pandas as pd
 from threading import Thread, Event
-import rel
+from collections import deque
 import atexit
-import multiprocessing as mp
+import time
+import json
 from concurrent.futures import ThreadPoolExecutor
+import tenacity
+from pydantic import BaseModel
+import pyarrow as pa
 
-from tmautils.common import (
-    IOHelper, AsyncHelper,
-    IpcMethodBase, IpcMsg, IpcStatusCode,
-    LogConfig, LogHelper, get_logger_from_helper,
+from tmautils.common import IOHelper
+from tmautils.db import (
+    DuckDbStore, DuckDbBackend, BufferedWriter,
+    TableConfig, WriteMode,
 )
-from tmautils.db import SqliteDatabase, SqliteTable
 
 
-class ZoneStreamMethod(IpcMethodBase, StrEnum):
-    STOP = "stop"
-    BATCH = "batch"
+class NewlyRegisteredFqdn(BaseModel):
+    msg_timestamp: float
+    fqdn: str
+    cert_index: int
+    ct_name: str
+    timestamp: int
+
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("msg_timestamp", pa.timestamp("us", tz="UTC")),
+        pa.field("fqdn", pa.string()),
+        pa.field("cert_index", pa.int64()),
+        pa.field("ct_name", pa.string()),
+        pa.field("timestamp", pa.int64()),
+    ])
+
+    SQL_TABLE_CONSTRAINTS: ClassVar[list[str]] = [
+        "PRIMARY KEY (msg_timestamp, fqdn)"
+    ]
+
+    SQL_TABLE_INDICES: ClassVar[list[list[str]]] = [
+        ["fqdn"],
+        ["fqdn", "msg_timestamp"]
+    ]
 
 
-class OpenIntelZoneStreamWorker:
-    SERVICE = "openintel_zonestream"
-    WS_URL = "wss://zonestream.openintel.nl/ws/{topic}"
-    BATCH_MAX = 1000
-    THREAD_JOIN_TIMEOUT_SEC = 3.0
-    RECONNECT_INTERVAL_SEC = 5
+class NewlyRegisteredDomain(BaseModel):
+    msg_timestamp: float
+    domain: str
+    cert_index: int
+    ct_name: str
+    timestamp: int
 
-    def __init__(
-        self,
-        topics: list[str],
-        data_q: mp.Queue,
-        cmd_q: mp.Queue,
-        *,
-        logging_config: Optional[LogConfig] = None,
-    ):
-        from collections import deque
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("msg_timestamp", pa.timestamp("us", tz="UTC")),
+        pa.field("domain", pa.string()),
+        pa.field("cert_index", pa.int64()),
+        pa.field("ct_name", pa.string()),
+        pa.field("timestamp", pa.int64()),
+    ])
 
-        self.topics = topics
-        self.data_q = data_q
-        self.cmd_q = cmd_q
+    SQL_TABLE_CONSTRAINTS: ClassVar[list[str]] = [
+        "PRIMARY KEY (msg_timestamp, domain)"
+    ]
 
-        self.ws_map: dict[str, WebSocketApp] = {}
+    SQL_TABLE_INDICES: ClassVar[list[list[str]]] = [
+        ["domain"]
+    ]
 
-        self.send_q = deque()
-        self.sender_wake = Event()
-        self.running = Event()
-        self.running.set()
 
-        self.sender_thr: Optional[Thread] = None
-        self.cmd_thr: Optional[Thread] = None
+class ConfirmedNewlyRegisteredDomain(BaseModel):
+    msg_timestamp: float
+    domain: str
+    cert_index: int
+    ct_name: str
+    timestamp: int
+    confidence: int
 
-        self._async_helper = AsyncHelper()
-        self._log_helper = LogHelper(
-            logging_config) if logging_config else None
-        self.logger = get_logger_from_helper(self._log_helper)
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("msg_timestamp", pa.timestamp("us", tz="UTC")),
+        pa.field("domain", pa.string()),
+        pa.field("cert_index", pa.int64()),
+        pa.field("ct_name", pa.string()),
+        pa.field("timestamp", pa.int64()),
+        pa.field("confidence", pa.int64()),
+    ])
 
-    def _sender_loop(self):
-        while self.running.is_set() or self.send_q:
-            if not self.send_q:
-                # Nothing to send, wait for sender_wake_event
-                self.sender_wake.wait()
-                self.sender_wake.clear()  # Woke up => clear event
-                continue  # Let the next iteration handle sending or exit
+    SQL_TABLE_CONSTRAINTS: ClassVar[list[str]] = [
+        "PRIMARY KEY (msg_timestamp, domain)"
+    ]
 
-            topic_map = {}
-            total = 0
-            while self.send_q and total < self.BATCH_MAX:
-                topic, msg = self.send_q.popleft()
-                topic_map.setdefault(topic, []).append(msg)
-                total += 1
-
-            self._async_helper.mpq_put_sync(
-                self.data_q,
-                IpcMsg.notify(
-                    self.SERVICE,
-                    ZoneStreamMethod.BATCH,
-                    topic_map=topic_map
-                )
-            )
-
-    def _cmd_loop(self):
-        while self.running.is_set():
-            try:
-                msg = self.cmd_q.get(timeout=0.5)
-            except Exception:
-                continue
-
-            if ((not isinstance(msg, IpcMsg)) or
-                (msg.service != self.SERVICE) or
-                    (not msg.is_notify)):
-                continue
-
-            if ZoneStreamMethod.get_method(msg) == ZoneStreamMethod.STOP:
-                self.logger.info("Received STOP notification from parent")
-                self.shutdown()
-                break
-
-    def _on_open_factory(self, topic):
-        def _on_open(ws):
-            self.logger.info(f"[{topic}] WebSocket opened: {ws.url}")
-
-        return _on_open
-
-    def _on_message_factory(self, topic):
-        import json
-
-        def _on_message(ws, message: str):
-            try:
-                msg = json.loads(message)
-            except Exception as e:
-                self.logger.error(f"[{topic}] JSON decode error: {e}")
-                return
-            msg["msg_timestamp"] = pd.Timestamp.now(tz="UTC").timestamp()
-            self.send_q.append((topic, msg))
-            self.sender_wake.set()
-
-        return _on_message
-
-    def _on_error_factory(self, topic):
-        def _on_error(ws, error: Exception):
-            self.logger.error(f"[{topic}] WebSocket error: {error}")
-
-        return _on_error
-
-    def _on_close_factory(self, topic):
-        def _on_close(ws, code, msg):
-            self.logger.info(
-                f"[{topic}] WebSocket closed, code={code}, msg={msg}"
-            )
-
-        return _on_close
-
-    def shutdown(self):
-        if not self.running.is_set():
-            return
-        self.running.clear()
-
-        # Close all websockets
-        for ws in self.ws_map.values():
-            try:
-                ws.close()
-            except Exception:
-                pass
-
-        # Abort rel dispatcher
-        try:
-            rel.abort()
-        except Exception:
-            pass
-
-        # Signal sender to exit
-        self.sender_wake.set()
-
-    def run(self):
-        try:
-            # Command thread
-            self.cmd_thr = Thread(
-                target=self._cmd_loop,
-                name=f"{self.__class__.__name__}-cmd",
-                daemon=True,
-            )
-            self.cmd_thr.start()
-
-            self.logger.info(
-                f"Starting WebSocket listeners for topics: {self.topics}"
-            )
-
-            for topic in self.topics:
-                ws = WebSocketApp(
-                    self.WS_URL.format(topic=topic),
-                    on_open=self._on_open_factory(topic),
-                    on_message=self._on_message_factory(topic),
-                    on_error=self._on_error_factory(topic),
-                    on_close=self._on_close_factory(topic),
-                )
-                self.ws_map[topic] = ws
-                ws.run_forever(
-                    dispatcher=rel,  # Use rel to run in background
-                    reconnect=self.RECONNECT_INTERVAL_SEC,
-                )
-
-            # Sender thread
-            self.sender_thr = Thread(
-                target=self._sender_loop,
-                name=f"{self.__class__.__name__}-sender",
-                daemon=True,
-            )
-            self.sender_thr.start()
-
-            self._async_helper.mpq_put_sync(
-                self.data_q, IpcMsg.status(IpcStatusCode.READY)
-            )
-            rel.dispatch()
-        except Exception as e:
-            self.logger.exception(
-                f"Error starting WebSocket listeners: {e}"
-            )
-        finally:
-            self.shutdown()
-            try:
-                if self.sender_thr and self.sender_thr.is_alive():
-                    self.sender_thr.join(timeout=self.THREAD_JOIN_TIMEOUT_SEC)
-                if self.cmd_thr and self.cmd_thr.is_alive():
-                    self.cmd_thr.join(timeout=self.THREAD_JOIN_TIMEOUT_SEC)
-            except Exception:
-                pass
-            self._async_helper.mpq_put_sync(
-                self.data_q, IpcMsg.status(IpcStatusCode.STOPPED)
-            )
+    SQL_TABLE_INDICES: ClassVar[list[list[str]]] = [
+        ["domain"]
+    ]
 
 
 class OpenIntelZoneStreamUtil:
     """
-    Utility to connect to OpenIntel Zone Stream WebSocket and store messages to
-    a local SQLite database.
+    Utility to connect to OpenIntel ZoneStream using WebSockets,
+    act on received messages through an optional callback,
+    and store the messages in a local DuckDB database.
 
     Args:
         topics (list[str]): List of topics to subscribe to. Valid topics are:
@@ -243,43 +124,22 @@ class OpenIntelZoneStreamUtil:
             See IOHelper documentation for more details.
     """
 
+    SERVICE = "openintel_zonestream"
+    WS_URL = "wss://zonestream.openintel.nl/ws/{topic}"
+    BATCH_MAX = 1000
     MAX_CALLBACK_WORKERS = 4
-    STOP_TIMEOUT_SEC = 10.0
-    TOPIC_TO_SCHEMA = {
-        "newly_registered_fqdn": {
-            "msg_timestamp":    float,
-            "fqdn":             str,
-            "cert_index":       int,
-            "ct_name":          str,
-            "timestamp":        int,
-        },
-        "newly_registered_domain": {
-            "msg_timestamp":    float,
-            "domain":           str,
-            "cert_index":       int,
-            "ct_name":          str,
-            "timestamp":        int,
-        },
-        "confirmed_newly_registered_domain": {
-            "msg_timestamp":    float,
-            "domain":           str,
-            "cert_index":       int,
-            "ct_name":          str,
-            "timestamp":        int,
-            "confidence":       int,
-        },
-    }
-    TOPIC_TO_CONSTRAINTS = {
-        "newly_registered_fqdn": ["PRIMARY KEY (msg_timestamp, fqdn)"],
-        "newly_registered_domain": ["PRIMARY KEY (msg_timestamp, domain)"],
-        "confirmed_newly_registered_domain": [
-            "PRIMARY KEY (msg_timestamp, domain)"
-        ],
-    }
-    TOPIC_TO_INDICES = {
-        "newly_registered_fqdn": [["fqdn"], ["fqdn", "msg_timestamp"]],
-        "newly_registered_domain": [["domain"]],
-        "confirmed_newly_registered_domain": [["domain"]],
+    # WebSocket config
+    WS_RECONNECT_INTERVAL_SEC = 5
+    # Retry config
+    RETRY_MIN_SEC = 5.0
+    RETRY_MAX_SEC = 120.0
+    RETRY_MULTIPLIER = 1.5
+
+    # Topic to model mapping
+    TOPIC_TO_MODEL = {
+        "newly_registered_fqdn": NewlyRegisteredFqdn,
+        "newly_registered_domain": NewlyRegisteredDomain,
+        "confirmed_newly_registered_domain": ConfirmedNewlyRegisteredDomain,
     }
 
     def __init__(
@@ -304,287 +164,333 @@ class OpenIntelZoneStreamUtil:
         # Sanitize topics
         if not topics:
             raise ValueError("At least one topic must be specified")
-        invalid_topics = set(topics) - set(self.TOPIC_TO_SCHEMA.keys())
+        invalid_topics = set(topics) - set(self.TOPIC_TO_MODEL.keys())
         if invalid_topics:
             raise ValueError(f"Invalid topics: {invalid_topics}")
         self.topics = topics
 
-        # Concurrency
-        self._stop_event = Event()
-        self._receiver_thread: Optional[Thread] = None
-        self._atexit_registered = False
-        self._async_helper = AsyncHelper()
-        self._child_stopped = Event()
-
-        # IPC/process
-        self._ctx = mp.get_context("spawn")
-        self._cmd_queue: Optional[mp.Queue] = None   # parent -> child
-        self._data_queue: Optional[mp.Queue] = None  # child -> parent
-        self._proc: Optional[mp.Process] = None
-        self._running = False
-
         # Callback
         self._callback = callback
-        self._cb_pool = ThreadPoolExecutor(
-            max_workers=self.MAX_CALLBACK_WORKERS,
-            thread_name_prefix=f"{self.__class__.__name__}-cb"
-        ) if callback is not None else None
+        self._cb_pool: Optional[ThreadPoolExecutor] = None
 
-        # Database
-        self.db_path = self.io_helper.raw / "openintel_zone_stream.sqlite"
-        self.db: Optional[SqliteDatabase] = SqliteDatabase(
-            self.db_path,
+        # Batching
+        self.send_q = deque(maxlen=10 * self.BATCH_MAX)
+        self.batcher_wake = Event()
+        self.running = Event()
+
+        # WebSockets
+        self.ws_map: dict[str, WebSocketApp] = {}
+
+        # Threads
+        self.batcher_thr: Optional[Thread] = None
+        self.ws_threads: dict[str, Thread] = {}
+        self._atexit_registered = False
+
+        # Database setup
+        db_path = self.io_helper.raw / "openintel_zs.duckdb"
+        self.db = DuckDbStore(
+            db_path=str(db_path),
             log_helper=self.io_helper.log_helper,
-            offload_to_worker=True,
-            write_buffering=True,
         )
-        self.topic_tables: Optional[dict[str, SqliteTable]] = {
-            topic: self.db.register_table(
-                topic,
-                schema=self.TOPIC_TO_SCHEMA[topic],
-                table_constraints=self.TOPIC_TO_CONSTRAINTS[topic],
-                indices=self.TOPIC_TO_INDICES[topic],
-            ) for topic in self.topics
+        self.table_configs = {
+            topic: TableConfig(
+                model=self.TOPIC_TO_MODEL[topic],
+                mode=WriteMode.APPEND,
+            )
+            for topic in self.topics
         }
+        self.writer: Optional[BufferedWriter] = None
 
-    @staticmethod
-    def _child_entry(
-        topics: list[str],
-        data_q: mp.Queue,
-        cmd_q: mp.Queue,
-        logging_config: Optional[LogConfig] = None,
+    def _on_message_factory(self, topic):
+        def _on_message(ws, message: str):
+            try:
+                msg = json.loads(message)
+            except Exception as e:
+                self.io_helper.logger.error(
+                    f"[{topic}] JSON decode error: {e}"
+                )
+                return
+
+            msg["msg_timestamp"] = time.time()
+
+            # Add to batch queue and wake batcher
+            self.send_q.append((topic, msg))
+            self.batcher_wake.set()
+
+        return _on_message
+
+    def _on_error_factory(self, topic):
+        def _on_error(ws, error):
+            self.io_helper.logger.error(f"[{topic}] WebSocket error: {error}")
+        return _on_error
+
+    def _on_close_factory(self, topic):
+        def _on_close(ws, close_status_code, close_msg):
+            self.io_helper.logger.info(
+                f"[{topic}] WebSocket closed: status={close_status_code}, msg={close_msg}"
+            )
+        return _on_close
+
+    def _on_open_factory(self, topic):
+        def _on_open(ws):
+            self.io_helper.logger.info(f"[{topic}] WebSocket connected")
+        return _on_open
+
+    def _pre_retry_websocket(
+        self,
+        retry_state: tenacity.RetryCallState,
+        topic: str
     ):
-        # Ignore SIGINT in child
-        import signal
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        attempt = retry_state.attempt_number
+        exception = retry_state.outcome.exception()
 
-        OpenIntelZoneStreamWorker(
-            topics,
-            data_q,
-            cmd_q,
-            logging_config=logging_config,
-        ).run()
+        self.io_helper.logger.warning(
+            f"[{topic}] WebSocket failed (attempt {attempt}): {exception}"
+        )
 
-    def start(self):
-        """
-        Start the Zone Stream listener.
-        """
+        # Clean up this websocket
+        if topic in self.ws_map:
+            try:
+                self.ws_map[topic].close()
+            except Exception:
+                pass
+            del self.ws_map[topic]
 
-        if self._running:
-            self.io_helper.logger.warning("Already running; start() ignored.")
+        wait_time = retry_state.next_action.sleep
+        self.io_helper.logger.info(
+            f"[{topic}] Retrying in {wait_time:.1f} seconds..."
+        )
+
+    def _websocket_worker(self, topic: str):
+        retry_decorator = tenacity.retry(
+            # Retry forever if still running
+            retry=tenacity.retry_if_exception(
+                lambda e: self.running.is_set()
+            ),
+            # Exponential backoff
+            wait=tenacity.wait_exponential(
+                multiplier=self.RETRY_MULTIPLIER,
+                min=self.RETRY_MIN_SEC,
+                max=self.RETRY_MAX_SEC,
+            ),
+            # Log and clean up before retrying
+            before_sleep=lambda rs: self._pre_retry_websocket(rs, topic),
+        )
+
+        @retry_decorator
+        def _inner():
+            # Create websocket
+            ws = WebSocketApp(
+                self.WS_URL.format(topic=topic),
+                on_message=self._on_message_factory(topic),
+                on_error=self._on_error_factory(topic),
+                on_close=self._on_close_factory(topic),
+                on_open=self._on_open_factory(topic),
+            )
+
+            # Store in map for cleanup
+            self.ws_map[topic] = ws
+
+            self.io_helper.logger.info(f"[{topic}] Starting WebSocket...")
+
+            # Run until closed or error
+            ws.run_forever(reconnect=self.WS_RECONNECT_INTERVAL_SEC)
+
+            # If run_forever exits cleanly while still running, something is wrong
+            if self.running.is_set():
+                raise RuntimeError(
+                    f"WebSocket for {topic} exited unexpectedly"
+                )
+
+        _inner()
+
+    def _batcher_loop(self):
+        while self.running.is_set() or self.send_q:
+            if not self.send_q:
+                # Wait for messages
+                self.batcher_wake.wait(timeout=0.5)
+                self.batcher_wake.clear()
+                continue
+
+            # Batch messages by topic
+            topic_map = {}
+            total = 0
+            while self.send_q and total < self.BATCH_MAX:
+                topic, msg = self.send_q.popleft()
+                topic_map.setdefault(topic, []).append(msg)
+                total += 1
+
+            # Buffer for writing and dispatch callback
+            for topic, batch in topic_map.items():
+                try:
+                    self.writer.add_rows(topic, batch)
+                except Exception as e:
+                    self.io_helper.logger.error(
+                        f"Failed to add rows for {topic}: {e}"
+                    )
+
+                # Dispatch callback
+                if self._callback:
+                    self._dispatch_cb(topic, batch)
+
+    def _dispatch_cb(self, topic: str, batch: list[dict]) -> None:
+        if not batch:
             return
 
-        self.io_helper.logger.info("Starting Zone Stream listener")
-        self._stop_event.clear()
-        self._child_stopped.clear()
+        def _run():
+            try:
+                self._callback(topic, batch)
+            except Exception as e:
+                self.io_helper.logger.error(f"Callback error: {e}")
 
-        # Queues
-        self._data_queue = self._ctx.Queue()
-        self._cmd_queue = self._ctx.Queue()
+        self._cb_pool.submit(_run)
 
-        # Child process
-        self.io_helper.logger.info("Starting child process")
-        self._proc = self._ctx.Process(
-            target=OpenIntelZoneStreamUtil._child_entry,
-            name=f"{OpenIntelZoneStreamUtil.__name__}-child",
-            args=(
-                self.topics,
-                self._data_queue,
-                self._cmd_queue,
-                self.io_helper.get_worker_logging_config(),
-            ),
-        )
-        self._proc.start()
+    def start(self):
+        """Start the WebSocket listeners in individual threads"""
 
-        # Receiver: drains queue into parent buffers
-        self.io_helper.logger.info("Starting receiver thread")
-        self._receiver_thread = Thread(
-            target=self._recv_loop,
-            name=f"{OpenIntelZoneStreamUtil.__name__}-receiver",
+        if self.running.is_set():
+            self.io_helper.logger.warning("Already running; start() ignored.")
+            return
+        self.running.set()
+
+        self.send_q.clear()
+        self.batcher_wake.clear()
+
+        if self.writer is None:
+            self.writer = BufferedWriter(
+                backend=DuckDbBackend(store=self.db),
+                table_configs=self.table_configs,
+                time_thresh_sec=300.0,
+                log_helper=self.io_helper.log_helper,
+            )
+
+        if self._callback is not None and self._cb_pool is None:
+            self._cb_pool = ThreadPoolExecutor(
+                max_workers=self.MAX_CALLBACK_WORKERS,
+                thread_name_prefix="zonestream-cb"
+            )
+
+        # Start batcher thread
+        self.batcher_thr = Thread(
+            target=self._batcher_loop,
+            name="zonestream-batcher",
             daemon=True,
         )
-        self._receiver_thread.start()
+        self.batcher_thr.start()
 
+        # Start websocket threads
+        for topic in self.topics:
+            ws_thread = Thread(
+                target=self._websocket_worker,
+                args=(topic,),
+                name=f"zonestream-ws-{topic}",
+                daemon=True,
+            )
+            ws_thread.start()
+            self.ws_threads[topic] = ws_thread
+
+        # Register atexit handler
         if not self._atexit_registered:
             atexit.register(self._atexit_cleanup)
             self._atexit_registered = True
-
-        self._running = True
 
         self.io_helper.logger.info(
             f"Started Zone Stream listener for topics: {self.topics}"
         )
 
     def stop(self):
-        """
-        Stop the Zone Stream listener and flush all caches to the database.
-        """
+        """Stop WebSockets, flush data, and clean up"""
 
-        if not self._running:
+        if not self.running.is_set():
             return
-        self._running = False
 
         self.io_helper.logger.info("Stopping Zone Stream listener")
 
-        # Ask child to stop
-        try:
-            if self._cmd_queue:
-                self._async_helper.mpq_put_sync(
-                    self._cmd_queue,
-                    IpcMsg.notify(
-                        OpenIntelZoneStreamWorker.SERVICE,
-                        ZoneStreamMethod.STOP
-                    ),
-                    timeout=0.5
+        # Signal threads to exit
+        self.running.clear()
+        self.batcher_wake.set()
+
+        # Close all websockets (causes run_forever() to exit)
+        self.io_helper.logger.info("Closing WebSockets...")
+        for topic, ws in list(self.ws_map.items()):
+            try:
+                ws.close()
+            except Exception as e:
+                self.io_helper.logger.warning(
+                    f"[{topic}] Error closing websocket: {e}"
                 )
-        except Exception as exc:
-            self.io_helper.logger.warning(
-                f"Failed to signal child process to stop: {exc}"
-            )
+        self.ws_map.clear()
 
-        if not self._child_stopped.wait(timeout=self.STOP_TIMEOUT_SEC):
-            self.io_helper.logger.warning(
-                "Timed out waiting for child process to stop"
-            )
+        # Join websocket threads
+        for topic, ws_thread in list(self.ws_threads.items()):
+            if ws_thread.is_alive():
+                ws_thread.join(timeout=5.0)
+                if ws_thread.is_alive():
+                    self.io_helper.logger.warning(
+                        f"[{topic}] WebSocket thread did not stop in time"
+                    )
+        self.ws_threads.clear()
 
-        self._stop_event.set()  # Signal receiver to stop
+        # Join batcher thread
+        if self.batcher_thr and self.batcher_thr.is_alive():
+            self.batcher_thr.join(timeout=5.0)
+            if self.batcher_thr.is_alive():
+                self.io_helper.logger.warning(
+                    "Batcher thread did not stop in time"
+                )
+        self.batcher_thr = None
 
-        # Join receiver thread
-        self.io_helper.logger.info("Stopping receiver thread")
-        if self._receiver_thread and self._receiver_thread.is_alive():
-            self._receiver_thread.join(timeout=5.0)
-        self._receiver_thread = None
+        # Flush and close writer
+        if self.writer is not None:
+            try:
+                self.io_helper.logger.info("Flushing BufferedWriter...")
+                self.writer.close()
+            except Exception as e:
+                self.io_helper.logger.error(
+                    f"Error closing BufferedWriter: {e}")
+            self.writer = None
 
-        # Shut down callback pool
-        try:
-            if self._cb_pool is not None:
+        # We keep DuckDb open for user queries.
+        # Use close() method for explicit cleanup if needed.
+
+        # Shutdown callback pool
+        if self._cb_pool is not None:
+            try:
                 self.io_helper.logger.info(
                     "Shutting down callback thread pool"
                 )
-                self._cb_pool.shutdown(wait=True)
-                self._cb_pool = None
-        except Exception:
-            pass
-
-        # Join child
-        self.io_helper.logger.info("Waiting for child process to stop")
-        if self._proc is not None:
-            self._proc.join(timeout=self.STOP_TIMEOUT_SEC)
-            if self._proc.is_alive():
-                self.io_helper.logger.warning(
-                    "Child unresponsive; terminating."
+                self._cb_pool.shutdown(wait=True, cancel_futures=True)
+            except Exception as e:
+                self.io_helper.logger.error(
+                    f"Error shutting down callback pool: {e}"
                 )
-                self._proc.terminate()
-                self._proc.join(timeout=5.0)
-        self._proc = None
+            self._cb_pool = None
 
-        # Close DB
-        try:
-            if self.db is not None:
-                self.io_helper.logger.info("Closing database")
+        self.io_helper.logger.info("OpenIntelZoneStreamUtil stopped")
+
+    def close(self):
+        """Explicitly close all resources including database"""
+
+        # Stop websockets if running
+        self.stop()
+
+        # Close database connection
+        if self.db is not None:
+            try:
                 self.db.close()
-        except Exception:
-            pass
-        self.db = None
-        self.topic_tables = None
-        self._cmd_queue = None
-        self._data_queue = None
-
-        self.io_helper.logger.info(
-            "Stopped Zone Stream listener and flushed caches to database"
-        )
+            except Exception as e:
+                self.io_helper.logger.error(f"Error closing DuckDbStore: {e}")
+            self.db = None
 
     def __enter__(self):
         self.start()
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        self.stop()
+        self.close()
 
     def _atexit_cleanup(self):
         try:
-            self.stop()
+            self.close()
         except Exception:
             pass
-
-    def _dispatch_cb(self, topic: str, batch: list[dict]) -> None:
-        if not self._callback or not self._cb_pool or not batch:
-            return
-
-        def _run(cb=self._callback, t=topic, b=batch):
-            try:
-                cb(t, b)
-            except Exception as e:
-                self.io_helper.logger.error(f"Callback error: {e}")
-
-        self._cb_pool.submit(_run)
-
-    def _recv_loop(self):
-        if self._data_queue is None:
-            return
-
-        while not self._stop_event.is_set():
-            try:
-                msg = self._async_helper.mpq_get_sync(
-                    self._data_queue,
-                    timeout=0.5,
-                )
-            except Exception:
-                continue
-
-            if not isinstance(msg, IpcMsg):
-                self.io_helper.logger.warning(f"Invalid IPC message: {msg}")
-                continue
-
-            if msg.is_status:
-                st = msg.status_code
-                self.io_helper.logger.info(
-                    f"Child status: {st.value if st else st}"
-                )
-                if st == IpcStatusCode.STOPPED:
-                    self._child_stopped.set()
-                    self._stop_event.set()
-                    break  # Stop since child stopped
-                continue
-
-            if msg.service != OpenIntelZoneStreamWorker.SERVICE:
-                self.io_helper.logger.warning(
-                    f"Message for unknown service: {msg.service}"
-                )
-                continue
-
-            if msg.is_notify:
-                if ZoneStreamMethod.get_method(msg) == ZoneStreamMethod.BATCH:
-                    topic_map = (msg.kwargs or {}).get("topic_map", {})
-                    for topic, batch in topic_map.items():
-                        if not batch:
-                            continue
-
-                        df = pd.DataFrame(batch)
-
-                        # Missing columns -> NA
-                        for col in self.TOPIC_TO_SCHEMA[topic].keys():
-                            if col not in df.columns:
-                                df[col] = pd.NA
-
-                        # Sometimes integers are sent as raw bytes, fix them here
-                        # (assume little-endian 64-bit)
-                        for col, typ in self.TOPIC_TO_SCHEMA[topic].items():
-                            if typ is int and col in df.columns:
-                                mask_bytes = df[col].apply(
-                                    lambda v: isinstance(v, bytes)
-                                )
-                                if mask_bytes.any():
-                                    df.loc[mask_bytes, col] = df.loc[mask_bytes, col].apply(
-                                        lambda b: int.from_bytes(b, "little")
-                                    )
-                                df[col] = pd.to_numeric(
-                                    df[col], errors="coerce"
-                                ).astype("Int64")
-
-                        # Reorder
-                        df = df[list(self.TOPIC_TO_SCHEMA[topic].keys())]
-                        self.topic_tables[topic].insert_df(df)
-
-                        # Dispatch callback if any
-                        self._dispatch_cb(topic, batch)
