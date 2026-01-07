@@ -1,7 +1,24 @@
-from .is_vpn import (
+import warnings
+
+warnings.warn(
+    "tmautils.app is deprecated and will be removed in a future release. "
+    "Use tmautils.enrich_ip instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
+
+from tmautils.enrich_ip import (
     VpnIpAz0,
     ListsVpnX4BNet,
     IpInfoPrivacyUtil,
+    IpInfoCarrierUtil,
+    ChromePrefetchUtil,
 )
-from .is_carrier import IpInfoCarrierUtil
-from .is_chrome_prefetch_proxy import ChromePrefetchUtil
+
+__all__ = [
+    'VpnIpAz0',
+    'ListsVpnX4BNet',
+    'IpInfoPrivacyUtil',
+    'IpInfoCarrierUtil',
+    'ChromePrefetchUtil',
+]
