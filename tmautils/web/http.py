@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, AsyncIterator, Optional
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -60,29 +60,47 @@ class _WaitRetryAfterOrRandomExp:
 
 
 @asynccontextmanager
-async def aget_with_retry(
+async def arequest_with_retry(
     session: aiohttp.ClientSession,
+    method: str,
     url: str,
     *,
+    data: Any = None,
+    json: Any = None,
     attempt_timeout: float = 10.0,
     max_attempts: int = 3,
-    retry_statuses: frozenset[int] = frozenset({429, 503}),
+    retry_statuses: Optional[frozenset[int]] = None,
     retry_multiplier: float = 0.5,
     retry_max_wait: float = 30.0,
     respect_retry_after: bool = True,
     max_retry_after: float = 60.0,
     log_helper: Optional[LogHelper] = None,
     **request_kwargs,
-):
+) -> AsyncIterator[aiohttp.ClientResponse]:
     """
-    Asynchronous HTTP GET with retry mechanism.
+    Asynchronous HTTP request with retry mechanism.
 
     Args:
         session:
             aiohttp ClientSession to use for requests.
 
+        method:
+            HTTP method (e.g., "GET", "POST", "HEAD", "PUT", "PATCH", "DELETE").
+            Case-insensitive.
+
         url:
-            URL to send the GET request to.
+            URL to send the request to.
+
+        data:
+            Request body data.
+            Forwarded to aiohttp.ClientSession.request().
+            See aiohttp documentation for supported types (bytes, str, FormData, etc.).
+            Cannot be used together with json parameter.
+
+        json:
+            JSON-serializable data to send in request body.
+            Forwarded to aiohttp.ClientSession.request().
+            Cannot be used together with data parameter.
 
         attempt_timeout:
             Timeout for each individual attempt in seconds.
@@ -94,7 +112,12 @@ async def aget_with_retry(
 
         retry_statuses:
             Set of HTTP status codes that should trigger a retry.
-            Default is {429, 503}.
+            If None (default), uses method-specific defaults:
+            - Safe methods (GET, HEAD, OPTIONS, TRACE): {429, 500, 502, 503, 504}
+            - Unsafe methods (POST, PUT, PATCH, DELETE): {429, 503}
+
+            Unsafe methods default to conservative retry due to idempotency concerns.
+            Override with custom frozenset if your endpoint is idempotent.
 
         retry_multiplier:
             Multiplier for exponential backoff calculation.
@@ -116,19 +139,64 @@ async def aget_with_retry(
             Optional LogHelper for logging.
 
         **request_kwargs:
-            Additional keyword arguments to pass to `aiohttp.ClientSession.get()`.
+            Additional keyword arguments to pass to `aiohttp.ClientSession.request()`.
 
     Yields:
         aiohttp.ClientResponse:
             The HTTP response object.
 
     Raises:
+        ValueError:
+            If both data and json parameters are specified.
+
         aiohttp.ClientError:
             If all retry attempts fail.
 
         asyncio.TimeoutError:
             If a timeout occurs during the request.
+
+    Examples:
+        GET request:
+        ```python
+        async with arequest_with_retry(session, "GET", url) as resp:
+            data = await resp.json()
+        ```
+
+        HEAD request:
+        ```python
+        async with arequest_with_retry(session, "HEAD", url) as resp:
+            content_length = resp.headers.get("Content-Length")
+        ```
+
+        POST request with JSON:
+        ```python
+        async with arequest_with_retry(
+            session, "POST", url, json={"key": "value"}
+        ) as resp:
+            result = await resp.json()
+        ```
+
+        POST request with data:
+        ```python
+        async with arequest_with_retry(
+            session, "POST", url, data=b"raw bytes"
+        ) as resp:
+            result = await resp.text()
+        ```
     """
+    # Validate parameters
+    if data is not None and json is not None:
+        raise ValueError("Cannot specify both 'data' and 'json' parameters")
+
+    # Set method-specific default retry statuses
+    method = method.upper()
+    if retry_statuses is None:
+        if method in {"GET", "HEAD", "OPTIONS", "TRACE"}:
+            # Safe/idempotent methods - can retry more aggressively
+            retry_statuses = frozenset({429, 500, 502, 503, 504})
+        else:
+            # More conservative to avoid duplicate operations
+            retry_statuses = frozenset({429, 503})
 
     logger = get_logger_from_helper(log_helper)
 
@@ -150,8 +218,11 @@ async def aget_with_retry(
         with attempt:
             try:
                 # Send HTTP Request
-                resp = await session.get(
-                    url,
+                resp = await session.request(
+                    method=method,
+                    url=url,
+                    data=data,
+                    json=json,
                     timeout=timeout,
                     **request_kwargs
                 )
@@ -169,8 +240,8 @@ async def aget_with_retry(
                             retry_after = min(retry_after, max_retry_after)
 
                     logger.info(
-                        "Retryable HTTP %s for %s (retry_after=%s)",
-                        status, url, retry_after
+                        "Retryable HTTP %s for %s %s (retry_after=%s)",
+                        status, method, url, retry_after
                     )
 
                     # Release connection before retrying
@@ -188,7 +259,7 @@ async def aget_with_retry(
                 if resp is not None:
                     resp.release()
                     resp = None
-                logger.info("GET error for %s", url, exc_info=True)
+                logger.info("%s error for %s", method, url, exc_info=True)
                 raise
 
     # Yield response to caller outside retry mechanism
@@ -200,3 +271,43 @@ async def aget_with_retry(
     finally:
         if resp is not None:
             resp.release()
+
+
+@asynccontextmanager
+async def aget_with_retry(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    attempt_timeout: float = 10.0,
+    max_attempts: int = 3,
+    retry_statuses: frozenset[int] = frozenset({429, 500, 502, 503, 504}),
+    retry_multiplier: float = 0.5,
+    retry_max_wait: float = 30.0,
+    respect_retry_after: bool = True,
+    max_retry_after: float = 60.0,
+    log_helper: Optional[LogHelper] = None,
+    **request_kwargs,
+):
+    """
+    Asynchronous HTTP GET with retry mechanism.
+
+    This function is a convenience wrapper around `arequest_with_retry()` for GET
+    requests.
+
+    Refer to `arequest_with_retry()` for detailed parameter descriptions.
+    """
+    async with arequest_with_retry(
+        session=session,
+        method="GET",
+        url=url,
+        attempt_timeout=attempt_timeout,
+        max_attempts=max_attempts,
+        retry_statuses=retry_statuses,
+        retry_multiplier=retry_multiplier,
+        retry_max_wait=retry_max_wait,
+        respect_retry_after=respect_retry_after,
+        max_retry_after=max_retry_after,
+        log_helper=log_helper,
+        **request_kwargs,
+    ) as resp:
+        yield resp

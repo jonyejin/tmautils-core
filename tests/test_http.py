@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, Mock
 from datetime import datetime, timezone, timedelta
 import aiohttp
 
-from tmautils.web import aget_with_retry
+from tmautils.web import aget_with_retry, arequest_with_retry
 from tmautils.web.http import _parse_retry_after
 
 
@@ -31,7 +31,7 @@ def test_successful_get():
     async def _test():
         mock_session = Mock()
         mock_response = MockResponse(200)
-        mock_session.get = AsyncMock(return_value=mock_response)
+        mock_session.request = AsyncMock(return_value=mock_response)
 
         async with aget_with_retry(mock_session, "http://example.com") as resp:
             assert resp.status == 200
@@ -39,7 +39,7 @@ def test_successful_get():
 
         # After context exits, response should be released
         assert mock_response.release_called
-        assert mock_session.get.call_count == 1
+        assert mock_session.request.call_count == 1
 
     _run_async(_test())
 
@@ -54,7 +54,7 @@ def test_retryable_status_429_triggers_retry():
             MockResponse(429),
             MockResponse(200),
         ]
-        mock_session.get = AsyncMock(side_effect=mock_responses)
+        mock_session.request = AsyncMock(side_effect=mock_responses)
 
         async with aget_with_retry(
             mock_session, "http://example.com", max_attempts=3
@@ -62,7 +62,7 @@ def test_retryable_status_429_triggers_retry():
             assert resp.status == 200
 
         # Should have made 3 attempts
-        assert mock_session.get.call_count == 3
+        assert mock_session.request.call_count == 3
         # First two responses should be released before retry
         assert mock_responses[0].release_called
         assert mock_responses[1].release_called
@@ -80,26 +80,27 @@ def test_retryable_status_503_triggers_retry():
             MockResponse(503),
             MockResponse(200),
         ]
-        mock_session.get = AsyncMock(side_effect=mock_responses)
+        mock_session.request = AsyncMock(side_effect=mock_responses)
 
         async with aget_with_retry(
             mock_session, "http://example.com", max_attempts=2
         ) as resp:
             assert resp.status == 200
 
-        assert mock_session.get.call_count == 2
+        assert mock_session.request.call_count == 2
         assert mock_responses[0].release_called
 
     _run_async(_test())
 
 
 def test_non_retryable_status_returned():
-    """Test non-retryable status (404, 500) doesn't trigger retry"""
-    for status in [404, 500, 403, 502]:
+    """Test non-retryable status (404, 403) doesn't trigger retry"""
+    # Note: 500 and 502 are in default retry_statuses for GET, so only test non-retryable statuses
+    for status in [404, 403, 400, 401]:
         async def _test():
             mock_session = Mock()
             mock_response = MockResponse(status)
-            mock_session.get = AsyncMock(return_value=mock_response)
+            mock_session.request = AsyncMock(return_value=mock_response)
 
             async with aget_with_retry(
                 mock_session, "http://example.com", max_attempts=3
@@ -107,7 +108,7 @@ def test_non_retryable_status_returned():
                 assert resp.status == status
 
             # Should only make 1 attempt (no retry)
-            assert mock_session.get.call_count == 1
+            assert mock_session.request.call_count == 1
             assert mock_response.release_called
 
         _run_async(_test())
@@ -118,7 +119,7 @@ def test_network_error_triggers_retry():
     async def _test():
         mock_session = Mock()
         # First call raises error, second succeeds
-        mock_session.get = AsyncMock(
+        mock_session.request = AsyncMock(
             side_effect=[
                 aiohttp.ClientError("Connection failed"),
                 MockResponse(200),
@@ -130,7 +131,7 @@ def test_network_error_triggers_retry():
         ) as resp:
             assert resp.status == 200
 
-        assert mock_session.get.call_count == 2
+        assert mock_session.request.call_count == 2
 
     _run_async(_test())
 
@@ -139,7 +140,7 @@ def test_timeout_error_triggers_retry():
     """Test timeout errors trigger retry"""
     async def _test():
         mock_session = Mock()
-        mock_session.get = AsyncMock(
+        mock_session.request = AsyncMock(
             side_effect=[
                 asyncio.TimeoutError(),
                 MockResponse(200),
@@ -151,7 +152,7 @@ def test_timeout_error_triggers_retry():
         ) as resp:
             assert resp.status == 200
 
-        assert mock_session.get.call_count == 2
+        assert mock_session.request.call_count == 2
 
     _run_async(_test())
 
@@ -165,7 +166,7 @@ def test_caller_exception_no_retry():
     async def _test():
         mock_session = Mock()
         mock_response = MockResponse(200)
-        mock_session.get = AsyncMock(return_value=mock_response)
+        mock_session.request = AsyncMock(return_value=mock_response)
 
         # Caller code raises aiohttp.ClientError while processing response
         with pytest.raises(aiohttp.ClientError, match="Caller error"):
@@ -176,7 +177,7 @@ def test_caller_exception_no_retry():
                 raise aiohttp.ClientError("Caller error")
 
         # Should only make 1 HTTP request (no retry)
-        assert mock_session.get.call_count == 1
+        assert mock_session.request.call_count == 1
         # Response should still be released
         assert mock_response.release_called
 
@@ -188,7 +189,7 @@ def test_caller_timeout_exception_no_retry():
     async def _test():
         mock_session = Mock()
         mock_response = MockResponse(200)
-        mock_session.get = AsyncMock(return_value=mock_response)
+        mock_session.request = AsyncMock(return_value=mock_response)
 
         with pytest.raises(asyncio.TimeoutError):
             async with aget_with_retry(
@@ -198,7 +199,7 @@ def test_caller_timeout_exception_no_retry():
                 raise asyncio.TimeoutError()
 
         # Should only make 1 HTTP request (no retry)
-        assert mock_session.get.call_count == 1
+        assert mock_session.request.call_count == 1
         assert mock_response.release_called
 
     _run_async(_test())
@@ -208,7 +209,7 @@ def test_max_retries_exhausted():
     """Test that max retries exhausted raises the last exception"""
     async def _test():
         mock_session = Mock()
-        mock_session.get = AsyncMock(
+        mock_session.request = AsyncMock(
             side_effect=[
                 aiohttp.ClientError("Error 1"),
                 aiohttp.ClientError("Error 2"),
@@ -222,7 +223,7 @@ def test_max_retries_exhausted():
             ) as resp:
                 pass
 
-        assert mock_session.get.call_count == 3
+        assert mock_session.request.call_count == 3
 
     _run_async(_test())
 
@@ -266,7 +267,7 @@ def test_respect_retry_after_honored():
             MockResponse(429, {"Retry-After": "0.1"}),  # Small delay for testing
             MockResponse(200),
         ]
-        mock_session.get = AsyncMock(side_effect=mock_responses)
+        mock_session.request = AsyncMock(side_effect=mock_responses)
 
         start_time = asyncio.get_event_loop().time()
         async with aget_with_retry(
@@ -292,7 +293,7 @@ def test_respect_retry_after_disabled():
             MockResponse(429, {"Retry-After": "100"}),  # Large delay
             MockResponse(200),
         ]
-        mock_session.get = AsyncMock(side_effect=mock_responses)
+        mock_session.request = AsyncMock(side_effect=mock_responses)
 
         start_time = asyncio.get_event_loop().time()
         async with aget_with_retry(
@@ -319,7 +320,7 @@ def test_max_retry_after_cap():
             MockResponse(429, {"Retry-After": "1000"}),  # Very large delay
             MockResponse(200),
         ]
-        mock_session.get = AsyncMock(side_effect=mock_responses)
+        mock_session.request = AsyncMock(side_effect=mock_responses)
 
         start_time = asyncio.get_event_loop().time()
         async with aget_with_retry(
@@ -347,7 +348,7 @@ def test_custom_retry_statuses():
             MockResponse(404),
             MockResponse(200),
         ]
-        mock_session.get = AsyncMock(side_effect=mock_responses)
+        mock_session.request = AsyncMock(side_effect=mock_responses)
 
         async with aget_with_retry(
             mock_session,
@@ -357,7 +358,7 @@ def test_custom_retry_statuses():
         ) as resp:
             assert resp.status == 200
 
-        assert mock_session.get.call_count == 2
+        assert mock_session.request.call_count == 2
 
     _run_async(_test())
 
@@ -367,7 +368,7 @@ def test_request_kwargs_passed_through():
     async def _test():
         mock_session = Mock()
         mock_response = MockResponse(200)
-        mock_session.get = AsyncMock(return_value=mock_response)
+        mock_session.request = AsyncMock(return_value=mock_response)
 
         headers = {"User-Agent": "test"}
         params = {"key": "value"}
@@ -381,7 +382,7 @@ def test_request_kwargs_passed_through():
             assert resp.status == 200
 
         # Verify kwargs were passed to session.get
-        call_kwargs = mock_session.get.call_args.kwargs
+        call_kwargs = mock_session.request.call_args.kwargs
         assert call_kwargs["headers"] == headers
         assert call_kwargs["params"] == params
 
@@ -393,7 +394,7 @@ def test_resource_cleanup_on_success():
     async def _test():
         mock_session = Mock()
         mock_response = MockResponse(200)
-        mock_session.get = AsyncMock(return_value=mock_response)
+        mock_session.request = AsyncMock(return_value=mock_response)
 
         async with aget_with_retry(mock_session, "http://example.com") as resp:
             assert not resp.release_called
@@ -409,7 +410,7 @@ def test_resource_cleanup_on_caller_exception():
     async def _test():
         mock_session = Mock()
         mock_response = MockResponse(200)
-        mock_session.get = AsyncMock(return_value=mock_response)
+        mock_session.request = AsyncMock(return_value=mock_response)
 
         with pytest.raises(ValueError):
             async with aget_with_retry(mock_session, "http://example.com") as resp:
@@ -417,6 +418,414 @@ def test_resource_cleanup_on_caller_exception():
 
         # Response should be released even though exception was raised
         assert mock_response.release_called
+
+    _run_async(_test())
+
+
+# ===== Tests for arequest_with_retry =====
+
+def test_arequest_with_retry_get_method():
+    """Test arequest_with_retry with GET method"""
+    async def _test():
+        mock_session = Mock()
+        mock_response = MockResponse(200)
+        mock_session.request = AsyncMock(return_value=mock_response)
+
+        async with arequest_with_retry(
+            mock_session, "GET", "http://example.com"
+        ) as resp:
+            assert resp.status == 200
+
+        # Verify request was called with correct method
+        call_kwargs = mock_session.request.call_args.kwargs
+        assert call_kwargs["method"] == "GET"
+        assert call_kwargs["url"] == "http://example.com"
+        assert call_kwargs.get("data") is None
+        assert call_kwargs.get("json") is None
+
+    _run_async(_test())
+
+
+def test_arequest_with_retry_post_with_json():
+    """Test arequest_with_retry POST with JSON data"""
+    async def _test():
+        mock_session = Mock()
+        mock_response = MockResponse(200)
+        mock_session.request = AsyncMock(return_value=mock_response)
+
+        json_data = {"key": "value", "number": 42}
+        async with arequest_with_retry(
+            mock_session, "POST", "http://example.com", json=json_data
+        ) as resp:
+            assert resp.status == 200
+
+        # Verify request was called with correct parameters
+        call_kwargs = mock_session.request.call_args.kwargs
+        assert call_kwargs["method"] == "POST"
+        assert call_kwargs["json"] == json_data
+        assert call_kwargs.get("data") is None
+
+    _run_async(_test())
+
+
+def test_arequest_with_retry_post_with_data():
+    """Test arequest_with_retry POST with raw data"""
+    async def _test():
+        mock_session = Mock()
+        mock_response = MockResponse(200)
+        mock_session.request = AsyncMock(return_value=mock_response)
+
+        raw_data = b"raw bytes data"
+        async with arequest_with_retry(
+            mock_session, "POST", "http://example.com", data=raw_data
+        ) as resp:
+            assert resp.status == 200
+
+        # Verify request was called with correct parameters
+        call_kwargs = mock_session.request.call_args.kwargs
+        assert call_kwargs["method"] == "POST"
+        assert call_kwargs["data"] == raw_data
+        assert call_kwargs.get("json") is None
+
+    _run_async(_test())
+
+
+def test_arequest_with_retry_data_and_json_raises_error():
+    """Test that specifying both data and json raises ValueError"""
+    async def _test():
+        mock_session = Mock()
+
+        with pytest.raises(ValueError, match="Cannot specify both 'data' and 'json'"):
+            async with arequest_with_retry(
+                mock_session,
+                "POST",
+                "http://example.com",
+                data=b"data",
+                json={"key": "value"}
+            ) as resp:
+                pass
+
+    _run_async(_test())
+
+
+def test_arequest_with_retry_head_method():
+    """Test arequest_with_retry with HEAD method"""
+    async def _test():
+        mock_session = Mock()
+        mock_response = MockResponse(200, headers={"Content-Length": "1234"})
+        mock_session.request = AsyncMock(return_value=mock_response)
+
+        async with arequest_with_retry(
+            mock_session, "HEAD", "http://example.com"
+        ) as resp:
+            assert resp.status == 200
+            assert resp.headers.get("Content-Length") == "1234"
+
+        call_kwargs = mock_session.request.call_args.kwargs
+        assert call_kwargs["method"] == "HEAD"
+
+    _run_async(_test())
+
+
+def test_arequest_with_retry_safe_methods_default_retry():
+    """Test that safe methods (GET, HEAD) use aggressive default retry statuses"""
+    for method in ["GET", "HEAD", "OPTIONS", "TRACE"]:
+        async def _test():
+            mock_session = Mock()
+            # First returns 500 (should retry), then 200
+            mock_responses = [MockResponse(500), MockResponse(200)]
+            mock_session.request = AsyncMock(side_effect=mock_responses)
+
+            async with arequest_with_retry(
+                mock_session, method, "http://example.com", max_attempts=2
+            ) as resp:
+                assert resp.status == 200
+
+            # Should have retried on 500
+            assert mock_session.request.call_count == 2
+            assert mock_responses[0].release_called
+
+        _run_async(_test())
+
+
+def test_arequest_with_retry_unsafe_methods_conservative_retry():
+    """Test that unsafe methods (POST, PUT, PATCH, DELETE) use conservative retry"""
+    for method in ["POST", "PUT", "PATCH", "DELETE"]:
+        async def _test():
+            mock_session = Mock()
+            # Returns 500 - should NOT retry for unsafe methods by default
+            mock_response = MockResponse(500)
+            mock_session.request = AsyncMock(return_value=mock_response)
+
+            async with arequest_with_retry(
+                mock_session, method, "http://example.com", max_attempts=3
+            ) as resp:
+                assert resp.status == 500
+
+            # Should NOT have retried on 500
+            assert mock_session.request.call_count == 1
+
+        _run_async(_test())
+
+
+def test_arequest_with_retry_post_retries_on_429():
+    """Test that POST retries on 429 (rate limit) by default"""
+    async def _test():
+        mock_session = Mock()
+        mock_responses = [MockResponse(429), MockResponse(200)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        async with arequest_with_retry(
+            mock_session, "POST", "http://example.com", max_attempts=2
+        ) as resp:
+            assert resp.status == 200
+
+        # Should have retried on 429
+        assert mock_session.request.call_count == 2
+
+    _run_async(_test())
+
+
+def test_arequest_with_retry_post_retries_on_503():
+    """Test that POST retries on 503 (service unavailable) by default"""
+    async def _test():
+        mock_session = Mock()
+        mock_responses = [MockResponse(503), MockResponse(200)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        async with arequest_with_retry(
+            mock_session, "POST", "http://example.com", max_attempts=2
+        ) as resp:
+            assert resp.status == 200
+
+        # Should have retried on 503
+        assert mock_session.request.call_count == 2
+
+    _run_async(_test())
+
+
+def test_arequest_with_retry_custom_retry_statuses_override():
+    """Test that custom retry_statuses override method-specific defaults"""
+    async def _test():
+        mock_session = Mock()
+        # POST with 500 and custom retry_statuses that includes 500
+        mock_responses = [MockResponse(500), MockResponse(200)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        async with arequest_with_retry(
+            mock_session,
+            "POST",
+            "http://example.com",
+            max_attempts=2,
+            retry_statuses=frozenset({429, 500, 502, 503, 504})
+        ) as resp:
+            assert resp.status == 200
+
+        # Should have retried on 500 because of custom retry_statuses
+        assert mock_session.request.call_count == 2
+
+    _run_async(_test())
+
+
+def test_arequest_with_retry_logging_includes_method():
+    """Test that logging includes the HTTP method"""
+    # This is mostly a smoke test to ensure the logging doesn't crash
+    async def _test():
+        mock_session = Mock()
+        mock_response = MockResponse(200)
+        mock_session.request = AsyncMock(return_value=mock_response)
+
+        async with arequest_with_retry(
+            mock_session, "POST", "http://example.com"
+        ) as resp:
+            assert resp.status == 200
+
+    _run_async(_test())
+
+
+# ===== Integration tests =====
+
+def test_post_retry_with_retry_after_header():
+    """Test POST request respects Retry-After header"""
+    async def _test():
+        mock_session = Mock()
+        mock_responses = [
+            MockResponse(429, {"Retry-After": "0.1"}),
+            MockResponse(200)
+        ]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        start_time = asyncio.get_event_loop().time()
+        async with arequest_with_retry(
+            mock_session,
+            "POST",
+            "http://example.com",
+            json={"test": "data"},
+            max_attempts=2,
+            retry_statuses=frozenset({429, 503})
+        ) as resp:
+            assert resp.status == 200
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        # Should have waited at least 0.1 seconds
+        assert elapsed >= 0.1
+
+    _run_async(_test())
+
+
+def test_post_exhausts_retries():
+    """Test that POST exhausts all retry attempts"""
+    async def _test():
+        mock_session = Mock()
+        mock_session.request = AsyncMock(
+            side_effect=[
+                MockResponse(429),
+                MockResponse(429),
+                MockResponse(429),
+            ]
+        )
+
+        # All attempts fail with 429, should exhaust retries
+        with pytest.raises(Exception):  # tenacity will raise after max attempts
+            async with arequest_with_retry(
+                mock_session,
+                "POST",
+                "http://example.com",
+                json={"test": "data"},
+                max_attempts=3,
+                retry_statuses=frozenset({429, 503})
+            ) as resp:
+                pass
+
+        assert mock_session.request.call_count == 3
+
+    _run_async(_test())
+
+
+def test_post_client_error_triggers_retry():
+    """Test that POST retries on ClientError"""
+    async def _test():
+        mock_session = Mock()
+        mock_session.request = AsyncMock(
+            side_effect=[
+                aiohttp.ClientError("Connection failed"),
+                MockResponse(200)
+            ]
+        )
+
+        async with arequest_with_retry(
+            mock_session,
+            "POST",
+            "http://example.com",
+            json={"test": "data"},
+            max_attempts=2,
+            retry_statuses=frozenset({429, 503})
+        ) as resp:
+            assert resp.status == 200
+
+        assert mock_session.request.call_count == 2
+
+    _run_async(_test())
+
+
+def test_post_timeout_triggers_retry():
+    """Test that POST retries on TimeoutError"""
+    async def _test():
+        mock_session = Mock()
+        mock_session.request = AsyncMock(
+            side_effect=[
+                asyncio.TimeoutError(),
+                MockResponse(200)
+            ]
+        )
+
+        async with arequest_with_retry(
+            mock_session,
+            "POST",
+            "http://example.com",
+            json={"test": "data"},
+            max_attempts=2,
+            retry_statuses=frozenset({429, 503})
+        ) as resp:
+            assert resp.status == 200
+
+        assert mock_session.request.call_count == 2
+
+    _run_async(_test())
+
+
+# ===== Edge case tests =====
+
+def test_arequest_uppercase_lowercase_method():
+    """Test that method names work in both uppercase and lowercase"""
+    for method in ["GET", "get", "Post", "HEAD"]:
+        async def _test():
+            mock_session = Mock()
+            mock_response = MockResponse(200)
+            mock_session.request = AsyncMock(return_value=mock_response)
+
+            async with arequest_with_retry(
+                mock_session, method, "http://example.com"
+            ) as resp:
+                assert resp.status == 200
+
+            # Method is normalized to uppercase internally
+            call_kwargs = mock_session.request.call_args.kwargs
+            assert call_kwargs["method"] == method.upper()
+
+        _run_async(_test())
+
+
+def test_post_resource_cleanup_on_retry():
+    """Test that response is properly released when POST retry occurs"""
+    async def _test():
+        mock_session = Mock()
+        mock_responses = [MockResponse(429), MockResponse(200)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        async with arequest_with_retry(
+            mock_session,
+            "POST",
+            "http://example.com",
+            json={"test": "data"},
+            max_attempts=2,
+            retry_statuses=frozenset({429, 503})
+        ) as resp:
+            assert resp.status == 200
+
+        # First response should be released before retry
+        assert mock_responses[0].release_called
+        # Final response released after context exit
+        assert mock_responses[1].release_called
+
+    _run_async(_test())
+
+
+def test_request_kwargs_passed_through_for_post():
+    """Test that additional kwargs are passed through for POST requests"""
+    async def _test():
+        mock_session = Mock()
+        mock_response = MockResponse(200)
+        mock_session.request = AsyncMock(return_value=mock_response)
+
+        headers = {"Authorization": "Bearer token"}
+        params = {"key": "value"}
+
+        async with arequest_with_retry(
+            mock_session,
+            "POST",
+            "http://example.com",
+            json={"test": "data"},
+            retry_statuses=frozenset({429, 503}),
+            headers=headers,
+            params=params
+        ) as resp:
+            assert resp.status == 200
+
+        # Verify kwargs were passed to session.request
+        call_kwargs = mock_session.request.call_args.kwargs
+        assert call_kwargs["headers"] == headers
+        assert call_kwargs["params"] == params
 
     _run_async(_test())
 
