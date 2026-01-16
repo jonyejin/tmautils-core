@@ -11,15 +11,13 @@ import cryptography.x509 as x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
-import certifi
 
-from tmautils.security.cert import (
+from tmautils.pki import (
     get_cert,
+    get_cert_sync,
     get_cert_chain,
-    get_cert_async,
-    get_cert_chain_async,
+    get_cert_chain_sync,
 )
-from tmautils.common import IPAddress
 
 
 # --------------------------- Mock Classes ---------------------------
@@ -170,10 +168,10 @@ def test_cert_chain():
     }
 
 
-# --------------------------- Tests: get_cert ---------------------------
+# --------------------------- Tests: get_cert_sync ---------------------------
 
-def test_get_cert_basic_hostname(test_cert_single):
-    """Test basic get_cert call with hostname"""
+def test_get_cert_sync_basic_hostname(test_cert_single):
+    """Test basic get_cert_sync call with hostname"""
     cert_der = test_cert_single["der"]
     expected_cert = test_cert_single["cert"]
 
@@ -188,7 +186,7 @@ def test_get_cert_basic_hostname(test_cert_single):
         mock_ctx.wrap_socket.return_value = mock_sslsock
         mock_create_ctx.return_value = mock_ctx
 
-        result = get_cert("example.com")
+        result = get_cert_sync("example.com")
 
         # Verify connection parameters
         mock_create_conn.assert_called_once_with(
@@ -207,8 +205,8 @@ def test_get_cert_basic_hostname(test_cert_single):
         _assert_cert_equals(result, expected_cert)
 
 
-def test_get_cert_with_custom_sni(test_cert_single):
-    """Test get_cert with custom SNI (e.g., IP address + SNI hostname)"""
+def test_get_cert_sync_with_custom_sni(test_cert_single):
+    """Test get_cert_sync with custom SNI (e.g., IP address + SNI hostname)"""
     cert_der = test_cert_single["der"]
 
     mock_socket = Mock()
@@ -222,7 +220,7 @@ def test_get_cert_with_custom_sni(test_cert_single):
         mock_ctx.wrap_socket.return_value = mock_sslsock
         mock_create_ctx.return_value = mock_ctx
 
-        result = get_cert("192.0.2.1", sni="example.com")
+        result = get_cert_sync("192.0.2.1", sni="example.com")
 
         # Verify connection to IP
         mock_create_conn.assert_called_once_with(
@@ -239,8 +237,8 @@ def test_get_cert_with_custom_sni(test_cert_single):
         assert isinstance(result, x509.Certificate)
 
 
-def test_get_cert_verify_false(test_cert_single):
-    """Test get_cert with verification disabled"""
+def test_get_cert_sync_verify_false(test_cert_single):
+    """Test get_cert_sync with verification disabled"""
     cert_der = test_cert_single["der"]
 
     mock_socket = Mock()
@@ -254,7 +252,7 @@ def test_get_cert_verify_false(test_cert_single):
         mock_ctx.wrap_socket.return_value = mock_sslsock
         mock_ssl_context_cls.return_value = mock_ctx
 
-        result = get_cert("example.com", verify=False)
+        result = get_cert_sync("example.com", verify=False)
 
         # Verify SSL context created with CERT_NONE
         mock_ssl_context_cls.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
@@ -264,19 +262,19 @@ def test_get_cert_verify_false(test_cert_single):
         assert isinstance(result, x509.Certificate)
 
 
-def test_get_cert_connection_timeout():
-    """Test get_cert handles connection timeout"""
+def test_get_cert_sync_connection_timeout():
+    """Test get_cert_sync handles connection timeout"""
     with patch('socket.create_connection') as mock_create_conn:
         mock_create_conn.side_effect = socket.timeout("Connection timed out")
 
         with pytest.raises(socket.timeout):
-            get_cert("example.com")
+            get_cert_sync("example.com")
 
 
-# --------------------------- Tests: get_cert_chain ---------------------------
+# --------------------------- Tests: get_cert_chain_sync ---------------------------
 
-def test_get_cert_chain_basic(test_cert_chain):
-    """Test basic get_cert_chain call with 3-cert chain"""
+def test_get_cert_chain_sync_basic(test_cert_chain):
+    """Test basic get_cert_chain_sync call with 3-cert chain"""
     chain_ders = test_cert_chain["chain_ders"]
 
     mock_socket = Mock()
@@ -290,7 +288,7 @@ def test_get_cert_chain_basic(test_cert_chain):
         mock_ctx.wrap_socket.return_value = mock_sslsock
         mock_create_ctx.return_value = mock_ctx
 
-        result = get_cert_chain("example.com")
+        result = get_cert_chain_sync("example.com")
 
         # Verify returns list of certificates
         assert isinstance(result, list)
@@ -298,10 +296,10 @@ def test_get_cert_chain_basic(test_cert_chain):
         assert all(isinstance(cert, x509.Certificate) for cert in result)
 
 
-# --------------------------- Tests: get_cert_async ---------------------------
+# --------------------------- Tests: get_cert ---------------------------
 
-def test_get_cert_async_basic(test_cert_single):
-    """Test basic get_cert_async call"""
+def test_get_cert_basic(test_cert_single):
+    """Test basic get_cert call"""
     cert_der = test_cert_single["der"]
     expected_cert = test_cert_single["cert"]
 
@@ -312,7 +310,7 @@ def test_get_cert_async_basic(test_cert_single):
         with patch('asyncio.open_connection', new_callable=AsyncMock) as mock_open_conn:
             mock_open_conn.return_value = (None, mock_writer)
 
-            result = await get_cert_async("example.com")
+            result = await get_cert("example.com")
 
             # Verify connection parameters
             mock_open_conn.assert_called_once()
@@ -330,8 +328,8 @@ def test_get_cert_async_basic(test_cert_single):
     assert isinstance(result, x509.Certificate)
 
 
-def test_get_cert_async_ssl_object_none_raises(test_cert_single):
-    """Test get_cert_async raises RuntimeError when SSL object is None"""
+def test_get_cert_ssl_object_none_raises(test_cert_single):
+    """Test get_cert raises RuntimeError when SSL object is None"""
 
     async def _test():
         # Mock writer that returns None for ssl_object
@@ -341,13 +339,13 @@ def test_get_cert_async_ssl_object_none_raises(test_cert_single):
             mock_open_conn.return_value = (None, mock_writer)
 
             with pytest.raises(RuntimeError, match="TLS handshake did not complete"):
-                await get_cert_async("example.com")
+                await get_cert("example.com")
 
     _run_async(_test())
 
 
-def test_get_cert_async_timeout_error_message():
-    """Test that get_cert_async converts asyncio.TimeoutError with proper message"""
+def test_get_cert_timeout_error_message():
+    """Test that get_cert converts asyncio.TimeoutError with proper message"""
 
     async def _test():
         with patch('asyncio.open_connection', new_callable=AsyncMock) as mock_open_conn:
@@ -355,15 +353,15 @@ def test_get_cert_async_timeout_error_message():
             mock_open_conn.side_effect = asyncio.TimeoutError()
 
             with pytest.raises(TimeoutError, match="get_cert.*timed out"):
-                await get_cert_async("example.com", port=8443)
+                await get_cert("example.com", port=8443)
 
     _run_async(_test())
 
 
-# --------------------------- Tests: get_cert_chain_async ---------------------------
+# --------------------------- Tests: get_cert_chain ---------------------------
 
-def test_get_cert_chain_async_basic(test_cert_chain):
-    """Test basic get_cert_chain_async call"""
+def test_get_cert_chain_basic(test_cert_chain):
+    """Test basic get_cert_chain call"""
     chain_ders = test_cert_chain["chain_ders"]
 
     async def _test():
@@ -373,7 +371,7 @@ def test_get_cert_chain_async_basic(test_cert_chain):
         with patch('asyncio.open_connection', new_callable=AsyncMock) as mock_open_conn:
             mock_open_conn.return_value = (None, mock_writer)
 
-            result = await get_cert_chain_async("example.com")
+            result = await get_cert_chain("example.com")
 
             # Verify returns list of certificates
             assert isinstance(result, list)
@@ -395,7 +393,7 @@ def test_sync_connection_refused():
         mock_create_conn.side_effect = ConnectionRefusedError("Connection refused")
 
         with pytest.raises(ConnectionRefusedError):
-            get_cert("example.com")
+            get_cert_sync("example.com")
 
 
 def test_sync_ssl_error():
@@ -410,7 +408,7 @@ def test_sync_ssl_error():
         mock_create_ctx.return_value = mock_ctx
 
         with pytest.raises(ssl.SSLError):
-            get_cert("example.com")
+            get_cert_sync("example.com")
 
 
 def test_async_cleanup_on_exception(test_cert_single):
@@ -427,7 +425,7 @@ def test_async_cleanup_on_exception(test_cert_single):
             mock_open_conn.return_value = (None, mock_writer)
 
             with pytest.raises(RuntimeError):
-                await get_cert_async("example.com")
+                await get_cert("example.com")
 
             # Verify cleanup still happened
             assert mock_writer._closed is True
@@ -458,7 +456,7 @@ def test_host_type_variations(host, test_cert_single):
         mock_ctx.wrap_socket.return_value = mock_sslsock
         mock_create_ctx.return_value = mock_ctx
 
-        result = get_cert(host)
+        result = get_cert_sync(host)
 
         # Verify host is converted to string for connection
         call_args = mock_create_conn.call_args[0]

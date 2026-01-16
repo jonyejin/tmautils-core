@@ -8,11 +8,15 @@ warnings.warn(
 )
 
 from tmautils.pki import (
-    get_cert, get_cert_async,
-    get_cert_chain, get_cert_chain_async,
+    get_cert,
+    get_cert_sync,
+    get_cert_chain,
+    get_cert_chain_sync,
 )
 
 __all__ = [
-    'get_cert', 'get_cert_async',
-    'get_cert_chain', 'get_cert_chain_async',
+    'get_cert',
+    'get_cert_sync',
+    'get_cert_chain',
+    'get_cert_chain_sync',
 ]

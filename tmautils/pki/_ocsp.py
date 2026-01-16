@@ -22,7 +22,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from tmautils.common import LogHelper, get_logger_from_helper
-from tmautils.web import arequest_with_retry
+from tmautils.web import request_with_retry
 
 from .types import (
     RevocationStatus,
@@ -238,7 +238,7 @@ class OCSPHelper:
         )
 
         try:
-            async with arequest_with_retry(
+            async with request_with_retry(
                 session,
                 "POST",
                 ocsp_url,

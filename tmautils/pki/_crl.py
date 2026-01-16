@@ -21,7 +21,7 @@ from cryptography.x509.oid import ExtensionOID, CRLEntryExtensionOID
 from cryptography.hazmat.primitives import serialization
 
 from tmautils.common import LogHelper, get_logger_from_helper
-from tmautils.web import arequest_with_retry
+from tmautils.web import request_with_retry
 
 from .types import (
     RevocationStatus,
@@ -276,7 +276,7 @@ class CRLHelper:
         self._logger.info("Downloading CRL: %s", url)
 
         try:
-            async with arequest_with_retry(
+            async with request_with_retry(
                 session,
                 "GET",
                 url,
@@ -389,7 +389,7 @@ class CRLHelper:
                 "Downloading CRL signer cert: %s", signer_url
             )
             try:
-                async with arequest_with_retry(
+                async with request_with_retry(
                     session, "GET", signer_url,
                     attempt_timeout=self._request_timeout,
                     max_attempts=self._max_attempts,

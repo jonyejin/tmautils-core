@@ -10,7 +10,7 @@ import jwt
 import aiohttp
 
 from tmautils.common import IOHelper, run_coro_sync
-from tmautils.web import arequest_with_retry
+from tmautils.web import request_with_retry
 
 
 class CzdsDownloadUtil:
@@ -239,7 +239,7 @@ class CzdsDownloadUtil:
                 "password": self._password,
             }
 
-            async with arequest_with_retry(
+            async with request_with_retry(
                 session,
                 "POST",
                 self._AUTH_URL,
@@ -294,7 +294,7 @@ class CzdsDownloadUtil:
             }
 
             url = f"{self._BASE_URL}{self._LINKS_ENDPOINT}"
-            async with arequest_with_retry(
+            async with request_with_retry(
                 session,
                 "GET",
                 url,
@@ -340,7 +340,7 @@ class CzdsDownloadUtil:
                 "User-Agent": self._user_agent,
             }
 
-            async with arequest_with_retry(
+            async with request_with_retry(
                 session,
                 "HEAD",
                 download_url,
@@ -428,7 +428,7 @@ class CzdsDownloadUtil:
                 "User-Agent": self._user_agent,
             }
 
-            async with arequest_with_retry(
+            async with request_with_retry(
                 session,
                 "GET",
                 download_url,

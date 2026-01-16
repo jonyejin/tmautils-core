@@ -12,7 +12,7 @@ import asyncio
 import contextlib
 
 from tmautils.common import IPAddress, run_coro_sync, LogHelper, get_logger_from_helper
-from tmautils.web import arequest_with_retry
+from tmautils.web import request_with_retry
 
 from ._crypto import get_cache_key, parse_cert_lrucached
 from .types import ExtensionMissingError
@@ -55,7 +55,7 @@ def _get_cert_leaf_or_chain(
                 return x509.load_der_x509_certificate(der)
 
 
-def get_cert(
+def get_cert_sync(
     host: str | IPAddress,
     port: int = 443,
     *,
@@ -65,8 +65,9 @@ def get_cert(
     use_certifi: bool = True,
 ):
     """
-    Retrieve the TLS certificate from a server.
-    See `get_cert_async()` for async version.
+    Retrieve the TLS certificate from a server (sync version).
+
+    See `get_cert()` for async version with additional options.
 
     Args:
         host:
@@ -103,7 +104,7 @@ def get_cert(
     )
 
 
-def get_cert_chain(
+def get_cert_chain_sync(
     host: str | IPAddress,
     port: int = 443,
     *,
@@ -113,8 +114,9 @@ def get_cert_chain(
     use_certifi: bool = True,
 ) -> list[x509.Certificate]:
     """
-    Retrieve the TLS certificate chain from a server.
-    See `get_cert_chain_async()` for async version.
+    Retrieve the TLS certificate chain from a server (sync version).
+
+    See `get_cert_chain()` for async version with additional options.
 
     Args:
         host:
@@ -202,7 +204,7 @@ async def _get_cert_leaf_or_chain_async(
         )
 
 
-async def get_cert_async(
+async def get_cert(
     host: str | IPAddress,
     port: int = 443,
     *,
@@ -214,6 +216,8 @@ async def get_cert_async(
 ):
     """
     Asynchronously retrieve the TLS certificate from a server.
+
+    See `get_cert_sync()` for sync version.
 
     Args:
         host:
@@ -254,7 +258,7 @@ async def get_cert_async(
     )
 
 
-async def get_cert_chain_async(
+async def get_cert_chain(
     host: str | IPAddress,
     port: int = 443,
     *,
@@ -266,6 +270,8 @@ async def get_cert_chain_async(
 ) -> list[x509.Certificate]:
     """
     Asynchronously retrieve the TLS certificate chain from a server.
+
+    See `get_cert_chain_sync()` for sync version.
 
     Args:
         host:
@@ -385,7 +391,7 @@ async def fetch_issuer_cert(
         session = aiohttp.ClientSession()
 
     try:
-        async with arequest_with_retry(
+        async with request_with_retry(
             session,
             "GET",
             issuer_url,

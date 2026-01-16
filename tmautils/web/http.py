@@ -60,7 +60,7 @@ class _WaitRetryAfterOrRandomExp:
 
 
 @asynccontextmanager
-async def arequest_with_retry(
+async def request_with_retry(
     session: aiohttp.ClientSession,
     method: str,
     url: str,
@@ -158,19 +158,19 @@ async def arequest_with_retry(
     Examples:
         GET request:
         ```python
-        async with arequest_with_retry(session, "GET", url) as resp:
+        async with request_with_retry(session, "GET", url) as resp:
             data = await resp.json()
         ```
 
         HEAD request:
         ```python
-        async with arequest_with_retry(session, "HEAD", url) as resp:
+        async with request_with_retry(session, "HEAD", url) as resp:
             content_length = resp.headers.get("Content-Length")
         ```
 
         POST request with JSON:
         ```python
-        async with arequest_with_retry(
+        async with request_with_retry(
             session, "POST", url, json={"key": "value"}
         ) as resp:
             result = await resp.json()
@@ -178,7 +178,7 @@ async def arequest_with_retry(
 
         POST request with data:
         ```python
-        async with arequest_with_retry(
+        async with request_with_retry(
             session, "POST", url, data=b"raw bytes"
         ) as resp:
             result = await resp.text()
@@ -274,7 +274,7 @@ async def arequest_with_retry(
 
 
 @asynccontextmanager
-async def aget_with_retry(
+async def get_with_retry(
     session: aiohttp.ClientSession,
     url: str,
     *,
@@ -291,12 +291,12 @@ async def aget_with_retry(
     """
     Asynchronous HTTP GET with retry mechanism.
 
-    This function is a convenience wrapper around `arequest_with_retry()` for GET
+    This function is a convenience wrapper around `request_with_retry()` for GET
     requests.
 
-    Refer to `arequest_with_retry()` for detailed parameter descriptions.
+    Refer to `request_with_retry()` for detailed parameter descriptions.
     """
-    async with arequest_with_retry(
+    async with request_with_retry(
         session=session,
         method="GET",
         url=url,

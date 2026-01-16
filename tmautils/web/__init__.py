@@ -13,8 +13,8 @@ from .types import (
     OpenWpmSiteCrawlResult,
 )
 from .http import (
-    aget_with_retry,
-    arequest_with_retry,
+    request_with_retry,
+    get_with_retry,
 )
 
 __all__ = [
@@ -28,6 +28,6 @@ __all__ = [
     "UsedDnsRecord",
     "CompletedHttpRequest",
     "OpenWpmSiteCrawlResult",
-    "aget_with_retry",
-    "arequest_with_retry",
+    "request_with_retry",
+    "get_with_retry",
 ]

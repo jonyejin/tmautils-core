@@ -17,8 +17,8 @@ from tmautils.pki import (
     ExtensionMissingError,
     OCSPError,
     CRLError,
-    get_cert,
-    get_cert_chain,
+    get_cert_sync,
+    get_cert_chain_sync,
     fetch_issuer_cert,
     fetch_issuer_cert_sync,
     fetch_issuer_chain,
@@ -58,7 +58,7 @@ async def check_domains_concurrent(
     """
     async def check_one(domain: str):
         try:
-            cert = get_cert(domain)
+            cert = get_cert_sync(domain)
             result = await checker.check_cert(cert, mode=mode)
             return (domain, result, None)
         except Exception as e:
@@ -188,7 +188,7 @@ async def test_check_modes_ocsp_only(tmp_path):
     """Test OCSP_ONLY mode."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     try:
         result = await checker.check_cert(cert, mode=CheckMode.OCSP_ONLY)
@@ -203,7 +203,7 @@ async def test_check_modes_crl_only(tmp_path):
     """Test CRL_ONLY mode."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     try:
         result = await checker.check_cert(cert, mode=CheckMode.CRL_ONLY)
@@ -218,7 +218,7 @@ async def test_check_modes_fallback(tmp_path):
     """Test OCSP_FALLBACK_CRL mode."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     result = await checker.check_cert(cert, mode=CheckMode.OCSP_FALLBACK_CRL)
     assert result.status in (
@@ -232,7 +232,7 @@ async def test_check_with_explicit_issuer(tmp_path):
     """Test checking with explicitly provided issuer certificate."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    chain = get_cert_chain("google.com")
+    chain = get_cert_chain_sync("google.com")
     assert len(chain) >= 2
 
     result = await checker.check_cert(chain[0], issuer=chain[1])
@@ -247,7 +247,7 @@ async def test_chain_checking(tmp_path):
     """Test checking entire certificate chain."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    chain = get_cert_chain("google.com")
+    chain = get_cert_chain_sync("google.com")
     assert len(chain) >= 2
 
     results = await checker.check_chain(chain)
@@ -268,7 +268,7 @@ async def test_verify_signature_disabled(tmp_path):
     """Test checking without signature verification."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     result = await checker.check_cert(cert, verify_signature=False)
     assert result.status in (
@@ -281,7 +281,7 @@ async def test_ocsp_caching(tmp_path):
     """Test OCSP in-memory cache works."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     # First check
     try:
@@ -300,7 +300,7 @@ async def test_crl_disk_caching(tmp_path):
     """Test CRL disk cache works."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     try:
         # First check - downloads CRL
@@ -325,7 +325,7 @@ async def test_issuer_cert_caching(tmp_path):
     """Test issuer certificate caching."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     # Check triggers issuer fetch
     await checker.check_cert(cert)
@@ -343,7 +343,7 @@ async def test_cache_reuse_consistency(tmp_path):
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
 
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     # First check
     result1 = await checker.check_cert(cert)
@@ -368,7 +368,7 @@ async def test_crl_detects_revoked_cert(tmp_path):
     # Use known revoked domain
     for domain in REVOKED_DOMAINS:
         try:
-            cert = get_cert(domain)
+            cert = get_cert_sync(domain)
             result = await checker.check_cert(cert, mode=CheckMode.CRL_ONLY)
             print(f"  {domain} (CRL_ONLY): {result.status.value}")
             if result.status == RevocationStatus.REVOKED:
@@ -415,7 +415,7 @@ async def test_crl_cache_metadata(tmp_path):
     """Test CRL cache creates .meta files with proper timestamps."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     try:
         await checker.check_cert(cert, mode=CheckMode.CRL_ONLY)
@@ -443,7 +443,7 @@ async def test_crl_without_signature_verification(tmp_path):
     """Test CRL_ONLY mode with signature verification disabled."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     try:
         result = await checker.check_cert(cert, mode=CheckMode.CRL_ONLY, verify_signature=False)
@@ -487,7 +487,7 @@ async def test_ocsp_fallback_to_crl(tmp_path):
 
     for domain in VALID_DOMAINS[:3]:  # Test subset
         try:
-            cert = get_cert(domain)
+            cert = get_cert_sync(domain)
             result = await checker.check_cert(cert, mode=CheckMode.OCSP_FALLBACK_CRL)
             domains_tested.append(domain)
             methods_used.add(result.check_method)
@@ -504,7 +504,7 @@ async def test_crl_source_url_populated(tmp_path):
     """Test that CRL result includes source_url."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     try:
         result = await checker.check_cert(cert, mode=CheckMode.CRL_ONLY)
@@ -521,7 +521,7 @@ async def test_crl_timestamps_populated(tmp_path):
     """Test that CRL result includes this_update and next_update timestamps."""
     checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
                                 'console_level': logging.DEBUG})
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     try:
         result = await checker.check_cert(cert, mode=CheckMode.CRL_ONLY)
@@ -543,7 +543,7 @@ async def test_multiple_domains_chain_check(tmp_path):
 
     async def check_chain_for_domain(domain: str):
         try:
-            chain = get_cert_chain(domain)
+            chain = get_cert_chain_sync(domain)
             results = await checker.check_chain(chain)
             return (domain, results, None)
         except Exception as e:
@@ -568,7 +568,7 @@ async def test_multiple_domains_chain_check(tmp_path):
 @pytest.mark.asyncio
 async def test_fetch_issuer_cert_async(tmp_path):
     """Test fetch_issuer_cert fetches issuer via AIA."""
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
     cache_dir = tmp_path / "issuer_cache"
     cache_dir.mkdir()
 
@@ -586,7 +586,7 @@ async def test_fetch_issuer_cert_async(tmp_path):
 
 def test_fetch_issuer_cert_sync(tmp_path):
     """Test sync wrapper for fetch_issuer_cert."""
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
     cache_dir = tmp_path / "issuer_cache"
     cache_dir.mkdir()
 
@@ -600,7 +600,7 @@ def test_fetch_issuer_cert_sync(tmp_path):
 @pytest.mark.asyncio
 async def test_fetch_issuer_cert_caches_result(tmp_path):
     """Test that fetch_issuer_cert uses cache on second call."""
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
     cache_dir = tmp_path / "issuer_cache"
     cache_dir.mkdir()
 
@@ -625,7 +625,7 @@ async def test_fetch_issuer_cert_caches_result(tmp_path):
 @pytest.mark.asyncio
 async def test_fetch_issuer_chain_async(tmp_path):
     """Test fetch_issuer_chain builds chain via AIA."""
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
     cache_dir = tmp_path / "issuer_cache"
     cache_dir.mkdir()
 
@@ -646,7 +646,7 @@ async def test_fetch_issuer_chain_async(tmp_path):
 
 def test_fetch_issuer_chain_sync(tmp_path):
     """Test sync wrapper for fetch_issuer_chain."""
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
     cache_dir = tmp_path / "issuer_cache"
     cache_dir.mkdir()
 
@@ -660,7 +660,7 @@ def test_fetch_issuer_chain_sync(tmp_path):
 @pytest.mark.asyncio
 async def test_fetch_issuer_chain_stops_at_root(tmp_path):
     """Test that chain building stops at self-signed root."""
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
     cache_dir = tmp_path / "issuer_cache"
     cache_dir.mkdir()
 
@@ -676,7 +676,7 @@ async def test_fetch_issuer_chain_stops_at_root(tmp_path):
 @pytest.mark.asyncio
 async def test_fetch_issuer_cert_no_cache(tmp_path):
     """Test fetch_issuer_cert works without cache_dir."""
-    cert = get_cert("google.com")
+    cert = get_cert_sync("google.com")
 
     # No cache_dir provided
     issuer = await fetch_issuer_cert(cert)

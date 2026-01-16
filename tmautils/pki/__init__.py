@@ -1,8 +1,8 @@
 from .cert import (
     get_cert,
-    get_cert_async,
+    get_cert_sync,
     get_cert_chain,
-    get_cert_chain_async,
+    get_cert_chain_sync,
     fetch_issuer_cert,
     fetch_issuer_cert_sync,
     fetch_issuer_chain,
@@ -22,9 +22,9 @@ from .revocation import RevocationChecker
 
 __all__ = [
     'get_cert',
-    'get_cert_async',
+    'get_cert_sync',
     'get_cert_chain',
-    'get_cert_chain_async',
+    'get_cert_chain_sync',
     'fetch_issuer_cert',
     'fetch_issuer_cert_sync',
     'fetch_issuer_chain',
