@@ -1,12 +1,21 @@
 from typing import Optional
+from pathlib import Path
 import ssl
 import socket
 import cryptography.x509 as x509
+from cryptography import x509 as x509_module
+from cryptography.x509.oid import ExtensionOID
+from cryptography.hazmat.primitives import serialization
 import certifi
+import aiohttp
 import asyncio
 import contextlib
 
-from tmautils.common import IPAddress
+from tmautils.common import IPAddress, run_coro_sync, LogHelper, get_logger_from_helper
+from tmautils.web import arequest_with_retry
+
+from ._crypto import get_cache_key, parse_cert_lrucached
+from .types import ExtensionMissingError
 
 
 def _build_ctx(*, verify: bool, use_certifi: bool):
@@ -295,3 +304,274 @@ async def get_cert_chain_async(
         use_certifi=use_certifi,
         chain=True,
     )
+
+
+class IssuerFetchError(Exception):
+    """Error fetching issuer certificate."""
+    pass
+
+
+async def fetch_issuer_cert(
+    cert: x509.Certificate,
+    *,
+    cache_dir: Path | None = None,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = 10.0,
+    max_attempts: int = 3,
+    log_helper: LogHelper | None = None,
+) -> x509.Certificate:
+    """
+    Fetch issuer certificate via AIA extension (CA_ISSUERS).
+
+    Args:
+        cert: Certificate to fetch issuer for
+        cache_dir: Directory to cache downloaded certs (Optional)
+        session: Existing aiohttp session (creates one if not provided)
+        timeout: Request timeout in seconds
+        max_attempts: Retry attempts for failed downloads
+        log_helper: Optional LogHelper for logging
+
+    Returns:
+        Issuer certificate
+
+    Raises:
+        ExtensionMissingError: If cert lacks AIA or CA_ISSUERS entry
+        IssuerFetchError: If download/parsing fails
+    """
+    logger = get_logger_from_helper(log_helper)
+
+    # Extract AIA extension
+    try:
+        aia_ext = cert.extensions.get_extension_for_oid(
+            ExtensionOID.AUTHORITY_INFORMATION_ACCESS
+        )
+    except x509.ExtensionNotFound:
+        raise ExtensionMissingError(
+            f"Certificate {cert.serial_number} lacks AIA extension"
+        )
+
+    # Find CA Issuers URL
+    issuer_url = None
+    for desc in aia_ext.value:
+        if desc.access_method == x509_module.oid.AuthorityInformationAccessOID.CA_ISSUERS:
+            issuer_url = desc.access_location.value
+            break
+
+    if not issuer_url:
+        raise ExtensionMissingError(
+            f"Certificate {cert.serial_number} has no CA Issuers in AIA"
+        )
+
+    logger.debug("Issuer URL from AIA: %s", issuer_url)
+
+    # Check cache
+    if cache_dir is not None:
+        cache_key_str = get_cache_key(issuer_url) + ".crt"
+        cache_path = cache_dir / cache_key_str
+        if cache_path.exists():
+            try:
+                issuer_cert = parse_cert_lrucached(cache_path.read_bytes())
+                logger.debug("Issuer cert cache hit: %s", issuer_url)
+                return issuer_cert
+            except Exception:
+                pass  # Cache corrupted, re-download
+    else:
+        cache_path = None
+
+    logger.debug("Downloading issuer certificate: %s", issuer_url)
+
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+
+    try:
+        async with arequest_with_retry(
+            session,
+            "GET",
+            issuer_url,
+            attempt_timeout=timeout,
+            max_attempts=max_attempts,
+            log_helper=log_helper,
+        ) as resp:
+            resp.raise_for_status()
+            content = await resp.read()
+    except Exception as e:
+        raise IssuerFetchError(
+            f"Failed to download issuer cert from {issuer_url}: {e}"
+        ) from e
+    finally:
+        if owns_session:
+            await session.close()
+
+    # Yield before CPU-bound parsing
+    await asyncio.sleep(0)
+
+    # Try parsing as DER first, then PEM
+    try:
+        issuer_cert = x509.load_der_x509_certificate(content)
+    except ValueError:
+        try:
+            issuer_cert = x509.load_pem_x509_certificate(content)
+        except ValueError as e:
+            raise IssuerFetchError(
+                f"Failed to parse issuer cert from {issuer_url}: {e}"
+            ) from e
+
+    # Cache to disk as DER if cache_dir is provided
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_bytes(
+            issuer_cert.public_bytes(serialization.Encoding.DER)
+        )
+        logger.debug("Cached issuer cert: %s", cache_path)
+
+    return issuer_cert
+
+
+def fetch_issuer_cert_sync(
+    cert: x509.Certificate,
+    *,
+    cache_dir: Path | None = None,
+    timeout: float = 10.0,
+    max_attempts: int = 3,
+    log_helper: LogHelper | None = None,
+) -> x509.Certificate:
+    """
+    Sync wrapper for fetch_issuer_cert().
+
+    Note: Cannot pass an existing aiohttp session in sync mode.
+    """
+    return run_coro_sync(fetch_issuer_cert(
+        cert,
+        cache_dir=cache_dir,
+        session=None,
+        timeout=timeout,
+        max_attempts=max_attempts,
+        log_helper=log_helper,
+    ))
+
+
+async def fetch_issuer_chain(
+    cert: x509.Certificate,
+    *,
+    max_depth: int = 10,
+    cache_dir: Path | None = None,
+    session: aiohttp.ClientSession | None = None,
+    timeout: float = 10.0,
+    max_attempts: int = 3,
+    log_helper: LogHelper | None = None,
+) -> list[x509.Certificate]:
+    """
+    Build certificate chain starting from the given certificate
+    by fetching issuer certificates using AIA.
+
+    This differs from `get_cert_chain()` which fetches the chain from a TLS
+    handshake.
+
+    Args:
+        cert: Certificate to start from
+        max_depth: Maximum chain length (prevents infinite loops)
+        cache_dir: Directory to cache downloaded certs (Optional)
+        session: Existing aiohttp session (creates one if not provided)
+        timeout: Request timeout per fetch
+        max_attempts: Retry attempts per download
+        log_helper: Optional LogHelper for logging
+
+    Returns:
+        Chain as [cert, issuer, issuer's issuer, ..., root]
+        Stops at self-signed cert or max_depth.
+
+    Raises:
+        IssuerFetchError: If chain building fails due to circular reference
+            or max depth exceeded without finding root
+    """
+    logger = get_logger_from_helper(log_helper)
+
+    chain = [cert]
+    seen_serials = {cert.serial_number}
+
+    logger.debug(
+        "Building certificate chain starting from %s",
+        cert.serial_number
+    )
+
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+
+    try:
+        for depth in range(max_depth):
+            current_cert = chain[-1]
+
+            # Check if current cert is self-signed (root)
+            if current_cert.issuer == current_cert.subject:
+                logger.debug(
+                    "Reached self-signed root certificate at depth %d", depth
+                )
+                break
+
+            # Fetch issuer
+            try:
+                issuer_cert = await fetch_issuer_cert(
+                    current_cert,
+                    cache_dir=cache_dir,
+                    session=session,
+                    timeout=timeout,
+                    max_attempts=max_attempts,
+                    log_helper=log_helper,
+                )
+            except ExtensionMissingError as e:
+                logger.warning("Cannot continue chain building: %s", e)
+                break
+
+            # Check for circular reference
+            if issuer_cert.serial_number in seen_serials:
+                raise IssuerFetchError(
+                    f"Circular reference detected in certificate chain "
+                    f"(serial {issuer_cert.serial_number})"
+                )
+
+            # Add issuer to chain
+            chain.append(issuer_cert)
+            seen_serials.add(issuer_cert.serial_number)
+
+            logger.debug(
+                "Added certificate %s to chain (depth %d)",
+                issuer_cert.serial_number, depth + 1
+            )
+        else:
+            # Loop exhausted without finding root
+            raise IssuerFetchError(
+                f"Maximum chain depth ({max_depth}) reached without finding root certificate"
+            )
+    finally:
+        if owns_session:
+            await session.close()
+
+    logger.info("Built certificate chain with %d certificates", len(chain))
+    return chain
+
+
+def fetch_issuer_chain_sync(
+    cert: x509.Certificate,
+    *,
+    max_depth: int = 10,
+    cache_dir: Path | None = None,
+    timeout: float = 10.0,
+    max_attempts: int = 3,
+    log_helper: LogHelper | None = None,
+) -> list[x509.Certificate]:
+    """
+    Sync wrapper for `fetch_issuer_chain()`.
+
+    Note: Cannot pass an existing aiohttp session in sync mode.
+    """
+    return run_coro_sync(fetch_issuer_chain(
+        cert,
+        max_depth=max_depth,
+        cache_dir=cache_dir,
+        session=None,
+        timeout=timeout,
+        max_attempts=max_attempts,
+        log_helper=log_helper,
+    ))
