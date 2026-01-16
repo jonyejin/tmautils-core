@@ -65,6 +65,7 @@ class CRLHelper:
 
     def __init__(
         self,
+        http_semaphore: asyncio.Semaphore,
         *,
         crl_cache_dir: Path,
         issuer_cache_dir: Path,
@@ -72,6 +73,7 @@ class CRLHelper:
         max_attempts: int = 3,
         log_helper: LogHelper | None = None,
     ):
+        self._http_semaphore = http_semaphore
         self._crl_cache_dir = crl_cache_dir
         self._issuer_cache_dir = issuer_cache_dir
         self._request_timeout = request_timeout
@@ -206,7 +208,7 @@ class CRLHelper:
                     )
 
                 self._logger.debug(
-                    "CRL: Certificate %s is GOOD; not in CRL from from %s", cert.serial_number, url
+                    "CRL: Certificate %s is GOOD; not in CRL from %s", cert.serial_number, url
                 )
                 return RevocationInfo(
                     status=RevocationStatus.GOOD,
@@ -276,16 +278,17 @@ class CRLHelper:
         self._logger.info("Downloading CRL: %s", url)
 
         try:
-            async with request_with_retry(
-                session,
-                "GET",
-                url,
-                attempt_timeout=self._request_timeout,
-                max_attempts=self._max_attempts,
-                log_helper=self._log_helper,
-            ) as resp:
-                resp.raise_for_status()
-                content = await resp.read()
+            async with self._http_semaphore:
+                async with request_with_retry(
+                    session,
+                    "GET",
+                    url,
+                    attempt_timeout=self._request_timeout,
+                    max_attempts=self._max_attempts,
+                    log_helper=self._log_helper,
+                ) as resp:
+                    resp.raise_for_status()
+                    content = await resp.read()
         except Exception as e:
             raise CRLError(f"Failed to download CRL from {url}: {e}") from e
 
@@ -389,14 +392,15 @@ class CRLHelper:
                 "Downloading CRL signer cert: %s", signer_url
             )
             try:
-                async with request_with_retry(
-                    session, "GET", signer_url,
-                    attempt_timeout=self._request_timeout,
-                    max_attempts=self._max_attempts,
-                    log_helper=self._log_helper,
-                ) as resp:
-                    resp.raise_for_status()
-                    content = await resp.read()
+                async with self._http_semaphore:
+                    async with request_with_retry(
+                        session, "GET", signer_url,
+                        attempt_timeout=self._request_timeout,
+                        max_attempts=self._max_attempts,
+                        log_helper=self._log_helper,
+                    ) as resp:
+                        resp.raise_for_status()
+                        content = await resp.read()
             except Exception as e:
                 self._logger.warning(
                     "Failed to download CRL signer cert from %s: %s", signer_url, e

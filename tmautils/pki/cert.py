@@ -6,6 +6,7 @@ import cryptography.x509 as x509
 from cryptography import x509 as x509_module
 from cryptography.x509.oid import ExtensionOID
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import pkcs7
 import certifi
 import aiohttp
 import asyncio
@@ -317,6 +318,54 @@ class IssuerFetchError(Exception):
     pass
 
 
+def _find_matching_cert_pkcs7(
+    certs: list[x509.Certificate],
+    expected_subject: x509.Name | None,
+) -> x509.Certificate:
+    if not certs:
+        raise ValueError("PKCS#7 contains no certificates")
+
+    if expected_subject is None or len(certs) == 1:
+        return certs[0]
+
+    for cert in certs:
+        if cert.subject == expected_subject:
+            return cert
+
+    # Fallback to first if no match
+    return certs[0]
+
+
+def _parse_certificate(
+    content: bytes,
+    expected_subject: x509.Name | None = None,
+) -> x509.Certificate:
+    is_pem = content.strip().startswith(b"-----BEGIN")
+
+    if is_pem:
+        parsers = [
+            x509.load_pem_x509_certificate,
+            pkcs7.load_pem_pkcs7_certificates,
+        ]
+    else:
+        parsers = [
+            x509.load_der_x509_certificate,
+            pkcs7.load_der_pkcs7_certificates,
+        ]
+
+    for parser in parsers:
+        try:
+            result = parser(content)
+            # Handle single cert vs list from PKCS#7
+            if isinstance(result, list):
+                return _find_matching_cert_pkcs7(result, expected_subject)
+            return result
+        except (ValueError, IndexError):
+            continue
+
+    raise ValueError("Not a valid DER, PEM, or PKCS#7 certificate")
+
+
 async def fetch_issuer_cert(
     cert: x509.Certificate,
     *,
@@ -412,16 +461,12 @@ async def fetch_issuer_cert(
     # Yield before CPU-bound parsing
     await asyncio.sleep(0)
 
-    # Try parsing as DER first, then PEM
     try:
-        issuer_cert = x509.load_der_x509_certificate(content)
-    except ValueError:
-        try:
-            issuer_cert = x509.load_pem_x509_certificate(content)
-        except ValueError as e:
-            raise IssuerFetchError(
-                f"Failed to parse issuer cert from {issuer_url}: {e}"
-            ) from e
+        issuer_cert = _parse_certificate(content, expected_subject=cert.issuer)
+    except ValueError as e:
+        raise IssuerFetchError(
+            f"Failed to parse issuer cert from {issuer_url}: {e}"
+        ) from e
 
     # Cache to disk as DER if cache_dir is provided
     if cache_path is not None:
@@ -526,7 +571,7 @@ async def fetch_issuer_chain(
                     max_attempts=max_attempts,
                     log_helper=log_helper,
                 )
-            except ExtensionMissingError as e:
+            except (ExtensionMissingError, IssuerFetchError) as e:
                 logger.warning("Cannot continue chain building: %s", e)
                 break
 

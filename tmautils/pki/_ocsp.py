@@ -43,6 +43,7 @@ class OCSPHelper:
 
     def __init__(
         self,
+        http_semaphore: asyncio.Semaphore,
         *,
         request_timeout: float = 10.0,
         max_attempts: int = 3,
@@ -50,6 +51,7 @@ class OCSPHelper:
         max_cache_size: int = 1024,
         log_helper: LogHelper | None = None,
     ):
+        self._http_semaphore = http_semaphore
         self._request_timeout = request_timeout
         self._max_attempts = max_attempts
         self._default_ttl = default_ttl
@@ -238,18 +240,19 @@ class OCSPHelper:
         )
 
         try:
-            async with request_with_retry(
-                session,
-                "POST",
-                ocsp_url,
-                data=req_bytes,
-                headers={"Content-Type": "application/ocsp-request"},
-                attempt_timeout=self._request_timeout,
-                max_attempts=self._max_attempts,
-                log_helper=self._log_helper,
-            ) as resp:
-                resp.raise_for_status()
-                ocsp_resp_bytes = await resp.read()
+            async with self._http_semaphore:
+                async with request_with_retry(
+                    session,
+                    "POST",
+                    ocsp_url,
+                    data=req_bytes,
+                    headers={"Content-Type": "application/ocsp-request"},
+                    attempt_timeout=self._request_timeout,
+                    max_attempts=self._max_attempts,
+                    log_helper=self._log_helper,
+                ) as resp:
+                    resp.raise_for_status()
+                    ocsp_resp_bytes = await resp.read()
         except Exception as e:
             raise OCSPError(
                 f"OCSP HTTP request failed ({request_hash.name}): {e}"

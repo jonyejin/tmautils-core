@@ -39,6 +39,8 @@ class RevocationChecker:
             Default is 10.0 seconds.
         max_attempts: Maximum number of retry attempts for HTTP requests.
             Default is 3.
+        max_concurrent: Maximum number of concurrent HTTP requests.
+            Default is 20.
         working_root: Base directory for IOHelper. If None, uses default.
         **kwargs: Additional arguments passed to IOHelper.
 
@@ -71,12 +73,17 @@ class RevocationChecker:
         *,
         request_timeout: float = 10.0,
         max_attempts: int = 3,
+        max_concurrent: int = 20,
         working_root: Path | None = None,
         **kwargs: Any,
     ):
         # Store configuration
         self._request_timeout = request_timeout
         self._max_attempts = max_attempts
+        self._max_concurrent = max_concurrent
+
+        # Semaphore for limiting concurrent HTTP requests
+        self._http_semaphore = asyncio.Semaphore(max_concurrent)
 
         # Initialize IOHelper
         self._io_helper = IOHelper(
@@ -93,12 +100,14 @@ class RevocationChecker:
 
         # Initialize helper modules
         self._ocsp_helper = OCSPHelper(
+            self._http_semaphore,
             request_timeout=request_timeout,
             max_attempts=max_attempts,
             log_helper=self._io_helper.log_helper,
         )
 
         self._crl_helper = CRLHelper(
+            self._http_semaphore,
             crl_cache_dir=self._crl_cache_dir,
             issuer_cache_dir=self._issuer_cache_dir,
             request_timeout=request_timeout,
@@ -108,8 +117,8 @@ class RevocationChecker:
 
         self._io_helper.logger.info(
             "RevocationChecker initialized: "
-            "request_timeout=%ds, max_attempts=%d",
-            request_timeout, max_attempts,
+            "request_timeout=%ds, max_attempts=%d, max_concurrent=%d",
+            request_timeout, max_attempts, max_concurrent,
         )
 
     async def check_cert(
@@ -177,14 +186,15 @@ class RevocationChecker:
                 self._io_helper.logger.debug(
                     f"Checking certificate {cert.serial_number} (auto-fetching issuer)"
                 )
-                issuer = await fetch_issuer_cert(
-                    cert,
-                    cache_dir=self._issuer_cache_dir,
-                    session=session,
-                    timeout=self._request_timeout,
-                    max_attempts=self._max_attempts,
-                    log_helper=self._io_helper.log_helper,
-                )
+                async with self._http_semaphore:
+                    issuer = await fetch_issuer_cert(
+                        cert,
+                        cache_dir=self._issuer_cache_dir,
+                        session=session,
+                        timeout=self._request_timeout,
+                        max_attempts=self._max_attempts,
+                        log_helper=self._io_helper.log_helper,
+                    )
             elif issuer is None:
                 # verify_signature=False, no issuer needed
                 self._io_helper.logger.debug(
@@ -354,14 +364,16 @@ class RevocationChecker:
 
         async with aiohttp.ClientSession() as session:
             # Fetch full chain
-            chain = await fetch_issuer_chain(
-                leaf, session,
-                max_depth=max_depth,
-                cache_dir=self._issuer_cache_dir,
-                timeout=self._request_timeout,
-                max_attempts=self._max_attempts,
-                log_helper=self._io_helper.log_helper,
-            )
+            async with self._http_semaphore:
+                chain = await fetch_issuer_chain(
+                    leaf,
+                    max_depth=max_depth,
+                    cache_dir=self._issuer_cache_dir,
+                    session=session,
+                    timeout=self._request_timeout,
+                    max_attempts=self._max_attempts,
+                    log_helper=self._io_helper.log_helper,
+                )
 
             # Check all certificates in chain
             return await self._check_chain(
