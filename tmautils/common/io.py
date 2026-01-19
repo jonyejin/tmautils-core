@@ -1,8 +1,69 @@
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Optional, TYPE_CHECKING
 from pathlib import Path
 from logging import Logger
+from dataclasses import dataclass, field
+from enum import StrEnum
 
 from .log import LogConfig, LogHelper, get_logger_from_helper
+
+
+class DirCreationMode(StrEnum):
+    """
+    Mode for directory creation timing.
+
+    Choose EAGER to create directories at initialization (legacy behavior),
+    or LAZY to create them on first access (new default).
+    """
+
+    EAGER = "eager"  # Create at init (legacy behavior)
+    LAZY = "lazy"  # Create on first access (new default)
+
+
+@dataclass(slots=True)
+class DirConfig:
+    """
+    Configuration for a single directory.
+
+    Args:
+        enabled: Whether this directory is enabled (can be accessed).
+        symlink_to: Path to symlink this directory to. If set, the directory
+            will be a symlink to this path instead of a real directory.
+        creation_mode: When to create the directory (EAGER or LAZY).
+    """
+
+    enabled: bool = True
+    symlink_to: Optional[Path] = None
+    creation_mode: DirCreationMode = DirCreationMode.LAZY
+
+
+@dataclass(slots=True)
+class IOConfig:
+    """
+    Configuration for IOHelper.
+
+    Args:
+        top_level_symlink_to: Path to symlink the entire top-level directory to.
+            If set, namespace/[instance_name]/ will be a symlink.
+        raw: Configuration for the `raw/` directory.
+        processed: Configuration for the `processed/` directory.
+        logs: Configuration for the `logs/` directory.
+        custom_dirs: Additional directories (e.g., `{"results": DirConfig()}`).
+        setup_logging: Whether to set up logging.
+        logging_config: Optional LogConfig for custom logging setup.
+        logging_kwargs: kwargs passed to LogConfig if logging_config is None.
+    """
+
+    top_level_symlink_to: Path | None = None
+
+    raw: DirConfig = field(default_factory=DirConfig)
+    processed: DirConfig = field(default_factory=DirConfig)
+    logs: DirConfig = field(default_factory=DirConfig)
+    custom_dirs: dict[str, DirConfig] = field(default_factory=dict)
+
+    setup_logging: bool = True
+    logging_config: LogConfig | None = None
+    logging_kwargs: dict[str, Any] = field(default_factory=dict)
+
 
 _GZIP_STREAM_CHUNK_SIZE = 64 * 1024  # 64 KiB
 
@@ -195,18 +256,28 @@ class IOHelper:
     """
     IOHelper is a utility class for managing input/output operations in a structured way.
 
+    There are two ways to use IOHelper:
+
+    1. **New API** (recommended): Pass an `IOConfig` object.
+       More flexible and configurable.
+       Only creates configured directories, lazily on first access.
+
+    2. **Legacy API**: Pass individual parameters.
+       Creates `raw`, `processed`, `logs` and `results` directories eagerly at init.
+
     Args:
         namespace (str):
             Name of the namespace for this unit.
             It becomes a directory under `working_root` (i.e., `working_root/namespace/`).
 
-            If `instance_name` is given, the structure is `working_root/namespace/instance_name/{raw,processed,logs,results}`.
-
-            Otherwise, the `{raw,processed,logs,results}` directories are directly under `working_root/namespace/`.
-
         instance_name (str | None):
             Optional instance name.
             If provided, it will be used to create a subdirectory under the namespace directory.
+
+        config (IOConfig | None):
+            Configuration object for new API.
+            If provided, uses IOConfig settings and ignores legacy symlink parameters.
+            Provides lazy creation, custom directories, and top-level symlinks.
 
         working_root (Path | None):
             Base directory where the namespace directory will be created.
@@ -216,54 +287,52 @@ class IOHelper:
             Deprecated alias for `working_root`.
 
         raw_dir_symlink_to (Path | None):
-            Path to which the raw directory should be symlinked.
-            If provided, the `raw` directory will be a symlink to this path.
-            If None, the `raw` directory will be created in the namespace directory.
+            [Legacy] Path to which the raw directory should be symlinked.
 
         processed_dir_symlink_to (Path | None):
-            Path to which the processed directory should be symlinked.
-            If provided, the `processed` directory will be a symlink to this path.
-            If None, the `processed` directory will be created in the namespace directory.
+            [Legacy] Path to which the processed directory should be symlinked.
 
         logs_dir_symlink_to (Path | None):
-            Path to which the logs directory should be symlinked.
-            If provided, the `logs` directory will be a symlink to this path.
-            If None, the `logs` directory will be created in the namespace directory.
+            [Legacy] Path to which the logs directory should be symlinked.
 
         results_dir_symlink_to (Path | None):
-            Path to which the results directory should be symlinked.
-            If provided, the `results` directory will be a symlink to this path.
-            If None, the `results` directory will be created in the namespace directory.
+            [Legacy] Path to which the results directory should be symlinked.
 
         setup_logging (bool):
             If True, logging will be set up for the unit.
-            The logs will be stored in the `logs` directory.
 
         logging_config (LogConfig | None):
             Optional logging configuration.
-            If None and `setup_logging` is True, a default configuration will be created.
 
         logging_kwargs (Dict[str, Any] | None):
             kwargs to pass to LogConfig if `logging_config` is None.
-            Useful for customizing logging setup without creating a LogConfig manually.
     """
+
+    # For IDE typing support (these are accessed via __getattr__)
+    if TYPE_CHECKING:
+        raw: Path
+        processed: Path
+        logs: Path
+        results: Path
 
     def __init__(
         self,
-        namespace: str,  # was `module_name` in earlier versions
+        namespace: str,
         instance_name: str | None = None,
         *,
-        working_root: Path | None = None,  # new preferred argument
+        config: IOConfig | None = None,
+        working_root: Path | None = None,
         data_dir: Path | None = None,  # deprecated alias for `working_root`
+        # Legacy parameters: Use config instead
         raw_dir_symlink_to: Path | None = None,
         processed_dir_symlink_to: Path | None = None,
         logs_dir_symlink_to: Path | None = None,
         results_dir_symlink_to: Path | None = None,
         setup_logging: bool = True,
-        logging_config: Optional["LogConfig"] = None,
+        logging_config: LogConfig | None = None,
         logging_kwargs: Dict[str, Any] | None = None,
     ):
-        # If working_root is None, use the current working directory
+        # Handle working_root vs deprecated data_dir
         working_root = self.handle_working_root_data_dir(
             working_root, data_dir
         )
@@ -274,80 +343,224 @@ class IOHelper:
         # Set up namespace and instance directories
         self.namespace = namespace
         self.instance_name = instance_name
-        # top_level_dir => working_root/namespace/[instance_name/]
+
+        # Set up top-level directory (possibly as symlink)
         self.top_level_dir = self.working_root / self.namespace
         if self.instance_name is not None:
             self.top_level_dir = self.top_level_dir / self.instance_name
-        self.top_level_dir.mkdir(parents=True, exist_ok=True)
+        self._setup_top_level_dir(
+            top_level_symlink_to=config.top_level_symlink_to if config is not None else None
+        )
 
-        # Set up raw, processed, logs, and results directories
-        for dir_name, symlink_to in [
-            ("raw", raw_dir_symlink_to),
-            ("processed", processed_dir_symlink_to),
-            ("logs", logs_dir_symlink_to),
-            ("results", results_dir_symlink_to)
-        ]:
-            dir_path = self.top_level_dir / dir_name
+        # Set up sub-directories
+        self._dir_configs = self._build_dir_configs(
+            config=config,
+            raw_dir_symlink_to=raw_dir_symlink_to,
+            processed_dir_symlink_to=processed_dir_symlink_to,
+            logs_dir_symlink_to=logs_dir_symlink_to,
+            results_dir_symlink_to=results_dir_symlink_to,
+        )
+        self._dirs_created: set[str] = set()
+        self._create_eager_dirs()
 
-            if symlink_to is not None:
-                symlink_to = symlink_to.expanduser().resolve(strict=True)
-
-                # Ensure symlink_to is a directory (and exists)
-                if not symlink_to.is_dir():
-                    raise FileNotFoundError(
-                        f"{symlink_to} is not a directory."
-                    )
-
-                # Remove the old symlink if it exists
-                if dir_path.exists():
-                    if dir_path.is_symlink():
-                        dir_path.unlink()
-                    else:
-                        raise FileExistsError(
-                            f"{dir_path} exists and is not a symlink."
-                        )
-
-                # Create the new symlink
-                dir_path.symlink_to(
-                    symlink_to,
-                    target_is_directory=True
-                )
-            else:
-                dir_path.mkdir(parents=True, exist_ok=True)
-
-        # Logging
+        # Set up logging if requested
         self._log_helper: LogHelper | None = None
-        if setup_logging:
-            if logging_config is None:
-                name = (
-                    f"{self.namespace}/{self.instance_name}" if self.instance_name is not None
-                    else self.namespace
-                )
-                log_path = self.logs / f"{self.namespace}.log"
-                logging_config = LogConfig(
-                    name=name,
-                    log_path=log_path,
-                    **(logging_kwargs or {}),
-                )
-            self._log_helper = LogHelper(logging_config)
+        _setup_logging = (
+            config.setup_logging if config is not None else setup_logging
+        )
+        if _setup_logging:
+            self._setup_logging(
+                logging_config=config.logging_config if config is not None else logging_config,
+                logging_kwargs=(
+                    config.logging_kwargs if config is not None else (
+                        logging_kwargs or {}
+                    )
+                ),
+            )
 
         self.logger.info(
             f"IOHelper initialized with top-level directory: {self.top_level_dir}"
         )
 
+    def _build_dir_configs(
+        self,
+        *,
+        config: IOConfig | None,
+        raw_dir_symlink_to: Path | None,
+        processed_dir_symlink_to: Path | None,
+        logs_dir_symlink_to: Path | None,
+        results_dir_symlink_to: Path | None,
+    ) -> dict[str, DirConfig]:
+        # If config object is provided, use it
+        if config is not None:
+            dir_configs: dict[str, DirConfig] = {
+                "raw": config.raw,
+                "processed": config.processed,
+                "logs": config.logs,
+            }
+            for name, cfg in config.custom_dirs.items():
+                if name in {"raw", "processed", "logs"}:
+                    raise ValueError(
+                        f"Cannot use IOConfig directory name '{name}' in custom_dirs. "
+                        f"Configure it directly via config.{name} instead."
+                    )
+                dir_configs[name] = cfg
+            return dir_configs
+
+        # Legacy API: eagerly create (old) standard directories
+        return {
+            "raw": DirConfig(
+                symlink_to=raw_dir_symlink_to,
+                creation_mode=DirCreationMode.EAGER,
+            ),
+            "processed": DirConfig(
+                symlink_to=processed_dir_symlink_to,
+                creation_mode=DirCreationMode.EAGER,
+            ),
+            "logs": DirConfig(
+                symlink_to=logs_dir_symlink_to,
+                creation_mode=DirCreationMode.EAGER,
+            ),
+            "results": DirConfig(
+                symlink_to=results_dir_symlink_to,
+                creation_mode=DirCreationMode.EAGER,
+            ),
+        }
+
+    def _setup_top_level_dir(self, top_level_symlink_to: Path | None = None):
+        if top_level_symlink_to is not None:
+            self.top_level_dir.parent.mkdir(parents=True, exist_ok=True)
+            self._create_dir_symlink(self.top_level_dir, top_level_symlink_to)
+        else:
+            self.top_level_dir.mkdir(parents=True, exist_ok=True)
+
+    def _create_eager_dirs(self):
+        for name, cfg in self._dir_configs.items():
+            if cfg.enabled and cfg.creation_mode == DirCreationMode.EAGER:
+                self._ensure_dir(name)
+
+    def _get_dir_path(self, name: str) -> Path:
+        return self.top_level_dir / name
+
+    def _ensure_dir(self, name: str) -> Path:
+        if name in self._dirs_created:
+            return self._get_dir_path(name)
+
+        cfg = self._dir_configs.get(name)
+        if cfg is None:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no directory '{name}'"
+            )
+        if not cfg.enabled:
+            raise RuntimeError(
+                f"Directory '{name}' is disabled. "
+                f"Enable it via DirConfig(enabled=True)."
+            )
+
+        path = self._get_dir_path(name)
+
+        if cfg.symlink_to is not None:
+            self._create_dir_symlink(path, cfg.symlink_to)
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+
+        self._dirs_created.add(name)
+        return path
+
+    def _create_dir_symlink(self, dir_path: Path, symlink_to: Path) -> None:
+        target = symlink_to.expanduser().resolve(strict=True)
+
+        # Ensure symlink_to is a directory (and exists)
+        if not target.is_dir():
+            raise FileNotFoundError(f"{target} is not a directory.")
+
+        # Remove the old symlink if it exists
+        if dir_path.exists() or dir_path.is_symlink():
+            if dir_path.is_symlink():
+                # Just change the symlink
+                dir_path.unlink()
+            else:
+                # No clean way to change a non-symlink dir to a symlink
+                raise FileExistsError(
+                    f"{dir_path} exists and is not a symlink."
+                )
+
+        # Create the new symlink
+        dir_path.symlink_to(target, target_is_directory=True)
+
+    def __getattr__(self, name: str) -> Path:
+        """
+        Access any configured directory (standard or custom) as an attribute.
+        """
+
+        # Note: need to short-circuit _dir_configs to avoid infinite recursion
+        # (if this method is called before _dir_configs is set up)
+        if name != "_dir_configs":
+            if name in self._dir_configs:
+                return self._ensure_dir(name)
+
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def _setup_logging(
+        self,
+        logging_config: LogConfig | None,
+        logging_kwargs: dict[str, Any],
+    ) -> None:
+        # Check if logs directory is disabled
+        logs_cfg = self._dir_configs.get("logs")
+        logs_disabled = logs_cfg is None or not logs_cfg.enabled
+
+        # Determine if file logging is requested
+        if logging_config is not None:
+            file_logging_enabled = logging_config.file_level is not None
+        else:
+            # Default LogConfig has file_level=logging.INFO (enabled)
+            # Only file_level=None explicitly passed in kwargs disables it
+            file_logging_enabled = logging_kwargs.get(
+                "file_level", "default"
+            ) is not None
+
+        if logs_disabled and file_logging_enabled:
+            raise ValueError(
+                "Cannot enable file logging when logs directory is disabled. "
+                "Either enable the logs directory (logs=DirConfig(enabled=True)) "
+                "or disable file logging (logging_kwargs={'file_level': None})."
+            )
+
+        if logging_config is None:
+            name = (
+                f"{self.namespace}/{self.instance_name}"
+                if self.instance_name is not None
+                else self.namespace
+            )
+            # Only get logs path if file logging is enabled
+            log_path = (
+                self.logs / f"{self.namespace}.log"
+                if file_logging_enabled
+                else None
+            )
+            logging_config = LogConfig(
+                name=name,
+                log_path=log_path,
+                **logging_kwargs,
+            )
+
+        self._log_helper = LogHelper(logging_config)
+
     def create_symlink(
         self,
-        dir_name: Literal["raw", "processed"],
+        directory: Path,
         target: Path,
         link_name: Optional[str] = None,
     ):
         """
-        Create a symlink in the specified directory (raw or processed).
+        Create a symlink in the specified directory.
 
         Args:
-            dir_name (Literal["raw", "processed"]):
-                Directory in which to create the symlink.
-                Must be either "raw" or "processed".
+            directory (Path):
+                Directory in which to create the symlink (e.g., io.raw, io.processed).
 
             target (Path):
                 Path to which the symlink should point.
@@ -360,16 +573,11 @@ class IOHelper:
             link_path (Path):
                 Path of the created symlink.
         """
-        if dir_name not in ("raw", "processed"):
-            raise ValueError("dir_name must be either 'raw' or 'processed'.")
-
         target = target.expanduser().resolve(strict=True)
-        if not target.exists():
-            raise FileNotFoundError(f"Target {target} does not exist.")
 
         if link_name is None:
             link_name = target.name
-        link_path = self.top_level_dir / dir_name / link_name
+        link_path = directory / link_name
 
         if link_path.exists():
             if link_path.is_symlink():
@@ -380,9 +588,7 @@ class IOHelper:
                 )
 
         link_path.symlink_to(target, target_is_directory=target.is_dir())
-
         self.logger.info(f"Created symlink {link_path} -> {target}")
-
         return link_path
 
     @staticmethod
@@ -416,22 +622,6 @@ class IOHelper:
             working_root = data_dir
 
         return working_root
-
-    @property
-    def raw(self):
-        return self.top_level_dir / "raw"
-
-    @property
-    def processed(self):
-        return self.top_level_dir / "processed"
-
-    @property
-    def logs(self):
-        return self.top_level_dir / "logs"
-
-    @property
-    def results(self):
-        return self.top_level_dir / "results"
 
     @property
     def has_logger(self):
