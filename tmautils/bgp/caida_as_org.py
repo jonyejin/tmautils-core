@@ -29,6 +29,7 @@ class CaidaAsOrgInfoUtil:
     def __init__(
         self,
         date_str: str,
+        *,
         working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
@@ -36,8 +37,9 @@ class CaidaAsOrgInfoUtil:
         working_root = IOHelper.handle_working_root_data_dir(
             working_root, data_dir
         )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "processed", "logs"},
             working_root=working_root,
             **kwargs,
         )

@@ -59,9 +59,6 @@ class OpenWpmCrawlUtil:
             Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
 
-        data_dir (Path | None):
-            Deprecated alias for `working_root`.
-
         **kwargs (dict):
             Additional arguments for IOHelper.
             See the IOHelper class for more details.
@@ -84,8 +81,8 @@ class OpenWpmCrawlUtil:
         failure_limit: int | None = None,
         n_sites_chunk: int = 100,
         max_retry_per_chunk: int = 3,
+        *,
         working_root: Path | None = None,
-        data_dir: Path | None = None,
         **kwargs,
     ):
         import sys
@@ -120,13 +117,11 @@ class OpenWpmCrawlUtil:
         self.n_sites_chunk = n_sites_chunk
         self.max_retry_per_chunk = max_retry_per_chunk
 
-        # Set up data directory
-        working_root = IOHelper.handle_working_root_data_dir(
-            working_root, data_dir
-        )
-        self.io_helper = IOHelper(
+        # Set up IOHelper
+        kwargs.setdefault("instance_name", self.crawl_id)
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
-            instance_name=self.crawl_id,
+            dirs={"raw", "logs"},
             working_root=working_root,
             **kwargs,
         )

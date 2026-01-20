@@ -19,9 +19,12 @@ class IpInfoCarrierUtil:
             Date of the dataset to use, in 'YYYY-MM-DD' format.
             If None, the latest available dataset will be used.
 
-        data_dir (Path | None):
+        working_root (Path | None):
             Base directory for data files.
             If None, the current working directory will be used.
+
+        data_dir (Path | None):
+            Deprecated alias for `working_root`.
 
         **kwargs (dict):
             Additional arguments for IOHelper.
@@ -41,10 +44,12 @@ class IpInfoCarrierUtil:
         working_root = IOHelper.handle_working_root_data_dir(
             working_root, data_dir
         )
-        self.io_helper = IOHelper(
+
+        kwargs.setdefault("raw_dir_symlink_to", ipinfo_carrier_dir)
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "processed", "logs"},
             working_root=working_root,
-            raw_dir_symlink_to=ipinfo_carrier_dir,
             **kwargs,
         )
 

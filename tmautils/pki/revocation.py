@@ -86,15 +86,16 @@ class RevocationChecker:
         self._http_semaphore = asyncio.Semaphore(max_concurrent)
 
         # Initialize IOHelper
-        self._io_helper = IOHelper(
+        self._io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"cache", "logs"},
             working_root=working_root,
             **kwargs,
         )
 
-        # Create cache directories
-        self._crl_cache_dir = self._io_helper.raw / "crl_cache"
-        self._issuer_cache_dir = self._io_helper.raw / "issuer_cache"
+        # Create cache subdirectories
+        self._crl_cache_dir = self._io_helper.cache / "crl_cache"
+        self._issuer_cache_dir = self._io_helper.cache / "issuer_cache"
         self._crl_cache_dir.mkdir(exist_ok=True, parents=True)
         self._issuer_cache_dir.mkdir(exist_ok=True, parents=True)
 

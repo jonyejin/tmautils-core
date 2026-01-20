@@ -86,9 +86,9 @@ def test_cache_directories_created(tmp_path):
                                 'console_level': logging.DEBUG})
 
     assert checker._crl_cache_dir == tmp_path / \
-        "RevocationChecker" / "raw" / "crl_cache"
+        "RevocationChecker" / "cache" / "crl_cache"
     assert checker._issuer_cache_dir == tmp_path / \
-        "RevocationChecker" / "raw" / "issuer_cache"
+        "RevocationChecker" / "cache" / "issuer_cache"
 
 
 def test_enum_values():
@@ -307,7 +307,7 @@ async def test_crl_disk_caching(tmp_path):
         result1 = await checker.check_cert(cert, mode=CheckMode.CRL_ONLY)
 
         # Check cache file exists
-        crl_cache_dir = tmp_path / "RevocationChecker" / "raw" / "crl_cache"
+        crl_cache_dir = tmp_path / "RevocationChecker" / "cache" / "crl_cache"
         crl_files = list(crl_cache_dir.glob("*.crl"))
         assert len(crl_files) >= 1, "CRL should be cached to disk"
 
@@ -331,7 +331,7 @@ async def test_issuer_cert_caching(tmp_path):
     await checker.check_cert(cert)
 
     # Issuer should be cached
-    issuer_cache_dir = tmp_path / "RevocationChecker" / "raw" / "issuer_cache"
+    issuer_cache_dir = tmp_path / "RevocationChecker" / "cache" / "issuer_cache"
     issuer_files = list(issuer_cache_dir.glob("*.crt"))
     assert len(issuer_files) >= 1, "Issuer cert should be cached"
     print(f"  Issuer cache files: {len(issuer_files)}")
@@ -421,7 +421,7 @@ async def test_crl_cache_metadata(tmp_path):
         await checker.check_cert(cert, mode=CheckMode.CRL_ONLY)
 
         # Check cache files exist
-        crl_cache_dir = tmp_path / "RevocationChecker" / "raw" / "crl_cache"
+        crl_cache_dir = tmp_path / "RevocationChecker" / "cache" / "crl_cache"
         crl_files = list(crl_cache_dir.glob("*.crl"))
         meta_files = list(crl_cache_dir.glob("*.meta"))
 

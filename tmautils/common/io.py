@@ -26,8 +26,8 @@ class DirConfig:
 
     Args:
         enabled: Whether this directory is enabled (can be accessed).
-        symlink_to: Path to symlink this directory to. If set, the directory
-            will be a symlink to this path instead of a real directory.
+        symlink_to: Path to symlink this directory to.
+            If set, the directory will be a symlink to this path.
         creation_mode: When to create the directory (EAGER or LAZY).
     """
 
@@ -284,7 +284,7 @@ class IOHelper:
             If None, the current working directory will be used.
 
         data_dir (Path | None):
-            Deprecated alias for `working_root`.
+            [Legacy] Deprecated alias for `working_root`.
 
         raw_dir_symlink_to (Path | None):
             [Legacy] Path to which the raw directory should be symlinked.
@@ -299,14 +299,16 @@ class IOHelper:
             [Legacy] Path to which the results directory should be symlinked.
 
         setup_logging (bool):
-            If True, logging will be set up for the unit.
+            [Legacy] If True, logging will be set up for the unit.
 
         logging_config (LogConfig | None):
-            Optional logging configuration.
+            [Legacy] Optional logging configuration.
 
         logging_kwargs (Dict[str, Any] | None):
-            kwargs to pass to LogConfig if `logging_config` is None.
+            [Legacy] kwargs to pass to LogConfig if `logging_config` is None.
     """
+
+    _STANDARD_DIRS = frozenset({"raw", "processed", "logs"})
 
     # For IDE typing support (these are accessed via __getattr__)
     if TYPE_CHECKING:
@@ -349,7 +351,9 @@ class IOHelper:
         if self.instance_name is not None:
             self.top_level_dir = self.top_level_dir / self.instance_name
         self._setup_top_level_dir(
-            top_level_symlink_to=config.top_level_symlink_to if config is not None else None
+            top_level_symlink_to=(
+                config.top_level_symlink_to if config is not None else None
+            )
         )
 
         # Set up sub-directories
@@ -370,7 +374,9 @@ class IOHelper:
         )
         if _setup_logging:
             self._setup_logging(
-                logging_config=config.logging_config if config is not None else logging_config,
+                logging_config=(
+                    config.logging_config if config is not None else logging_config
+                ),
                 logging_kwargs=(
                     config.logging_kwargs if config is not None else (
                         logging_kwargs or {}
@@ -381,6 +387,127 @@ class IOHelper:
         self.logger.info(
             f"IOHelper initialized with top-level directory: {self.top_level_dir}"
         )
+
+    @classmethod
+    def init_with_dirs(
+        cls,
+        namespace: str,
+        dirs: set[str],
+        *,
+        working_root: Path | None = None,
+        **kwargs,
+    ) -> "IOHelper":
+        """
+        Create IOHelper with a fixed set of directories.
+
+        This classmethod is designed for use by utility classes that define a fixed
+        set of directories they need.
+        Users of the utility can customize symlinks and logging,
+        but cannot add or remove directories.
+
+        Args:
+            namespace: Name of the namespace directory.
+            dirs: Set of enabled directory names.
+            working_root: Base directory.
+            **kwargs: User customizations:
+                - instance_name: Optional instance name
+                - top_level_symlink_to: Path to symlink the namespace dir to
+                - {dir}_dir_symlink_to: Path to symlink any dir in `dirs` to
+                - setup_logging: Whether to set up logging (default True)
+                - logging_config: Optional LogConfig
+                - logging_kwargs: kwargs for LogConfig
+
+        Returns:
+            IOHelper instance.
+
+        Raises:
+            ValueError: If symlink kwargs are provided for dirs not in `dirs`.
+
+        Example:
+            >>> # Utility defines its structure
+            >>> class MyUtil:
+            ...     def __init__(self, working_root=None, **kwargs):
+            ...         self._io_helper = IOHelper.init_with_dirs(
+            ...             self.__class__.__name__,
+            ...             dirs={"raw", "logs"},
+            ...             working_root=working_root,
+            ...             **kwargs,
+            ...         )
+            >>> # User can customize symlinks/logging
+            >>> util = MyUtil(
+            ...     working_root=Path("/data"),
+            ...     raw_dir_symlink_to=Path("/tmp/raw"),
+            ...     setup_logging=False,
+            ... )
+        """
+        config, instance_name = cls._build_config_from_dirs(dirs, kwargs)
+        return cls(
+            namespace,
+            instance_name=instance_name,
+            config=config,
+            working_root=working_root,
+        )
+
+    @staticmethod
+    def _build_config_from_dirs(
+        dirs: set[str],
+        kwargs: dict,
+    ) -> tuple[IOConfig, str | None]:
+        # Separate standard and custom dirs
+        custom_dir_names = dirs - IOHelper._STANDARD_DIRS
+
+        # Extract symlinks for dirs in the set
+        symlinks: dict[str, Path] = {}
+        for dir_name in dirs:
+            kwarg_name = f"{dir_name}_dir_symlink_to"
+            if kwarg_name in kwargs:
+                symlinks[dir_name] = kwargs.pop(kwarg_name)
+
+        # Reject symlink kwargs for dirs NOT in set
+        for key in list(kwargs.keys()):
+            if key.endswith("_dir_symlink_to"):
+                dir_name = key.removesuffix("_dir_symlink_to")
+                raise ValueError(
+                    f"Cannot symlink '{dir_name}' - not in dirs. Valid: {dirs}"
+                )
+
+        # Extract top-level symlink
+        top_level_symlink = kwargs.pop("top_level_symlink_to", None)
+
+        # Extract logging config
+        setup_logging = kwargs.pop("setup_logging", True)
+        logging_config = kwargs.pop("logging_config", None)
+        logging_kwargs = kwargs.pop("logging_kwargs", {})
+
+        # Extract instance_name
+        instance_name = kwargs.pop("instance_name", None)
+
+        # Warn about unknown kwargs
+        if kwargs:
+            import warnings
+            warnings.warn(f"Unknown kwargs: {list(kwargs.keys())}")
+
+        # Build IOConfig
+        config = IOConfig(
+            top_level_symlink_to=top_level_symlink,
+            raw=DirConfig(
+                enabled="raw" in dirs,
+                symlink_to=symlinks.get("raw")),
+            processed=DirConfig(
+                enabled="processed" in dirs,
+                symlink_to=symlinks.get("processed")),
+            logs=DirConfig(
+                enabled="logs" in dirs,
+                symlink_to=symlinks.get("logs")),
+            custom_dirs={
+                name: DirConfig(symlink_to=symlinks.get(name))
+                for name in custom_dir_names
+            },
+            setup_logging=setup_logging,
+            logging_config=logging_config,
+            logging_kwargs=logging_kwargs,
+        )
+        return config, instance_name
 
     def _build_dir_configs(
         self,
@@ -399,7 +526,7 @@ class IOHelper:
                 "logs": config.logs,
             }
             for name, cfg in config.custom_dirs.items():
-                if name in {"raw", "processed", "logs"}:
+                if name in self._STANDARD_DIRS:
                     raise ValueError(
                         f"Cannot use IOConfig directory name '{name}' in custom_dirs. "
                         f"Configure it directly via config.{name} instead."
@@ -468,11 +595,22 @@ class IOHelper:
         return path
 
     def _create_dir_symlink(self, dir_path: Path, symlink_to: Path) -> None:
-        target = symlink_to.expanduser().resolve(strict=True)
+        target = symlink_to.expanduser()
 
-        # Ensure symlink_to is a directory (and exists)
-        if not target.is_dir():
-            raise FileNotFoundError(f"{target} is not a directory.")
+        # If the target is a relative path, make it absolute
+        if not target.is_absolute():
+            target = target.resolve(strict=True)
+
+        # Target must exist
+        if not target.exists():
+            raise FileNotFoundError(f"{target} does not exist.")
+
+        # Resolved target must be a directory
+        resolved = target.resolve(strict=True)
+        if not resolved.is_dir():
+            raise FileNotFoundError(
+                f"{target} does not resolve to a directory."
+            )
 
         # Remove the old symlink if it exists
         if dir_path.exists() or dir_path.is_symlink():
@@ -573,7 +711,15 @@ class IOHelper:
             link_path (Path):
                 Path of the created symlink.
         """
-        target = target.expanduser().resolve(strict=True)
+        target = target.expanduser()
+
+        # If the target is a relative path, make it absolute
+        if not target.is_absolute():
+            target = target.resolve(strict=True)
+
+        # Target must exist
+        if not target.exists():
+            raise FileNotFoundError(f"{target} does not exist.")
 
         if link_name is None:
             link_name = target.name
@@ -587,7 +733,9 @@ class IOHelper:
                     f"{link_path} exists and is not a symlink."
                 )
 
-        link_path.symlink_to(target, target_is_directory=target.is_dir())
+        # Check if resolved target is directory (for symlink_to flag)
+        resolved = target.resolve(strict=True)
+        link_path.symlink_to(target, target_is_directory=resolved.is_dir())
         self.logger.info(f"Created symlink {link_path} -> {target}")
         return link_path
 

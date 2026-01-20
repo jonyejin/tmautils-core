@@ -36,6 +36,7 @@ class ASdbCategoryUtil:
         self,
         year: int = 2024,
         month: int = 1,
+        *,
         working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
@@ -43,8 +44,9 @@ class ASdbCategoryUtil:
         working_root = IOHelper.handle_working_root_data_dir(
             working_root, data_dir
         )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "logs"},
             working_root=working_root,
             **kwargs,
         )

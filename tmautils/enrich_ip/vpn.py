@@ -36,8 +36,9 @@ class VpnIpAz0:
         working_root = IOHelper.handle_working_root_data_dir(
             working_root, data_dir
         )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "logs"},
             working_root=working_root,
             **kwargs,
         )
@@ -187,17 +188,15 @@ class ListsVpnX4BNet:
         working_root = IOHelper.handle_working_root_data_dir(
             working_root, data_dir
         )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "logs"},
             working_root=working_root,
             **kwargs
         )
 
         # Download raw files and load into DataFrames
         self._download_lists()
-
-        # Load into DataFrames
-        self._load_dataframes()
 
         self.io_helper.logger.info("Initialized ListsVpnX4BNet")
 
@@ -335,10 +334,12 @@ class IpInfoPrivacyUtil:
         working_root = IOHelper.handle_working_root_data_dir(
             working_root, data_dir
         )
-        self.io_helper = IOHelper(
+
+        kwargs.setdefault("raw_dir_symlink_to", ipinfo_privacy_dir)
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "processed", "logs"},
             working_root=working_root,
-            raw_dir_symlink_to=ipinfo_privacy_dir,
             **kwargs,
         )
 

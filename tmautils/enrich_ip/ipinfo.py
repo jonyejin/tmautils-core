@@ -38,12 +38,15 @@ class IPInfoLiteUtil:
         working_root = IOHelper.handle_working_root_data_dir(
             working_root, data_dir
         )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "processed", "logs"},
             working_root=working_root,
             **kwargs,
         )
-        raw_path = self.io_helper.create_symlink("raw", ipinfo_lite_path)
+        raw_path = self.io_helper.create_symlink(
+            self.io_helper.raw, ipinfo_lite_path
+        )
 
         # If the file is compressed, decompress it
         if raw_path.suffix == ".gz":

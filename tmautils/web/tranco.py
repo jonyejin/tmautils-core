@@ -19,19 +19,17 @@ class TrancoTopListUtil:
         subdomains: bool = False,
         full: bool = False,
         n_top_sites: int = 100000,
+        *,
         working_root: Path | None = None,
-        data_dir: Path | None = None,
         **kwargs,
     ):
         import tranco
 
         self.n_top_sites = n_top_sites
 
-        working_root = IOHelper.handle_working_root_data_dir(
-            working_root, data_dir
-        )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "logs"},
             working_root=working_root,
             **kwargs,
         )
@@ -84,9 +82,6 @@ class PeriodicTrancoCrawlUtil:
             Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
 
-        data_dir (Path | None):
-            Deprecated alias for `working_root`.
-
         **kwargs (dict):
             Additional arguments for IOHelper.
             See the IOHelper class for more details.
@@ -98,19 +93,17 @@ class PeriodicTrancoCrawlUtil:
         continue_only: bool = True,
         top_count: int = 100000,
         openwpm_args: dict = {},
+        *,
         working_root: Path | None = None,
-        data_dir: Path | None = None,
         **kwargs,
     ):
         self.openwpm_path = openwpm_path
         self.openwpm_args = openwpm_args
         self.top_count = top_count
 
-        working_root = IOHelper.handle_working_root_data_dir(
-            working_root, data_dir
-        )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"logs"},
             working_root=working_root,
             **kwargs,
         )
@@ -256,9 +249,6 @@ class TrancoProcessUtil:
             Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
 
-        data_dir (Path | None):
-            Deprecated alias for `working_root`.
-
         **kwargs (dict):
             Additional arguments for IOHelper.
             See the IOHelper class for more details.
@@ -269,7 +259,6 @@ class TrancoProcessUtil:
         openwpm_crawl_path: Path,
         crawl_date: str,
         working_root: Path | None = None,
-        data_dir: Path | None = None,
         **kwargs,
     ):
         # Verify that crawl_date is in the correct format
@@ -292,15 +281,16 @@ class TrancoProcessUtil:
                 f"the expected directory structure for crawl date {crawl_date}."
             )
 
-        working_root = IOHelper.handle_working_root_data_dir(
-            working_root, data_dir
-        )
-        self.io_helper = IOHelper(
+        kwargs.setdefault("raw_dir_symlink_to",
+                          crawl_base_path / crawl_date / "raw")
+        kwargs.setdefault("processed_dir_symlink_to",
+                          crawl_base_path / crawl_date / "processed")
+        kwargs.setdefault("instance_name", self.crawl_date)
+
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
-            instance_name=self.crawl_date,
+            dirs={"raw", "processed", "logs"},
             working_root=working_root,
-            raw_dir_symlink_to=crawl_base_path / crawl_date / "raw",
-            processed_dir_symlink_to=crawl_base_path / crawl_date / "processed",
             **kwargs,
         )
 

@@ -95,9 +95,9 @@ class CzdsDownloadUtil:
                 f"{self._ENV_USERNAME} and {self._ENV_PASSWORD} environment variables."
             )
 
-        # Set up IOHelper
-        self._io_helper = IOHelper(
+        self._io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "logs"},
             working_root=working_root,
             **kwargs,
         )

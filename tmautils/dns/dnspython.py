@@ -38,9 +38,6 @@ class AsyncDnsPythonUtil:
             Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
 
-        data_dir (Path | None):
-            Deprecated alias for `working_root`.
-
         **kwargs:
             Additional keyword arguments for IOHelper.
             See IOHelper documentation for more details.
@@ -57,15 +54,13 @@ class AsyncDnsPythonUtil:
         nameservers: Optional[list[str]] = None,
         max_concurrent_requests: int = 500,
         cachesize: int = 500000,
+        *,
         working_root: Path | None = None,
-        data_dir: Path | None = None,
         **kwargs
     ):
-        working_root = IOHelper.handle_working_root_data_dir(
-            working_root, data_dir
-        )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"logs"},
             working_root=working_root,
             **kwargs,
         )

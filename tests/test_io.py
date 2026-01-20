@@ -467,6 +467,171 @@ class TestCreateSymlink:
         assert link_path.is_symlink()
 
 
+class TestSymlinkToSymlink:
+    """Tests for symlink-to-symlink behavior (preserving intermediate symlinks)."""
+
+    def test_dir_symlink_to_symlink_preserves_intermediate(self, tmp_path: Path):
+        """DirConfig symlink_to a symlink preserves the intermediate symlink."""
+        # Create chain: A -> B -> real_dir
+        real_dir = tmp_path / "real_dir"
+        real_dir.mkdir()
+        (real_dir / "test.txt").write_text("content")
+
+        symlink_b = tmp_path / "symlink_b"
+        symlink_b.symlink_to(real_dir, target_is_directory=True)
+
+        symlink_a = tmp_path / "symlink_a"
+        symlink_a.symlink_to(symlink_b, target_is_directory=True)
+
+        # Create IOHelper with raw pointing to symlink_a
+        config = IOConfig(
+            raw=DirConfig(symlink_to=symlink_a),
+        )
+        io = IOHelper("TestUtil", config=config, working_root=tmp_path, setup_logging=False)
+
+        # Access raw to trigger creation
+        raw_path = io.raw
+
+        # Verify: raw is a symlink pointing to symlink_a (not resolved to real_dir)
+        assert raw_path.is_symlink()
+        assert raw_path.readlink() == symlink_a  # Points to symlink_a, not real_dir
+
+        # But the content should still be accessible
+        assert (raw_path / "test.txt").read_text() == "content"
+
+    def test_top_level_symlink_to_symlink_preserves_intermediate(self, tmp_path: Path):
+        """top_level_symlink_to a symlink preserves the intermediate symlink."""
+        # Create chain: A -> B -> real_dir
+        real_dir = tmp_path / "real_dir"
+        real_dir.mkdir()
+
+        symlink_b = tmp_path / "symlink_b"
+        symlink_b.symlink_to(real_dir, target_is_directory=True)
+
+        symlink_a = tmp_path / "symlink_a"
+        symlink_a.symlink_to(symlink_b, target_is_directory=True)
+
+        # Create IOHelper with top_level pointing to symlink_a
+        config = IOConfig(top_level_symlink_to=symlink_a)
+        io = IOHelper("TestUtil", config=config, working_root=tmp_path, setup_logging=False)
+
+        top_level = tmp_path / "TestUtil"
+        assert top_level.is_symlink()
+        assert top_level.readlink() == symlink_a  # Points to symlink_a, not real_dir
+
+    def test_create_symlink_to_symlink_preserves_intermediate(self, tmp_path: Path):
+        """create_symlink to a symlink preserves the intermediate symlink."""
+        io = IOHelper("TestUtil", working_root=tmp_path, setup_logging=False)
+
+        # Create chain: A -> B -> real_file
+        real_file = tmp_path / "real_file.txt"
+        real_file.write_text("content")
+
+        symlink_b = tmp_path / "symlink_b.txt"
+        symlink_b.symlink_to(real_file)
+
+        symlink_a = tmp_path / "symlink_a.txt"
+        symlink_a.symlink_to(symlink_b)
+
+        # Create symlink to symlink_a
+        link_path = io.create_symlink(io.raw, symlink_a)
+
+        # Verify: link points to symlink_a (not resolved to real_file)
+        assert link_path.is_symlink()
+        assert link_path.readlink() == symlink_a
+
+        # Content should still be accessible
+        assert link_path.read_text() == "content"
+
+    def test_create_symlink_to_dir_symlink_preserves_intermediate(self, tmp_path: Path):
+        """create_symlink to a directory symlink preserves the intermediate symlink."""
+        io = IOHelper("TestUtil", working_root=tmp_path, setup_logging=False)
+
+        # Create chain: A -> B -> real_dir
+        real_dir = tmp_path / "real_dir"
+        real_dir.mkdir()
+        (real_dir / "file.txt").write_text("content")
+
+        symlink_b = tmp_path / "symlink_b"
+        symlink_b.symlink_to(real_dir, target_is_directory=True)
+
+        symlink_a = tmp_path / "symlink_a"
+        symlink_a.symlink_to(symlink_b, target_is_directory=True)
+
+        # Create symlink to symlink_a
+        link_path = io.create_symlink(io.raw, symlink_a)
+
+        # Verify: link points to symlink_a (not resolved to real_dir)
+        assert link_path.is_symlink()
+        assert link_path.readlink() == symlink_a
+
+        # Content should still be accessible
+        assert (link_path / "file.txt").read_text() == "content"
+
+    def test_dir_symlink_relative_path_becomes_absolute(self, tmp_path: Path):
+        """Relative paths are converted to absolute paths."""
+        import os
+
+        # Create target directory
+        target_dir = tmp_path / "external" / "data"
+        target_dir.mkdir(parents=True)
+        (target_dir / "test.txt").write_text("content")
+
+        # Change to tmp_path so relative path works
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+
+            # Use relative path
+            config = IOConfig(
+                raw=DirConfig(symlink_to=Path("external/data")),
+            )
+            io = IOHelper("TestUtil", config=config, working_root=tmp_path, setup_logging=False)
+
+            raw_path = io.raw
+
+            # Symlink should point to absolute path (not relative)
+            assert raw_path.is_symlink()
+            link_target = raw_path.readlink()
+            assert link_target.is_absolute()
+            assert link_target == target_dir
+
+            # Content should be accessible
+            assert (raw_path / "test.txt").read_text() == "content"
+        finally:
+            os.chdir(old_cwd)
+
+    def test_create_symlink_relative_path_becomes_absolute(self, tmp_path: Path):
+        """create_symlink converts relative paths to absolute."""
+        import os
+
+        io = IOHelper("TestUtil", working_root=tmp_path, setup_logging=False)
+
+        # Create target file
+        target_file = tmp_path / "external" / "data.txt"
+        target_file.parent.mkdir(parents=True)
+        target_file.write_text("content")
+
+        # Change to tmp_path so relative path works
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(tmp_path)
+
+            # Use relative path
+            link_path = io.create_symlink(io.raw, Path("external/data.txt"))
+
+            # Symlink should point to absolute path
+            assert link_path.is_symlink()
+            link_target = link_path.readlink()
+            assert link_target.is_absolute()
+            assert link_target == target_file
+
+            # Content should be accessible
+            assert link_path.read_text() == "content"
+        finally:
+            os.chdir(old_cwd)
+
+
 class TestSymlinkErrors:
     """Tests for symlink error handling."""
 
@@ -492,7 +657,7 @@ class TestSymlinkErrors:
         )
         io = IOHelper("TestUtil", config=config, working_root=tmp_path, setup_logging=False)
 
-        with pytest.raises(FileNotFoundError, match="not a directory"):
+        with pytest.raises(FileNotFoundError, match="does not resolve to a directory"):
             _ = io.raw
 
     def test_top_level_symlink_target_not_found(self, tmp_path: Path):
@@ -511,7 +676,7 @@ class TestSymlinkErrors:
 
         config = IOConfig(top_level_symlink_to=target_file)
 
-        with pytest.raises(FileNotFoundError, match="not a directory"):
+        with pytest.raises(FileNotFoundError, match="does not resolve to a directory"):
             IOHelper("TestUtil", config=config, working_root=tmp_path, setup_logging=False)
 
     def test_top_level_symlink_existing_dir_raises(self, tmp_path: Path):
@@ -612,3 +777,148 @@ class TestDeprecatedDataDir:
 
         with pytest.raises(ValueError, match="different values"):
             IOHelper("TestUtil", data_dir=tmp_path, working_root=other_path, setup_logging=False)
+
+
+class TestInitWithDirs:
+    """Tests for IOHelper.init_with_dirs classmethod."""
+
+    def test_basic_structure(self, tmp_path: Path):
+        """Basic init_with_dirs creates only specified dirs."""
+        io = IOHelper.init_with_dirs(
+            "TestUtil",
+            dirs={"raw", "logs"},
+            working_root=tmp_path,
+            setup_logging=False,
+        )
+
+        # raw and logs should exist (lazy on access)
+        assert io.raw.is_dir()
+        assert io.logs.is_dir()
+
+        # processed should not exist and accessing it should raise
+        assert not (tmp_path / "TestUtil" / "processed").exists()
+        with pytest.raises(RuntimeError, match="disabled"):
+            _ = io.processed
+
+    def test_custom_dirs_in_structure(self, tmp_path: Path):
+        """init_with_dirs handles custom dirs correctly."""
+        io = IOHelper.init_with_dirs(
+            "TestUtil",
+            dirs={"cache", "logs"},  # cache is not a standard dir
+            working_root=tmp_path,
+            setup_logging=False,
+        )
+
+        # cache should be accessible
+        assert io.cache.is_dir()
+        assert io.logs.is_dir()
+
+        # Standard dirs not in the set should be disabled
+        with pytest.raises(RuntimeError, match="disabled"):
+            _ = io.raw
+
+    def test_symlink_for_dirs_in_structure(self, tmp_path: Path):
+        """init_with_dirs allows symlinks for dirs in structure."""
+        target = tmp_path / "external_raw"
+        target.mkdir()
+
+        io = IOHelper.init_with_dirs(
+            "TestUtil",
+            dirs={"raw", "logs"},
+            working_root=tmp_path,
+            raw_dir_symlink_to=target,
+            setup_logging=False,
+        )
+
+        assert io.raw.is_symlink()
+        assert io.raw.resolve() == target
+
+    def test_symlink_for_custom_dir_in_structure(self, tmp_path: Path):
+        """init_with_dirs allows symlinks for custom dirs."""
+        target = tmp_path / "external_cache"
+        target.mkdir()
+
+        io = IOHelper.init_with_dirs(
+            "TestUtil",
+            dirs={"cache", "logs"},
+            working_root=tmp_path,
+            cache_dir_symlink_to=target,
+            setup_logging=False,
+        )
+
+        assert io.cache.is_symlink()
+        assert io.cache.resolve() == target
+
+    def test_symlink_for_dir_not_in_structure_raises(self, tmp_path: Path):
+        """init_with_dirs rejects symlinks for dirs not in structure."""
+        target = tmp_path / "external_processed"
+        target.mkdir()
+
+        with pytest.raises(ValueError, match="Cannot symlink 'processed'"):
+            IOHelper.init_with_dirs(
+                "TestUtil",
+                dirs={"raw", "logs"},  # processed not in structure
+                working_root=tmp_path,
+                processed_dir_symlink_to=target,
+                setup_logging=False,
+            )
+
+    def test_top_level_symlink(self, tmp_path: Path):
+        """init_with_dirs supports top_level_symlink_to."""
+        target = tmp_path / "external"
+        target.mkdir()
+
+        io = IOHelper.init_with_dirs(
+            "TestUtil",
+            dirs={"raw", "logs"},
+            working_root=tmp_path,
+            top_level_symlink_to=target,
+            setup_logging=False,
+        )
+
+        assert io.top_level_dir.is_symlink()
+        assert io.top_level_dir.resolve() == target
+
+    def test_instance_name(self, tmp_path: Path):
+        """init_with_dirs supports instance_name."""
+        io = IOHelper.init_with_dirs(
+            "TestUtil",
+            dirs={"raw", "logs"},
+            working_root=tmp_path,
+            instance_name="prod",
+            setup_logging=False,
+        )
+
+        assert io.top_level_dir == tmp_path / "TestUtil" / "prod"
+        assert io.raw == tmp_path / "TestUtil" / "prod" / "raw"
+
+    def test_logging_config(self, tmp_path: Path):
+        """init_with_dirs passes through logging config."""
+        io = IOHelper.init_with_dirs(
+            "TestUtil",
+            dirs={"logs"},  # Only logs
+            working_root=tmp_path,
+            setup_logging=True,
+            logging_kwargs={"file_level": None},  # Disable file logging
+        )
+
+        assert io.has_logger
+        assert io.logger is not None
+
+    def test_unknown_kwargs_warns(self, tmp_path: Path):
+        """init_with_dirs warns about unknown kwargs."""
+        import warnings
+
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            IOHelper.init_with_dirs(
+                "TestUtil",
+                dirs={"raw", "logs"},
+                working_root=tmp_path,
+                setup_logging=False,
+                unknown_param="value",
+            )
+
+            assert len(w) == 1
+            assert "Unknown kwargs" in str(w[0].message)
+            assert "unknown_param" in str(w[0].message)

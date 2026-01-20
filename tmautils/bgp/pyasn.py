@@ -43,6 +43,7 @@ class PyasnUtil:
         year: int,
         month: int,
         day: int = 1,
+        *,
         working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
@@ -50,8 +51,9 @@ class PyasnUtil:
         working_root = IOHelper.handle_working_root_data_dir(
             working_root, data_dir
         )
-        self.io_helper = IOHelper(
+        self.io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
+            dirs={"raw", "processed", "logs"},
             working_root=working_root,
             **kwargs,
         )
