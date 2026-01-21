@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 Sulyab Thottungal Valapu
+
 from typing import Any, Dict, Optional, Union
 from enum import StrEnum
 from dataclasses import dataclass, field, asdict

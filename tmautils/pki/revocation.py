@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 Sulyab Thottungal Valapu
+
 """
 Certificate revocation checking via OCSP and CRL.
 

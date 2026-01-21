@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 Sulyab Thottungal Valapu, Yejin Cho
+
 from typing import Any
 from pathlib import Path
 from ipaddress import ip_address, IPv4Address, IPv6Address

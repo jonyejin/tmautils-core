@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 Sulyab Thottungal Valapu
+
 from typing import Callable, Union
 from functools import wraps
 from ipaddress import ip_address, IPv4Address, IPv6Address

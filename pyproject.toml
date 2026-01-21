@@ -14,6 +14,7 @@ name = "tmautils"
 description = "Internet Measurement Research Utilities"
 dynamic = ["version"]
 readme = "README.md"
+license = "MPL-2.0"
 authors = [
     {name = "Sulyab Thottungal Valapu", email = "sulyabtv@gmail.com"},
     {name = "Yejin Cho", email = "i3pivigui@icloud.com"}

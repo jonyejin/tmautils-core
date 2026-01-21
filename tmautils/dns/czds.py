@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 Sulyab Thottungal Valapu
+
 from typing import Any
 from pathlib import Path
 from datetime import date, datetime, timedelta, timezone

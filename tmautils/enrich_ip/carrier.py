@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 Sulyab Thottungal Valapu, Yejin Cho
+
 from pathlib import Path
 import pandas as pd
 import warnings

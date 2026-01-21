@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+# Copyright (c) 2026 Sulyab Thottungal Valapu
+
 from enum import Enum
 from typing import Union
 from ipaddress import IPv4Address, IPv6Address
