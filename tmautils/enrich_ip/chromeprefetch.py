@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MPL-2.0
-# Copyright (c) 2026 Sulyab Thottungal Valapu, Yejin Cho
+# Copyright (c) 2026 Yejin Cho
 
 from ipaddress import IPv6Address, ip_network
 from pathlib import Path
