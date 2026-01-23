@@ -830,5 +830,287 @@ def test_request_kwargs_passed_through_for_post():
     _run_async(_test())
 
 
+# ===== AsyncRateLimiter Tests =====
+
+from tmautils.common import AsyncRateLimiter, RateLimitScope
+from tmautils.web import url_to_rate_limit_key
+
+
+async def test_rate_limiter_no_limits():
+    """Test AsyncRateLimiter with no limits configured (passthrough)."""
+    limiter = AsyncRateLimiter()
+    # Should be able to acquire without blocking
+    async with limiter.acquire("key1"):
+        pass
+    async with limiter.acquire("key2"):
+        pass
+
+
+async def test_rate_limiter_concurrency_global():
+    """Test global concurrency limit blocks when exceeded."""
+    limiter = AsyncRateLimiter(max_concurrent=2, scope=RateLimitScope.GLOBAL)
+    acquired = []
+    released = []
+
+    async def acquire_and_hold(key: str, delay: float):
+        async with limiter.acquire(key):
+            acquired.append(key)
+            await asyncio.sleep(delay)
+            released.append(key)
+
+    # Start 3 tasks, only 2 should acquire immediately
+    task1 = asyncio.create_task(acquire_and_hold("a", 0.1))
+    task2 = asyncio.create_task(acquire_and_hold("b", 0.1))
+    task3 = asyncio.create_task(acquire_and_hold("c", 0.1))
+
+    await asyncio.sleep(0.01)  # Let tasks start
+    assert len(acquired) == 2  # Third blocked
+
+    await asyncio.gather(task1, task2, task3)
+    assert len(acquired) == 3  # All completed
+    assert len(released) == 3
+
+
+async def test_rate_limiter_concurrency_per_key():
+    """Test per-key concurrency allows different keys in parallel."""
+    limiter = AsyncRateLimiter(max_concurrent=1, scope=RateLimitScope.PER_KEY)
+    acquired = []
+
+    async def acquire_and_hold(key: str, delay: float):
+        async with limiter.acquire(key):
+            acquired.append(key)
+            await asyncio.sleep(delay)
+
+    # Start 2 tasks with different keys - both should acquire
+    task1 = asyncio.create_task(acquire_and_hold("a.com", 0.1))
+    task2 = asyncio.create_task(acquire_and_hold("b.com", 0.1))
+
+    await asyncio.sleep(0.01)
+    assert len(acquired) == 2  # Different keys, both acquired
+
+    await asyncio.gather(task1, task2)
+
+
+async def test_rate_limiter_concurrency_per_key_same_key_blocks():
+    """Test per-key concurrency blocks same key."""
+    limiter = AsyncRateLimiter(max_concurrent=1, scope=RateLimitScope.PER_KEY)
+    acquired = []
+
+    async def acquire_and_hold(key: str, delay: float):
+        async with limiter.acquire(key):
+            acquired.append(key)
+            await asyncio.sleep(delay)
+
+    # Start 2 tasks with same key - second should block
+    task1 = asyncio.create_task(acquire_and_hold("a.com", 0.1))
+    task2 = asyncio.create_task(acquire_and_hold("a.com", 0.1))
+
+    await asyncio.sleep(0.01)
+    assert len(acquired) == 1  # Same key, second blocked
+
+    await asyncio.gather(task1, task2)
+    assert len(acquired) == 2
+
+
+async def test_rate_limiter_rate_global():
+    """Test global rate limiting with token bucket."""
+    # Allow 10 per second
+    limiter = AsyncRateLimiter(max_rate=10, scope=RateLimitScope.GLOBAL)
+    start_time = asyncio.get_event_loop().time()
+
+    # Make 3 requests
+    for _ in range(3):
+        async with limiter.acquire("example.com"):
+            pass
+
+    elapsed = asyncio.get_event_loop().time() - start_time
+    # Token bucket should allow bursts, so 3 requests shouldn't take long
+    # But it should track the rate
+    assert elapsed < 1.0  # Should be fast (within burst capacity)
+
+
+async def test_rate_limiter_rate_with_time_period():
+    """Test rate limiting with custom time period (60 requests per minute)."""
+    # 60 per minute = 1 per second
+    limiter = AsyncRateLimiter(max_rate=60, time_period=60, scope=RateLimitScope.GLOBAL)
+    start_time = asyncio.get_event_loop().time()
+
+    # Make 3 requests - should be within burst capacity
+    for _ in range(3):
+        async with limiter.acquire("example.com"):
+            pass
+
+    elapsed = asyncio.get_event_loop().time() - start_time
+    assert elapsed < 1.0  # Should be fast (within burst capacity)
+
+
+async def test_rate_limiter_both_limits():
+    """Test that both concurrency and rate limits are applied."""
+    limiter = AsyncRateLimiter(
+        max_concurrent=2,
+        max_rate=10,
+        scope=RateLimitScope.GLOBAL,
+    )
+    acquired = []
+
+    async def acquire_and_hold(key: str, delay: float):
+        async with limiter.acquire(key):
+            acquired.append(key)
+            await asyncio.sleep(delay)
+
+    # Start 3 tasks - only 2 should acquire due to semaphore
+    task1 = asyncio.create_task(acquire_and_hold("a", 0.1))
+    task2 = asyncio.create_task(acquire_and_hold("b", 0.1))
+    task3 = asyncio.create_task(acquire_and_hold("c", 0.1))
+
+    await asyncio.sleep(0.01)
+    assert len(acquired) == 2
+
+    await asyncio.gather(task1, task2, task3)
+    assert len(acquired) == 3
+
+
+async def test_url_to_rate_limit_key_normalization():
+    """Test that url_to_rate_limit_key extracts hostname correctly."""
+    # Same host, different paths - should produce same key
+    assert url_to_rate_limit_key("http://example.com/path1") == "example.com"
+    assert url_to_rate_limit_key("http://example.com/path2") == "example.com"
+    assert url_to_rate_limit_key("https://example.com:443/path") == "example.com"
+
+
+async def test_url_to_rate_limit_key_case_insensitive():
+    """Test that url_to_rate_limit_key is case-insensitive."""
+    assert url_to_rate_limit_key("http://EXAMPLE.COM/path") == "example.com"
+    assert url_to_rate_limit_key("http://Example.Com/path") == "example.com"
+
+
+# ===== request_with_retry with AsyncRateLimiter Tests =====
+
+
+async def test_request_with_retry_with_rate_limiter():
+    """Test request_with_retry works with rate_limiter parameter."""
+    limiter = AsyncRateLimiter(max_concurrent=10)
+
+    mock_session = Mock()
+    mock_response = MockResponse(200)
+    mock_session.request = AsyncMock(return_value=mock_response)
+
+    async with request_with_retry(
+        mock_session, "GET", "http://example.com", rate_limiter=limiter
+    ) as resp:
+        assert resp.status == 200
+
+    # Verify request was called
+    assert mock_session.request.call_count == 1
+
+
+async def test_request_with_retry_without_rate_limiter():
+    """Test request_with_retry works without rate_limiter (backwards compat)."""
+    mock_session = Mock()
+    mock_response = MockResponse(200)
+    mock_session.request = AsyncMock(return_value=mock_response)
+
+    async with request_with_retry(mock_session, "GET", "http://example.com") as resp:
+        assert resp.status == 200
+
+    assert mock_session.request.call_count == 1
+
+
+async def test_request_with_retry_acquire_per_attempt():
+    """Test acquire is called per attempt, not held through backoff."""
+    acquire_count = 0
+    release_count = 0
+
+    limiter = AsyncRateLimiter(max_concurrent=1, scope=RateLimitScope.GLOBAL)
+
+    # Track acquire/release calls
+    original_acquire = limiter.acquire
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def tracked_acquire(key):
+        nonlocal acquire_count, release_count
+        acquire_count += 1
+        try:
+            async with original_acquire(key):
+                yield
+        finally:
+            release_count += 1
+
+    limiter.acquire = tracked_acquire
+
+    mock_session = Mock()
+    # First returns 429 (retryable), second returns 200
+    mock_responses = [MockResponse(429), MockResponse(200)]
+    mock_session.request = AsyncMock(side_effect=mock_responses)
+
+    async with request_with_retry(
+        mock_session, "GET", "http://example.com",
+        rate_limiter=limiter, max_attempts=2
+    ) as resp:
+        assert resp.status == 200
+
+    # Should have acquired twice (once per attempt)
+    assert acquire_count == 2
+    assert release_count == 2
+
+
+async def test_request_with_retry_concurrency_during_retry():
+    """Test that another request can proceed during retry backoff."""
+    limiter = AsyncRateLimiter(max_concurrent=1, scope=RateLimitScope.GLOBAL)
+
+    mock_session = Mock()
+    # Request 1: returns 429, then 200 after retry
+    responses_1 = [MockResponse(429, {"Retry-After": "0.1"}), MockResponse(200)]
+    request_1_count = [0]
+
+    async def make_request_1():
+        def side_effect(*args, **kwargs):
+            result = responses_1[request_1_count[0]]
+            request_1_count[0] += 1
+            return result
+
+        mock_session.request = AsyncMock(side_effect=side_effect)
+        async with request_with_retry(
+            mock_session, "GET", "http://example.com/1",
+            rate_limiter=limiter, max_attempts=2
+        ) as resp:
+            return resp.status
+
+    # Request 2: returns 200 immediately
+    request_2_acquired = []
+
+    async def make_request_2():
+        # This should be able to acquire during request 1's backoff
+        await asyncio.sleep(0.05)  # Wait for request 1 to release
+        async with limiter.acquire("example.com"):
+            request_2_acquired.append(True)
+
+    task1 = asyncio.create_task(make_request_1())
+    task2 = asyncio.create_task(make_request_2())
+
+    await asyncio.gather(task1, task2)
+
+    # Request 2 should have been able to acquire during backoff
+    assert len(request_2_acquired) == 1
+
+
+async def test_get_with_retry_with_rate_limiter():
+    """Test get_with_retry works with rate_limiter parameter."""
+    from tmautils.web import get_with_retry
+
+    limiter = AsyncRateLimiter(max_concurrent=10)
+
+    mock_session = Mock()
+    mock_response = MockResponse(200)
+    mock_session.request = AsyncMock(return_value=mock_response)
+
+    async with get_with_retry(
+        mock_session, "http://example.com", rate_limiter=limiter
+    ) as resp:
+        assert resp.status == 200
+
+
 if __name__ == "__main__":
     pytest.main(["-vv", "-rA", __file__])

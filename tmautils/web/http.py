@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MPL-2.0
 # Copyright (c) 2026 Sulyab Thottungal Valapu
 
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Callable, Optional
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, AbstractAsyncContextManager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+import urllib.parse
+
 import aiohttp
 from tenacity import (
     AsyncRetrying,
@@ -14,7 +16,38 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from tmautils.common import LogHelper, get_logger_from_helper
+from tmautils.common import (
+    LogHelper,
+    get_logger_from_helper,
+    AsyncRateLimiter,
+    RateLimitScope,
+)
+
+
+def url_to_rate_limit_key(url: str) -> str:
+    """Extract hostname from URL for use as rate limit key."""
+    return (urllib.parse.urlparse(url).hostname or "").lower()
+
+
+@asynccontextmanager
+async def _noop_acquire() -> AsyncIterator[None]:
+    """No-op context manager when no rate limiter provided."""
+    yield
+
+
+def _get_acquire_func(
+    url: str,
+    rate_limiter: AsyncRateLimiter | None,
+) -> Callable[[], AbstractAsyncContextManager[None]]:
+    """Get acquire function from rate limiter or return no-op."""
+    if rate_limiter is not None:
+        # Extract key at call site for per-key limiting
+        key = (
+            url_to_rate_limit_key(url)
+            if rate_limiter._scope == RateLimitScope.PER_KEY else None
+        )
+        return lambda: rate_limiter.acquire(key)
+    return _noop_acquire
 
 
 class _RetryableHTTPStatus(aiohttp.ClientError):
@@ -68,6 +101,7 @@ async def request_with_retry(
     method: str,
     url: str,
     *,
+    rate_limiter: AsyncRateLimiter | None = None,
     data: Any = None,
     json: Any = None,
     attempt_timeout: float = 10.0,
@@ -93,6 +127,11 @@ async def request_with_retry(
 
         url:
             URL to send the request to.
+
+        rate_limiter:
+            Optional AsyncRateLimiter for rate limiting.
+            When provided, rate limits are acquired per-attempt
+            and released during retry backoffs.
 
         data:
             Request body data.
@@ -159,10 +198,20 @@ async def request_with_retry(
             If a timeout occurs during the request.
 
     Examples:
-        GET request:
+        GET request with plain session:
         ```python
         async with request_with_retry(session, "GET", url) as resp:
             data = await resp.json()
+        ```
+
+        GET request with rate limiter:
+        ```python
+        limiter = AsyncRateLimiter(max_concurrent=10)
+        async with aiohttp.ClientSession() as session:
+            async with request_with_retry(
+                session, "GET", url, rate_limiter=limiter
+            ) as resp:
+                data = await resp.json()
         ```
 
         HEAD request:
@@ -190,6 +239,9 @@ async def request_with_retry(
     # Validate parameters
     if data is not None and json is not None:
         raise ValueError("Cannot specify both 'data' and 'json' parameters")
+
+    # Get acquire function from rate limiter
+    acquire = _get_acquire_func(url, rate_limiter)
 
     # Set method-specific default retry statuses
     method = method.upper()
@@ -220,38 +272,42 @@ async def request_with_retry(
     async for attempt in retrying:
         with attempt:
             try:
-                # Send HTTP Request
-                resp = await session.request(
-                    method=method,
-                    url=url,
-                    data=data,
-                    json=json,
-                    timeout=timeout,
-                    **request_kwargs
-                )
-
-                # Check for retryable status
-                if resp.status in retry_statuses:
-                    # Use Retry-After if applicable
-                    status = resp.status
-                    retry_after = None
-                    if respect_retry_after:
-                        retry_after = _parse_retry_after(
-                            resp.headers.get("Retry-After")
-                        )
-                        if retry_after is not None:
-                            retry_after = min(retry_after, max_retry_after)
-
-                    logger.info(
-                        "Retryable HTTP %s for %s %s (retry_after=%s)",
-                        status, method, url, retry_after
+                # Acquire rate limits per attempt (released during backoff)
+                async with acquire():
+                    # Send HTTP Request
+                    resp = await session.request(
+                        method=method,
+                        url=url,
+                        data=data,
+                        json=json,
+                        timeout=timeout,
+                        **request_kwargs
                     )
 
-                    # Release connection before retrying
-                    resp.release()
-                    resp = None
+                    # Check for retryable status
+                    if resp.status in retry_statuses:
+                        # Use Retry-After if applicable
+                        status = resp.status
+                        retry_after = None
+                        if respect_retry_after:
+                            retry_after = _parse_retry_after(
+                                resp.headers.get("Retry-After")
+                            )
+                            if retry_after is not None:
+                                retry_after = min(retry_after, max_retry_after)
 
-                    raise _RetryableHTTPStatus(status, retry_after=retry_after)
+                        logger.info(
+                            "Retryable HTTP %s for %s %s (retry_after=%s)",
+                            status, method, url, retry_after
+                        )
+
+                        # Release connection before retrying
+                        resp.release()
+                        resp = None
+
+                        raise _RetryableHTTPStatus(
+                            status, retry_after=retry_after
+                        )
 
                 # Success or non-retryable status - break out of retry loop
                 break
@@ -281,6 +337,7 @@ async def get_with_retry(
     session: aiohttp.ClientSession,
     url: str,
     *,
+    rate_limiter: AsyncRateLimiter | None = None,
     attempt_timeout: float = 10.0,
     max_attempts: int = 3,
     retry_statuses: frozenset[int] = frozenset({429, 500, 502, 503, 504}),
@@ -303,6 +360,7 @@ async def get_with_retry(
         session=session,
         method="GET",
         url=url,
+        rate_limiter=rate_limiter,
         attempt_timeout=attempt_timeout,
         max_attempts=max_attempts,
         retry_statuses=retry_statuses,
