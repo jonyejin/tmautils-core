@@ -17,7 +17,7 @@ import asyncio
 import aiohttp
 import cryptography.x509 as x509
 
-from tmautils.common import IOHelper, run_coro_sync
+from tmautils.common import IOHelper, run_coro_sync, AsyncRateLimiter
 
 from .types import (
     RevocationStatus,
@@ -30,7 +30,7 @@ from .types import (
 )
 from ._ocsp import OCSPHelper
 from ._crl import CRLHelper
-from .cert import fetch_issuer_cert, fetch_issuer_chain
+from .cert import fetch_issuer_cert, fetch_issuer_chain, IssuerFetchError
 
 
 class RevocationChecker:
@@ -42,8 +42,9 @@ class RevocationChecker:
             Default is 10.0 seconds.
         max_attempts: Maximum number of retry attempts for HTTP requests.
             Default is 3.
-        max_concurrent: Maximum number of concurrent HTTP requests.
-            Default is 20.
+        rate_limiter:
+            Optional AsyncRateLimiter for controlling HTTP request concurrency and rate.
+            If None, a default AsyncRateLimiter with no limits is used.
         working_root: Base directory for IOHelper. If None, uses default.
         **kwargs: Additional arguments passed to IOHelper.
 
@@ -62,6 +63,14 @@ class RevocationChecker:
             print("Certificate is revoked!")
         ```
 
+        With rate limiting:
+        ```python
+        from tmautils.common import AsyncRateLimiter
+
+        # Limit to 10 concurrent requests
+        checker = RevocationChecker(rate_limiter=AsyncRateLimiter(max_concurrent=10))
+        ```
+
         Using explicit issuer (avoids download):
         ```python
         from tmautils.pki import get_cert_chain
@@ -76,17 +85,14 @@ class RevocationChecker:
         *,
         request_timeout: float = 10.0,
         max_attempts: int = 3,
-        max_concurrent: int = 20,
+        rate_limiter: AsyncRateLimiter | None = None,
         working_root: Path | None = None,
         **kwargs: Any,
     ):
         # Store configuration
         self._request_timeout = request_timeout
         self._max_attempts = max_attempts
-        self._max_concurrent = max_concurrent
-
-        # Semaphore for limiting concurrent HTTP requests
-        self._http_semaphore = asyncio.Semaphore(max_concurrent)
+        self._rate_limiter = rate_limiter or AsyncRateLimiter()
 
         # Initialize IOHelper
         self._io_helper = IOHelper.init_with_dirs(
@@ -104,14 +110,14 @@ class RevocationChecker:
 
         # Initialize helper modules
         self._ocsp_helper = OCSPHelper(
-            self._http_semaphore,
+            self._rate_limiter,
             request_timeout=request_timeout,
             max_attempts=max_attempts,
             log_helper=self._io_helper.log_helper,
         )
 
         self._crl_helper = CRLHelper(
-            self._http_semaphore,
+            self._rate_limiter,
             crl_cache_dir=self._crl_cache_dir,
             issuer_cache_dir=self._issuer_cache_dir,
             request_timeout=request_timeout,
@@ -121,8 +127,8 @@ class RevocationChecker:
 
         self._io_helper.logger.info(
             "RevocationChecker initialized: "
-            "request_timeout=%ds, max_attempts=%d, max_concurrent=%d",
-            request_timeout, max_attempts, max_concurrent,
+            "request_timeout=%ds, max_attempts=%d",
+            request_timeout, max_attempts,
         )
 
     async def check_cert(
@@ -190,15 +196,15 @@ class RevocationChecker:
                 self._io_helper.logger.debug(
                     f"Checking certificate {cert.serial_number} (auto-fetching issuer)"
                 )
-                async with self._http_semaphore:
-                    issuer = await fetch_issuer_cert(
-                        cert,
-                        cache_dir=self._issuer_cache_dir,
-                        session=session,
-                        timeout=self._request_timeout,
-                        max_attempts=self._max_attempts,
-                        log_helper=self._io_helper.log_helper,
-                    )
+                issuer = await fetch_issuer_cert(
+                    cert,
+                    cache_dir=self._issuer_cache_dir,
+                    session=session,
+                    timeout=self._request_timeout,
+                    max_attempts=self._max_attempts,
+                    rate_limiter=self._rate_limiter,
+                    log_helper=self._io_helper.log_helper,
+                )
             elif issuer is None:
                 # verify_signature=False, no issuer needed
                 self._io_helper.logger.debug(
@@ -265,18 +271,24 @@ class RevocationChecker:
                 If not provided, uses remaining chain from each cert's position.
 
         Returns:
-            Dict mapping serial numbers to RevocationInfo
+            Dict mapping serial numbers to RevocationInfo.
+            If a check fails for an individual certificate,
+            the result will have status=RevocationStatus.CHECK_FAILURE
+            with the exception captured in the `error` field.
 
         Raises:
+            TypeError: certs is not a list
             ValueError: Chain has fewer than 2 certificates
-            Various RevocationCheckErrors for individual certificate failures
 
         Examples:
             Check user-provided chain:
             >>> chain = get_cert_chain("example.com")
             >>> results = await checker.check_chain(chain)
-            >>> for serial, status in results.items():
-            ...     print(f"Cert {serial}: {status.status}")
+            >>> for serial, info in results.items():
+            ...     if info.status == RevocationStatus.CHECK_FAILURE:
+            ...         print(f"Cert {serial}: check failed - {info.error}")
+            ...     else:
+            ...         print(f"Cert {serial}: {info.status.value}")
 
             Check without signature verification:
             >>> results = await checker.check_chain(chain, verify_signature=False)
@@ -287,7 +299,7 @@ class RevocationChecker:
         if len(certs) < 2:
             raise ValueError("certs list must have at least 2 certificates")
 
-        self._io_helper.logger.info(
+        self._io_helper.logger.debug(
             f"Checking certificate chain ({len(certs)} certificates)"
         )
 
@@ -348,27 +360,31 @@ class RevocationChecker:
             max_depth: Maximum chain depth to prevent infinite loops.
 
         Returns:
-            Dict mapping serial numbers to RevocationInfo
-
-        Raises:
-            ExtensionMissingError: A certificate lacks AIA extension
-            RevocationCheckError: Chain building or checking failed
+            Dict mapping serial numbers to RevocationInfo.
+            If chain building or a check fails for an individual certificate,
+            the result will have status=RevocationStatus.CHECK_FAILURE
+            with the exception captured in the `error` field.
 
         Examples:
             Auto-fetch and check full chain:
             >>> cert = get_cert("example.com")
             >>> results = await checker.check_cert_chain(cert)
+            >>> for serial, info in results.items():
+            ...     if info.status == RevocationStatus.CHECK_FAILURE:
+            ...         print(f"Cert {serial}: check failed - {info.error}")
+            ...     else:
+            ...         print(f"Cert {serial}: {info.status.value}")
 
             Without signature verification:
             >>> results = await checker.check_cert_chain(cert, verify_signature=False)
         """
-        self._io_helper.logger.info(
+        self._io_helper.logger.debug(
             f"Auto-fetching and checking certificate chain starting from {leaf.serial_number}"
         )
 
         async with aiohttp.ClientSession() as session:
             # Fetch full chain
-            async with self._http_semaphore:
+            try:
                 chain = await fetch_issuer_chain(
                     leaf,
                     max_depth=max_depth,
@@ -376,8 +392,20 @@ class RevocationChecker:
                     session=session,
                     timeout=self._request_timeout,
                     max_attempts=self._max_attempts,
+                    rate_limiter=self._rate_limiter,
                     log_helper=self._io_helper.log_helper,
                 )
+            except (ExtensionMissingError, IssuerFetchError) as e:
+                self._io_helper.logger.debug(
+                    f"Chain building failed for {leaf.serial_number}: {e}"
+                )
+                # For now we don't validate partial chains
+                return {
+                    leaf.serial_number: RevocationInfo(
+                        status=RevocationStatus.CHECK_FAILURE,
+                        error=e,
+                    )
+                }
 
             # Check all certificates in chain
             return await self._check_chain(
@@ -440,7 +468,7 @@ class RevocationChecker:
                     issuer_chain=ocsp_issuer_chain,
                 )
             except (OCSPError, ExtensionMissingError) as e:
-                self._io_helper.logger.info(
+                self._io_helper.logger.debug(
                     f"OCSP check failed for cert {cert.serial_number}, falling back to CRL: {e}"
                 )
                 try:
@@ -481,15 +509,15 @@ class RevocationChecker:
                     crl_issuer_chain=effective_crl_chain,
                 )
                 return (cert.serial_number, status)
-            except RevocationCheckError as e:
-                self._io_helper.logger.error(
+            except (RevocationCheckError, OCSPError, CRLError, ExtensionMissingError) as e:
+                self._io_helper.logger.debug(
                     f"Failed to check certificate {cert.serial_number}: {e}"
                 )
                 return (
                     cert.serial_number,
                     RevocationInfo(
-                        status=RevocationStatus.UNKNOWN,
-                        check_method=None,
+                        status=RevocationStatus.CHECK_FAILURE,
+                        error=e,
                     )
                 )
 

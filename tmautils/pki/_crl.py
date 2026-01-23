@@ -23,7 +23,7 @@ from cryptography import x509 as x509_module
 from cryptography.x509.oid import ExtensionOID, CRLEntryExtensionOID
 from cryptography.hazmat.primitives import serialization
 
-from tmautils.common import LogHelper, get_logger_from_helper
+from tmautils.common import LogHelper, get_logger_from_helper, AsyncRateLimiter
 from tmautils.web import request_with_retry
 
 from .types import (
@@ -68,7 +68,7 @@ class CRLHelper:
 
     def __init__(
         self,
-        http_semaphore: asyncio.Semaphore,
+        rate_limiter: AsyncRateLimiter,
         *,
         crl_cache_dir: Path,
         issuer_cache_dir: Path,
@@ -76,7 +76,7 @@ class CRLHelper:
         max_attempts: int = 3,
         log_helper: LogHelper | None = None,
     ):
-        self._http_semaphore = http_semaphore
+        self._rate_limiter = rate_limiter
         self._crl_cache_dir = crl_cache_dir
         self._issuer_cache_dir = issuer_cache_dir
         self._request_timeout = request_timeout
@@ -107,7 +107,7 @@ class CRLHelper:
                 now = datetime.datetime.now(datetime.timezone.utc)
                 next_update = crl.next_update_utc
                 if next_update is not None and next_update < now:
-                    self._logger.warning(
+                    self._logger.debug(
                         "CRL from %s has expired (nextUpdate: %s)", url, next_update
                     )
                     last_error = CRLError(
@@ -118,7 +118,7 @@ class CRLHelper:
                 try:
                     self._validate_idp(crl, url, cert)
                 except CRLError as e:
-                    self._logger.warning(
+                    self._logger.debug(
                         "CRL IDP validation failed for %s: %s", url, e
                     )
                     last_error = e
@@ -153,7 +153,7 @@ class CRLHelper:
                             f"Cannot find CRL signer cert for issuer: "
                             f"{crl.issuer.rfc4514_string()}"
                         )
-                        self._logger.warning(
+                        self._logger.debug(
                             "CRL signer not found for %s: %s", url, last_error
                         )
                         continue
@@ -170,7 +170,7 @@ class CRLHelper:
                             crl.signature_algorithm_parameters,
                         )
                     except Exception as e:
-                        self._logger.warning(
+                        self._logger.debug(
                             "CRL signature verification failed for %s: %s", url, e
                         )
                         last_error = CRLError(
@@ -222,7 +222,7 @@ class CRLHelper:
                 )
 
             except CRLError as e:
-                self._logger.warning(
+                self._logger.debug(
                     "Failed to check CRL from %s: %s", url, e
                 )
                 last_error = e
@@ -274,26 +274,28 @@ class CRLHelper:
                 return crl
             except Exception as e:
                 # Cache is corrupted => fall through to re-download.
-                self._logger.warning(
+                self._logger.debug(
                     "Failed to load cached CRL (%s), re-downloading: %s", url, e
                 )
 
-        self._logger.info("Downloading CRL: %s", url)
+        self._logger.debug("Downloading CRL: %s", url)
 
         try:
-            async with self._http_semaphore:
-                async with request_with_retry(
-                    session,
-                    "GET",
-                    url,
-                    attempt_timeout=self._request_timeout,
-                    max_attempts=self._max_attempts,
-                    log_helper=self._log_helper,
-                ) as resp:
-                    resp.raise_for_status()
-                    content = await resp.read()
+            async with request_with_retry(
+                session,
+                "GET",
+                url,
+                rate_limiter=self._rate_limiter,
+                attempt_timeout=self._request_timeout,
+                max_attempts=self._max_attempts,
+                log_helper=self._log_helper,
+            ) as resp:
+                resp.raise_for_status()
+                content = await resp.read()
         except Exception as e:
-            raise CRLError(f"Failed to download CRL from {url}: {e}") from e
+            raise CRLError(
+                f"Failed to download CRL from {url}: {type(e).__name__}: {e}"
+            ) from e
 
         # Yield before CPU-bound parsing
         await asyncio.sleep(0)
@@ -321,7 +323,7 @@ class CRLHelper:
         try:
             meta_path.write_text(json.dumps(meta))
         except Exception as e:
-            self._logger.warning(
+            self._logger.debug(
                 "Failed to write CRL cache metadata: %s", e
             )
 
@@ -391,22 +393,23 @@ class CRLHelper:
                     pass  # Cache corrupted, re-download
 
             # Download
-            self._logger.info(
+            self._logger.debug(
                 "Downloading CRL signer cert: %s", signer_url
             )
             try:
-                async with self._http_semaphore:
-                    async with request_with_retry(
-                        session, "GET", signer_url,
-                        attempt_timeout=self._request_timeout,
-                        max_attempts=self._max_attempts,
-                        log_helper=self._log_helper,
-                    ) as resp:
-                        resp.raise_for_status()
-                        content = await resp.read()
+                async with request_with_retry(
+                    session, "GET", signer_url,
+                    rate_limiter=self._rate_limiter,
+                    attempt_timeout=self._request_timeout,
+                    max_attempts=self._max_attempts,
+                    log_helper=self._log_helper,
+                ) as resp:
+                    resp.raise_for_status()
+                    content = await resp.read()
             except Exception as e:
                 self._logger.warning(
-                    "Failed to download CRL signer cert from %s: %s", signer_url, e
+                    "Failed to download CRL signer cert from %s: %s: %s",
+                    signer_url, type(e).__name__, e
                 )
                 continue
 

@@ -10,13 +10,17 @@ import json
 import logging
 import pytest
 
+from unittest.mock import AsyncMock, patch
+
 from tmautils.pki import (
     RevocationChecker,
     RevocationStatus,
+    RevocationInfo,
     CheckMode,
     ExtensionMissingError,
     OCSPError,
     CRLError,
+    RevocationCheckError,
     get_cert_sync,
     get_cert_chain_sync,
     fetch_issuer_cert,
@@ -96,6 +100,7 @@ def test_enum_values():
     assert RevocationStatus.GOOD.value == "good"
     assert RevocationStatus.REVOKED.value == "revoked"
     assert RevocationStatus.UNKNOWN.value == "unknown"
+    assert RevocationStatus.CHECK_FAILURE.value == "check_failure"
 
     assert CheckMode.OCSP_ONLY.value == "ocsp_only"
     assert CheckMode.CRL_ONLY.value == "crl_only"
@@ -137,6 +142,23 @@ def test_check_chain_input_validation(tmp_path):
 
     with pytest.raises(ValueError, match="at least 2 certificates"):
         checker.check_chain_sync([])
+
+
+def test_revocation_info_error_field():
+    """Test that RevocationInfo has the error field."""
+    # Test with no error
+    info = RevocationInfo(status=RevocationStatus.GOOD)
+    assert info.error is None
+
+    # Test with error
+    error = RevocationCheckError("test error")
+    info_with_error = RevocationInfo(
+        status=RevocationStatus.CHECK_FAILURE,
+        error=error,
+    )
+    assert info_with_error.status == RevocationStatus.CHECK_FAILURE
+    assert info_with_error.error is error
+    assert isinstance(info_with_error.error, RevocationCheckError)
 
 
 # === Integration Tests (Network Required) ===
@@ -257,10 +279,78 @@ async def test_chain_checking(tmp_path):
     assert len(results) >= 1
 
     for serial, info in results.items():
+        # CHECK_FAILURE is also valid if a check couldn't complete
         assert info.status in (
-            RevocationStatus.GOOD, RevocationStatus.UNKNOWN, RevocationStatus.REVOKED)
+            RevocationStatus.GOOD, RevocationStatus.UNKNOWN,
+            RevocationStatus.REVOKED, RevocationStatus.CHECK_FAILURE)
         print(
             f"  Serial {serial}: {info.status.value} via {info.check_method}")
+        if info.status == RevocationStatus.CHECK_FAILURE:
+            print(f"    error: {info.error}")
+
+
+@pytest.mark.asyncio
+async def test_check_chain_returns_check_failure_on_error(tmp_path):
+    """Test that check_chain returns CHECK_FAILURE with error field when check fails."""
+    checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
+                                'console_level': logging.DEBUG})
+    chain = get_cert_chain_sync("google.com")
+    assert len(chain) >= 2
+
+    # Mock _check_single_cert to raise RevocationCheckError
+    test_error = RevocationCheckError("Simulated network failure")
+
+    async def mock_check_single_cert(*args, **kwargs):
+        raise test_error
+
+    with patch.object(checker, '_check_single_cert', side_effect=mock_check_single_cert):
+        results = await checker.check_chain(chain)
+
+    # All results should be CHECK_FAILURE with the error captured
+    assert len(results) >= 1
+    for serial, info in results.items():
+        assert info.status == RevocationStatus.CHECK_FAILURE
+        assert info.check_method is None
+        assert info.error is test_error
+        print(f"  Serial {serial}: {info.status.value}, error={info.error}")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exception_class,exception_name", [
+    (OCSPError, "OCSPError"),
+    (CRLError, "CRLError"),
+    (ExtensionMissingError, "ExtensionMissingError"),
+])
+async def test_check_chain_catches_all_exception_types(tmp_path, exception_class, exception_name):
+    """Test that check_chain catches OCSPError, CRLError, and ExtensionMissingError.
+
+    This ensures consistency: in OCSP_ONLY or CRL_ONLY modes, specific exceptions
+    are raised by _check_single_cert. When checking a chain, these should be caught
+    and converted to CHECK_FAILURE status (not raised to the caller).
+    """
+    checker = RevocationChecker(working_root=tmp_path, logging_kwargs={
+                                'console_level': logging.DEBUG})
+    chain = get_cert_chain_sync("google.com")
+    assert len(chain) >= 2
+
+    # Mock _check_single_cert to raise the specific exception type
+    test_error = exception_class(f"Simulated {exception_name}")
+
+    async def mock_check_single_cert(*args, **kwargs):
+        raise test_error
+
+    with patch.object(checker, '_check_single_cert', side_effect=mock_check_single_cert):
+        results = await checker.check_chain(chain)
+
+    # All results should be CHECK_FAILURE with the error captured
+    assert len(results) >= 1
+    for serial, info in results.items():
+        assert info.status == RevocationStatus.CHECK_FAILURE, \
+            f"{exception_name} should result in CHECK_FAILURE, not raise"
+        assert info.check_method is None
+        assert info.error is test_error
+        assert isinstance(info.error, exception_class)
+        print(f"  {exception_name} -> Serial {serial}: {info.status.value}, error={info.error}")
 
 
 @pytest.mark.asyncio
@@ -558,8 +648,10 @@ async def test_multiple_domains_chain_check(tmp_path):
             continue
         print(f"  {domain}: checked {len(chain_results)} certs")
         for _, info in chain_results.items():
+            # CHECK_FAILURE is also valid if a check couldn't complete
             assert info.status in (
-                RevocationStatus.GOOD, RevocationStatus.UNKNOWN, RevocationStatus.REVOKED
+                RevocationStatus.GOOD, RevocationStatus.UNKNOWN,
+                RevocationStatus.REVOKED, RevocationStatus.CHECK_FAILURE
             )
 
 

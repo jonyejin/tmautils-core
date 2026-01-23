@@ -15,7 +15,13 @@ import aiohttp
 import asyncio
 import contextlib
 
-from tmautils.common import IPAddress, run_coro_sync, LogHelper, get_logger_from_helper
+from tmautils.common import (
+    IPAddress,
+    run_coro_sync,
+    LogHelper,
+    get_logger_from_helper,
+    AsyncRateLimiter,
+)
 from tmautils.web import request_with_retry
 
 from ._crypto import get_cache_key, parse_cert_lrucached
@@ -376,6 +382,7 @@ async def fetch_issuer_cert(
     session: aiohttp.ClientSession | None = None,
     timeout: float = 10.0,
     max_attempts: int = 3,
+    rate_limiter: AsyncRateLimiter | None = None,
     log_helper: LogHelper | None = None,
 ) -> x509.Certificate:
     """
@@ -387,6 +394,7 @@ async def fetch_issuer_cert(
         session: Existing aiohttp session (creates one if not provided)
         timeout: Request timeout in seconds
         max_attempts: Retry attempts for failed downloads
+        rate_limiter: Optional AsyncRateLimiter for HTTP request rate limiting
         log_helper: Optional LogHelper for logging
 
     Returns:
@@ -447,6 +455,7 @@ async def fetch_issuer_cert(
             session,
             "GET",
             issuer_url,
+            rate_limiter=rate_limiter,
             attempt_timeout=timeout,
             max_attempts=max_attempts,
             log_helper=log_helper,
@@ -513,6 +522,7 @@ async def fetch_issuer_chain(
     session: aiohttp.ClientSession | None = None,
     timeout: float = 10.0,
     max_attempts: int = 3,
+    rate_limiter: AsyncRateLimiter | None = None,
     log_helper: LogHelper | None = None,
 ) -> list[x509.Certificate]:
     """
@@ -529,6 +539,7 @@ async def fetch_issuer_chain(
         session: Existing aiohttp session (creates one if not provided)
         timeout: Request timeout per fetch
         max_attempts: Retry attempts per download
+        rate_limiter: Optional AsyncRateLimiter for HTTP request rate limiting
         log_helper: Optional LogHelper for logging
 
     Returns:
@@ -536,8 +547,9 @@ async def fetch_issuer_chain(
         Stops at self-signed cert or max_depth.
 
     Raises:
-        IssuerFetchError: If chain building fails due to circular reference
-            or max depth exceeded without finding root
+        ExtensionMissingError: Certificate lacks AIA extension or CA_ISSUERS entry
+        IssuerFetchError: Failed to download/parse issuer certificate,
+            circular reference detected, or max depth exceeded
     """
     logger = get_logger_from_helper(log_helper)
 
@@ -572,11 +584,15 @@ async def fetch_issuer_chain(
                     session=session,
                     timeout=timeout,
                     max_attempts=max_attempts,
+                    rate_limiter=rate_limiter,
                     log_helper=log_helper,
                 )
             except (ExtensionMissingError, IssuerFetchError) as e:
-                logger.warning("Cannot continue chain building: %s", e)
-                break
+                logger.warning(
+                    "Failed to fetch issuer for cert %s at depth %d: %s",
+                    current_cert.serial_number, depth, e
+                )
+                raise
 
             # Check for circular reference
             if issuer_cert.serial_number in seen_serials:
@@ -602,7 +618,7 @@ async def fetch_issuer_chain(
         if owns_session:
             await session.close()
 
-    logger.info("Built certificate chain with %d certificates", len(chain))
+    logger.debug("Built certificate chain with %d certificates", len(chain))
     return chain
 
 
