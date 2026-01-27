@@ -12,7 +12,7 @@ import jwt
 
 import aiohttp
 
-from tmautils.common import IOHelper, run_coro_sync
+from tmautils.common import IOHelper, run_coro_sync, AsyncRateLimiter
 from tmautils.web import request_with_retry
 
 
@@ -105,7 +105,9 @@ class CzdsDownloadUtil:
             **kwargs,
         )
 
-        self._max_concurrent_downloads = max_concurrent_downloads
+        self._rate_limiter = AsyncRateLimiter(
+            max_concurrent=max_concurrent_downloads
+        )
         self._user_agent = user_agent
 
         # Token state
@@ -248,6 +250,7 @@ class CzdsDownloadUtil:
                 self._AUTH_URL,
                 json=payload,
                 headers=headers,
+                rate_limiter=self._rate_limiter,
                 log_helper=self._io_helper.log_helper,
             ) as resp:
                 if resp.status == 401:
@@ -302,6 +305,7 @@ class CzdsDownloadUtil:
                 "GET",
                 url,
                 headers=headers,
+                rate_limiter=self._rate_limiter,
                 log_helper=self._io_helper.log_helper,
             ) as resp:
                 if resp.status == 401:
@@ -348,6 +352,7 @@ class CzdsDownloadUtil:
                 "HEAD",
                 download_url,
                 headers=headers,
+                rate_limiter=self._rate_limiter,
                 log_helper=self._io_helper.log_helper,
             ) as resp:
                 resp.raise_for_status()
@@ -423,7 +428,7 @@ class CzdsDownloadUtil:
             datetime.now(timezone.utc).date(),
             create_dir=True
         ) / f"{tld}.txt.gz"
-        self._io_helper.logger.info(f"Downloading zone: {tld}")
+        self._io_helper.logger.info(f"Downloading zone: '{tld}'")
 
         async with aiohttp.ClientSession() as session:
             headers = {
@@ -437,6 +442,7 @@ class CzdsDownloadUtil:
                 download_url,
                 headers=headers,
                 attempt_timeout=600.0,  # 10 minutes for large files
+                rate_limiter=self._rate_limiter,
                 log_helper=self._io_helper.log_helper,
             ) as resp:
                 if resp.status == 403:
@@ -499,23 +505,21 @@ class CzdsDownloadUtil:
         links = await self.get_zone_links()
 
         self._io_helper.logger.info(
-            f"Downloading {len(links)} zones with max {self._max_concurrent_downloads} concurrent"
+            f"Downloading {len(links)} zones with rate limiting: "
+            f"{self._rate_limiter.config_string}"
         )
 
-        semaphore = asyncio.Semaphore(self._max_concurrent_downloads)
+        async def download_one(url: str) -> Path | None:
+            try:
+                return await self.download_zone(url)
+            except Exception as e:
+                tld = self._extract_tld_from_url(url)
+                self._io_helper.logger.error(
+                    f"Failed to download '{tld}': {e}"
+                )
+                return None
 
-        async def download_with_semaphore(url: str) -> Path | None:
-            async with semaphore:
-                try:
-                    return await self.download_zone(url)
-                except Exception as e:
-                    tld = self._extract_tld_from_url(url)
-                    self._io_helper.logger.error(
-                        f"Failed to download {tld}: {e}"
-                    )
-                    return None
-
-        tasks = [download_with_semaphore(url) for url in links]
+        tasks = [download_one(url) for url in links]
         results = await asyncio.gather(*tasks)
 
         paths = [p for p in results if p is not None]

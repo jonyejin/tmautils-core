@@ -17,7 +17,7 @@ from dns.resolver import (
 from dns.rdatatype import RdataType
 import dns.asyncresolver
 
-from tmautils.common import IOHelper, IPAddress
+from tmautils.common import IOHelper, IPAddress, AsyncRateLimiter
 
 
 class AsyncDnsPythonUtil:
@@ -29,13 +29,13 @@ class AsyncDnsPythonUtil:
             List of DNS nameservers to use for resolution.
             If None, system default nameservers will be used.
 
-        max_concurrent_requests (int):
-            Maximum number of concurrent DNS requests.
-            Defaults to 500.
-
         cachesize (int):
             Size of the dnspython DNS cache.
             Defaults to 500000.
+
+        rate_limiter (AsyncRateLimiter | None):
+            Rate limiter for concurrent DNS requests.
+            If None, no rate limiting will be applied.
 
         working_root (Path | None):
             Base directory where the namespace directory will be created.
@@ -55,9 +55,9 @@ class AsyncDnsPythonUtil:
     def __init__(
         self,
         nameservers: Optional[list[str]] = None,
-        max_concurrent_requests: int = 500,
-        cachesize: int = 500000,
         *,
+        cachesize: int = 500000,
+        rate_limiter: AsyncRateLimiter | None = None,
         working_root: Path | None = None,
         **kwargs
     ):
@@ -73,14 +73,13 @@ class AsyncDnsPythonUtil:
         if nameservers is not None:
             self.resolver.nameservers = nameservers
         self.resolver.cache = LRUCache(max_size=cachesize)
-        self.io_helper.logger.info(
-            f"Initialized DNS resolver with nameservers: {nameservers},"
-            f"cache size: {cachesize}, and "
-            f"max concurrent requests: {max_concurrent_requests}"
-        )
+        self._rate_limiter = rate_limiter or AsyncRateLimiter()
 
-        # Semaphore to limit concurrent DNS requests
-        self._dnsreq_semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self.io_helper.logger.info(
+            f"Initialized DNS resolver with nameservers: {nameservers}, "
+            f"cache size: {cachesize}, "
+            f"rate limiting: {self._rate_limiter.config_string}"
+        )
 
     async def __aenter__(self):
         return self
@@ -282,7 +281,7 @@ class AsyncDnsPythonUtil:
                 The DNS answer object containing the resolved records.
                 Returns None if resolution fails and raise_on_error is False.
         """
-        async with self._dnsreq_semaphore:
+        async with self._rate_limiter.acquire():
             try:
                 return await self.resolver.resolve(
                     domain,

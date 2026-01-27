@@ -116,7 +116,8 @@ result = await checker.check_cert_chain(cert) # using RevocationChecker's API
 | [`IOHelper`](./tmautils/common/io.py#L258)                                                                     | Directory structure and logging for utilities               |
 | [`LogHelper`](./tmautils/common/log.py#L174)                                                                   | Logging configuration                                       |
 | [`get_logger_from_helper()`](./tmautils/common/log.py#L405)                                                    | Get the configured or no-op logger from LogHelper           |
-| [`run_coro_sync()`](./tmautils/common/asyncutils.py#L14)                                                       | Run async code from sync context                            |
+| [`AsyncRateLimiter`](./tmautils/common/asyncutils.py#L24)                                                      | Rate limiter with concurrency and throughput limits         |
+| [`run_coro_sync()`](./tmautils/common/asyncutils.py#L151)                                                      | Run async code from sync context                            |
 | [`import_module_attr()`](./tmautils/common/io.py#L74)                                                          | Dynamically import an attribute from a module               |
 | [`gzip_file()`](./tmautils/common/io.py#L109), [`gunzip_file()`](./tmautils/common/io.py#L186)                 | Compress/decompress a file with gzip                        |
 | [`maybe_apply()`](./tmautils/common/utils.py#L11)                                                              | Decorator to apply a function on an input without failing   |
@@ -226,4 +227,4 @@ Contributions to `tmautils` are highly welcome! After all, there is much to do i
 
 Before writing code, please familiarize yourself with the [philosophy](#philosophy) and [design choices](#design-choices), and try to follow them, or talk to me about how they are stupid and we should do things differently. I want this library to be the best version of itself.
 
-AI Policy: I don't consider AI tool usage any different from IDE usage. This also means that *you* are responsible for the code you write and you should inspect every line of code written by an LLM. This policy is currently (slightly) relaxed for tests.
+AI Policy: I don't consider AI tool usage any different from IDE usage. This also means that *you* are responsible for the code you write and *you* should inspect every line of code written by an LLM. This policy is currently (slightly) relaxed for tests.

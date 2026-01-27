@@ -127,8 +127,8 @@ class RevocationChecker:
 
         self._io_helper.logger.info(
             "RevocationChecker initialized: "
-            "request_timeout=%ds, max_attempts=%d",
-            request_timeout, max_attempts,
+            "request_timeout=%ds, max_attempts=%d, rate limiting: %s",
+            request_timeout, max_attempts, self._rate_limiter.config_string,
         )
 
     async def check_cert(

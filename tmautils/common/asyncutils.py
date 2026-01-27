@@ -76,6 +76,19 @@ class AsyncRateLimiter:
         self._semaphores: dict[str, asyncio.Semaphore] = {}
         self._rate_limiters: dict[str, AsyncLimiter] = {}
 
+    @property
+    def config_string(self) -> str:
+        """String representation of the rate limiter configuration."""
+        parts = []
+        if self._max_concurrent is not None:
+            parts.append(f"max_concurrent={self._max_concurrent}")
+        if self._max_rate is not None:
+            parts.append(
+                f"max_rate={self._max_rate}/{self._time_period}s"
+            )
+        parts.append(f"scope={self._scope.value}")
+        return ", ".join(parts)
+
     def _get_effective_key(self, key: str | None) -> str:
         """Get effective key based on scope and provided key."""
         if self._scope == RateLimitScope.GLOBAL:

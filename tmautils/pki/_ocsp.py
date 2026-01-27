@@ -348,26 +348,12 @@ class OCSPHelper:
                 "Delegated OCSP responder lacks Extended Key Usage extension"
             )
 
-        # 2. Check responder was issued by the CA (issuer DN matches CA subject)
-        if responder_cert.issuer != issuer_cert.subject:
-            raise OCSPError(
-                f"OCSP responder not issued by CA. "
-                f"Responder issuer: {responder_cert.issuer.rfc4514_string()}, "
-                f"CA subject: {issuer_cert.subject.rfc4514_string()}"
-            )
-
-        # 3. Check responder cert was signed by same key that signed cert being checked
+        # 2. Verify responder cert was directly issued by CA
         try:
-            verify_signature(
-                issuer_cert.public_key(),
-                responder_cert.tbs_certificate_bytes,
-                responder_cert.signature,
-                responder_cert.signature_hash_algorithm,
-                responder_cert.signature_algorithm_parameters,
-            )
+            responder_cert.verify_directly_issued_by(issuer_cert)
         except Exception as e:
             raise OCSPError(
-                f"OCSP responder cert not signed by CA key: {e}"
+                f"Cannot validate that OCSP responder cert was directly issued by CA: {e}"
             ) from e
 
         # 4. Check for id-pkix-ocsp-nocheck extension (RFC 6960 §4.2.2.2.1)

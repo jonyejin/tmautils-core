@@ -415,6 +415,10 @@ async def fetch_issuer_cert(
         raise ExtensionMissingError(
             f"Certificate {cert.serial_number} lacks AIA extension"
         )
+    except ValueError as e:
+        raise IssuerFetchError(
+            f"Parsing AIA extension failed for cert {cert.serial_number}: {e}"
+        ) from e
 
     # Find CA Issuers URL
     issuer_url = None
@@ -571,10 +575,19 @@ async def fetch_issuer_chain(
 
             # Check if current cert is self-signed (root)
             if current_cert.issuer == current_cert.subject:
-                logger.debug(
-                    "Reached self-signed root certificate at depth %d", depth
-                )
-                break
+                try:
+                    current_cert.verify_directly_issued_by(current_cert)
+                    logger.debug(
+                        "Reached self-signed root certificate at depth %d", depth
+                    )
+                    break
+                except Exception:
+                    # Not a valid root; continue trying to fetch issuer
+                    logger.warning(
+                        "Certificate has issuer == subject "
+                        "but invalid self-signature at depth %d",
+                        depth
+                    )
 
             # Fetch issuer
             try:
@@ -587,7 +600,13 @@ async def fetch_issuer_chain(
                     rate_limiter=rate_limiter,
                     log_helper=log_helper,
                 )
-            except (ExtensionMissingError, IssuerFetchError) as e:
+            except ExtensionMissingError as e:
+                logger.debug(
+                    "No AIA/CA_ISSUERS for cert %s at depth %d: %s",
+                    current_cert.serial_number, depth, e
+                )
+                raise
+            except IssuerFetchError as e:
                 logger.warning(
                     "Failed to fetch issuer for cert %s at depth %d: %s",
                     current_cert.serial_number, depth, e
@@ -600,6 +619,15 @@ async def fetch_issuer_chain(
                     f"Circular reference detected in certificate chain "
                     f"(serial {issuer_cert.serial_number})"
                 )
+
+            # Validate signature relationship before adding to chain
+            try:
+                current_cert.verify_directly_issued_by(issuer_cert)
+            except Exception as e:
+                raise IssuerFetchError(
+                    f"Certificate {current_cert.serial_number} not properly signed by "
+                    f"fetched issuer {issuer_cert.serial_number}: {e}"
+                ) from e
 
             # Add issuer to chain
             chain.append(issuer_cert)
