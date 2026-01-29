@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: MPL-2.0
 # Copyright (c) 2026 Sulyab Thottungal Valapu
 
-from typing import Any, AsyncIterator, Awaitable, Callable, Optional, TypeVar
+from typing import AsyncIterator, Awaitable, Optional, TypeVar
 import asyncio
-import concurrent.futures
 from contextlib import asynccontextmanager
-import contextvars
 from enum import StrEnum
-import multiprocessing as mp
 
 from aiolimiter import AsyncLimiter
 
@@ -150,197 +147,40 @@ def run_coro_sync(
     coro: Awaitable[_T],
     *,
     timeout: Optional[float] = None,
-    ex: Optional[concurrent.futures.Executor] = None,
 ) -> _T:
     """
-    Run a coroutine from synchronous code, even if already on an event loop.
-    If no event loop is running in this thread, this will simply call `asyncio.run()`.
-    If already on an event loop, a worker thread will be used to run the coroutine.
+    Run a coroutine from synchronous code.
+
+    This function is for calling async code from sync contexts (e.g., scripts, sync functions).
+    If called from within an existing event loop (e.g., Jupyter notebook), it raises an error.
 
     Args:
-        coro:
+        coro (Awaitable):
             The coroutine to run.
 
-        timeout (float | None):
+        timeout (Optional[float]):
             Optional timeout in seconds to wait for the coroutine to complete.
-
-        ex (concurrent.futures.Executor | None):
-            Optional executor to use when offloading to a worker thread.
-            If None, a new two-thread ThreadPoolExecutor will be created for this call.
 
     Returns:
         The result of the coroutine.
+
+    Raises:
+        RuntimeError: If called from within a running event loop.
     """
 
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        # No loop in this thread -> start one
-        if timeout is not None:
-            coro = asyncio.wait_for(coro, timeout)
-        return asyncio.run(coro)
-
-    # We are on a running loop in THIS thread -> hop to a worker thread
-    ctx = contextvars.copy_context()
-
-    def _thread_entry():
-        new_loop = asyncio.new_event_loop()
-        try:
-            asyncio.set_event_loop(new_loop)
-            return new_loop.run_until_complete(asyncio.wait_for(coro, timeout))
-        finally:
-            new_loop.close()
-
-    if ex is not None:
-        return ex.submit(ctx.run, _thread_entry).result()
-
-    # Use max_workers=2 to avoid deadlocks in case of re-entrancy
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as temp_ex:
-        return temp_ex.submit(ctx.run, _thread_entry).result()
-
-
-class AsyncHelper:
-    """
-    Helper class for running blocking code asynchronously using a ThreadPoolExecutor.
-    Also provides async versions of multiprocessing.Queue put/get operations.
-
-    Args:
-        max_workers (int | None):
-            Maximum number of worker threads in the ThreadPoolExecutor.
-            If None, the default value from ThreadPoolExecutor is used.
-
-        thread_name_prefix (str):
-            Prefix for naming worker threads.
-            Default is "AsyncHelper".
-
-        register_atexit (bool):
-            If True, register an atexit handler to shutdown the executor on program exit.
-            Default is True.
-    """
-
-    def __init__(
-        self,
-        *,
-        max_workers: Optional[int] = None,
-        thread_name_prefix: str = "AsyncHelper",
-        register_atexit: bool = True,
-    ):
-        self._ex = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix=thread_name_prefix
+        pass  # No loop running - expected case
+    else:
+        raise RuntimeError(
+            "run_coro_sync() cannot be called from async code. "
+            "Use 'await' on the async method instead. "
+            "If using Jupyter, consider using 'nest_asyncio' or similar tools."
         )
-        self._closed = False
-        if register_atexit:
-            # Best effort cleanup on exit
-            import atexit
-            atexit.register(self.shutdown, wait=False, cancel_futures=True)
 
-    async def offload(
-        self,
-        func: Callable[..., _T],
-        /,
-        *args,
-        **kwargs,
-    ) -> _T:
-        """
-        Offload a blocking function to our ThreadPoolExecutor and await its result.
-        Useful for running blocking code without blocking the event loop.
+    if timeout is not None:
+        # Wrap with timeout
+        coro = asyncio.wait_for(coro, timeout)
 
-        Args:
-            func:
-                The blocking function to run.
-
-            *args:
-                Positional arguments to pass to the function.
-
-            **kwargs:
-                Keyword arguments to pass to the function.
-
-        Returns:
-            The result of the function.
-        """
-
-        loop = asyncio.get_running_loop()
-        ctx = contextvars.copy_context()
-        return await loop.run_in_executor(self._ex, lambda: ctx.run(func, *args, **kwargs))
-
-    async def mpq_put(
-        self,
-        q: mp.Queue,
-        item: Any,
-        *,
-        timeout: Optional[float] = None,
-    ):
-        """
-        Asynchronously put an item into a multiprocessing.Queue.
-        This function offloads the blocking put operation to our ThreadPoolExecutor,
-        so it doesn't block the event loop.
-        However, note that the put operation may still block if the queue is full.
-        """
-        return await self.offload(q.put, item, timeout=timeout)
-
-    async def mpq_get(
-        self,
-        q: mp.Queue,
-        *,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """
-        Asynchronously get an item from a multiprocessing.Queue.
-        This function offloads the blocking get operation to a ThreadPoolExecutor,
-        so it doesn't block the event loop.
-        However, note that the get operation may still block if the queue is empty.
-        """
-        return await self.offload(q.get, timeout=timeout)
-
-    def run_coro_sync(
-        self,
-        coro: Awaitable[_T],
-        *,
-        timeout: Optional[float] = None,
-    ) -> _T:
-        """
-        Run a coroutine from synchronous code, even if already on an event loop.
-        If no event loop is running in this thread, this will simply call `asyncio.run()`.
-        If already on an event loop, our ThreadPoolExecutor will be used to run the coroutine.
-
-        Args:
-            coro:
-                The coroutine to run.
-
-            timeout (float | None):
-                Optional timeout in seconds to wait for the coroutine to complete.
-
-        Returns:
-            The result of the coroutine.
-        """
-
-        return run_coro_sync(coro, timeout=timeout, ex=self._ex)
-
-    def mpq_put_sync(
-        self,
-        q: mp.Queue,
-        item: Any,
-        *,
-        timeout: Optional[float] = None,
-    ):
-        """
-        Synchronous version of `mpq_put()`.
-        """
-        return self.run_coro_sync(self.mpq_put(q, item, timeout=timeout))
-
-    def mpq_get_sync(
-        self,
-        q: mp.Queue,
-        *,
-        timeout: Optional[float] = None,
-    ) -> Any:
-        """
-        Synchronous version of `mpq_get()`.
-        """
-        return self.run_coro_sync(self.mpq_get(q, timeout=timeout))
-
-    def shutdown(self, *, wait: bool = True, cancel_futures: bool = False):
-        if self._closed:
-            return
-        self._closed = True
-        self._ex.shutdown(wait=wait, cancel_futures=cancel_futures)
+    return asyncio.run(coro)
