@@ -657,6 +657,7 @@ async def test_multiple_domains_chain_check(tmp_path):
 
 # === Issuer Certificate Fetching Tests ===
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_fetch_issuer_cert_async(tmp_path):
     """Test fetch_issuer_cert fetches issuer via AIA."""
@@ -676,6 +677,7 @@ async def test_fetch_issuer_cert_async(tmp_path):
     assert len(cache_files) >= 1, "Issuer cert should be cached"
 
 
+@pytest.mark.network
 def test_fetch_issuer_cert_sync(tmp_path):
     """Test sync wrapper for fetch_issuer_cert."""
     cert = get_cert_sync("google.com")
@@ -689,6 +691,7 @@ def test_fetch_issuer_cert_sync(tmp_path):
     print(f"  Issuer (sync): {issuer.subject.rfc4514_string()}")
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_fetch_issuer_cert_caches_result(tmp_path):
     """Test that fetch_issuer_cert uses cache on second call."""
@@ -714,6 +717,7 @@ async def test_fetch_issuer_cert_caches_result(tmp_path):
     assert issuer1.serial_number == issuer2.serial_number
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_fetch_issuer_chain_async(tmp_path):
     """Test fetch_issuer_chain builds chain via AIA."""
@@ -736,6 +740,7 @@ async def test_fetch_issuer_chain_async(tmp_path):
         print(f"    [{i}] {c.subject.rfc4514_string()[:60]}...")
 
 
+@pytest.mark.network
 def test_fetch_issuer_chain_sync(tmp_path):
     """Test sync wrapper for fetch_issuer_chain."""
     cert = get_cert_sync("google.com")
@@ -749,6 +754,7 @@ def test_fetch_issuer_chain_sync(tmp_path):
     print(f"  Chain length (sync): {len(chain)}")
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_fetch_issuer_chain_stops_at_root(tmp_path):
     """Test that chain building stops at self-signed root."""
@@ -765,6 +771,7 @@ async def test_fetch_issuer_chain_stops_at_root(tmp_path):
     print(f"  Chain ends at: {last_cert.subject.rfc4514_string()}")
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_fetch_issuer_cert_no_cache(tmp_path):
     """Test fetch_issuer_cert works without cache_dir."""

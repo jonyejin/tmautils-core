@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: MPL-2.0
 # Copyright (c) 2026 Sulyab Thottungal Valapu
 
+from functools import lru_cache
 from pathlib import Path
-import pandas as pd
-import requests
 import gzip
+import aiohttp
+import duckdb
+import pandas as pd
+import pyarrow as pa
 
-from tmautils.common import IOHelper
+from tmautils.common import IOHelper, run_coro_sync, atomic_write, path_temp_suffix
+from tmautils.web import request_with_retry
 
 
 class CaidaAsOrgInfoUtil:
@@ -16,6 +20,10 @@ class CaidaAsOrgInfoUtil:
     Args:
         date_str (str):
             Date string in the ISO format (YYYY-MM-DD)
+
+        force_refresh (bool):
+            If True, re-download and reprocess data even if cached files exist.
+            Default is False.
 
         working_root (Path | None):
             Base directory where the namespace directory will be created.
@@ -33,6 +41,7 @@ class CaidaAsOrgInfoUtil:
         self,
         date_str: str,
         *,
+        force_refresh: bool = False,
         working_root: Path | None = None,
         data_dir: Path | None = None,
         **kwargs,
@@ -47,106 +56,176 @@ class CaidaAsOrgInfoUtil:
             **kwargs,
         )
 
-        # Convert date_str from YYYY-MM-DD to YYYYMMDD
+        # Convert date_str from YYYY-MM-DD to YYYYMMDD for URL
         self.date_str = date_str.replace('-', '')
 
-        self.org_id_parquet = (
-            self.io_helper.processed /
-            f"{date_str}.as-org2info.v0.org_id.parquet"
+        # File paths
+        self._gz_path = (
+            self.io_helper.raw / f"{date_str}.as-org2info.v0.txt.gz"
         )
-        self.aut_parquet = (
-            self.io_helper.processed /
-            f"{date_str}.as-org2info.v0.aut.parquet"
+        self._parquet_path = (
+            self.io_helper.processed / f"{date_str}.as-org2info.v0.parquet"
         )
 
-        if (self.org_id_parquet.exists() and self.aut_parquet.exists()):
-            self.df_org_id = pd.read_parquet(self.org_id_parquet)
-            self.df_aut = pd.read_parquet(self.aut_parquet)
-            self.io_helper.logger.info(
-                f"Loaded {self.org_id_parquet.name} and {self.aut_parquet.name} from disk."
-            )
+        # Lazy-loaded DataFrames for backward compatibility
+        self._df_org_id: pd.DataFrame | None = None
+        self._df_aut: pd.DataFrame | None = None
+
+        # Handle force refresh
+        if force_refresh:
+            self._cleanup_cached_files()
+
+        # Check if we need to download/process
+        if not self._parquet_path.exists() or not self._validate_parquet():
+            run_coro_sync(self._download_and_process())
         else:
             self.io_helper.logger.info(
-                f"Parquet files not found, attempting to locate raw data."
+                f"Loaded {self._parquet_path.name} from disk."
             )
 
-            gz_file = self.io_helper.raw / f"{date_str}.as-org2info.v0.txt.gz"
-            if not gz_file.exists():
-                self.io_helper.logger.info(
-                    f"Raw gz file not found, downloading from CAIDA."
-                )
-                url = (f"https://publicdata.caida.org/datasets/as-organizations/versions/"
-                       f"{self.date_str}.as-org2info.v0.txt.gz")
-                try:
-                    r = requests.get(url, timeout=30)
-                except requests.exceptions.Timeout:
-                    self.io_helper.logger.error(
-                        f"Could not download CaidaAsOrgInfo dataset, cannot proceed"
-                    )
-                    raise
-                else:
-                    gz_file.write_bytes(r.content)
+    def _cleanup_cached_files(self) -> None:
+        self._parquet_path.unlink(missing_ok=True)
+        self._gz_path.unlink(missing_ok=True)
+        self.io_helper.logger.info("Cleaned cached files")
 
-            self.df_org_id, self.df_aut = self._parse_tables(gz_file)
-            self.df_org_id.to_parquet(self.org_id_parquet)
-            self.df_aut.to_parquet(self.aut_parquet)
-            self.io_helper.logger.info(
-                f"Wrote {self.org_id_parquet.name} and {self.aut_parquet.name} to disk."
+    def _validate_parquet(self) -> bool:
+        try:
+            result = duckdb.query(f"""
+                SELECT COUNT(*) as cnt
+                FROM read_parquet('{self._parquet_path}')
+                LIMIT 1
+            """).fetchone()
+            return result is not None and result[0] > 0
+        except Exception as e:
+            self.io_helper.logger.warning(
+                f"Parquet validation failed: {e}. Will reprocess."
             )
+            self._parquet_path.unlink(missing_ok=True)
+            return False
 
-        self.df_org_id.set_index('org_id', inplace=True)
-        self.df_aut.set_index('aut', inplace=True)
+    async def _download_and_process(self) -> None:
+        # Check if we need to download
+        if not self._gz_path.exists():
+            await self._download_gz()
 
-    def _parse_tables(
-        self,
-        gz_file: Path,
-    ):
-        def flush_table():
-            if current_cols and current_rows:
-                tables.append((current_cols, current_rows))
+        # Try to parse and save
+        try:
+            self._parse_and_save()
+        except Exception as e:
+            self.io_helper.logger.error(
+                f"Failed to parse {self._gz_path.name}: {e}. Attempting re-download..."
+            )
+            # Delete corrupt gz and try again
+            self._gz_path.unlink(missing_ok=True)
+            await self._download_gz()
+            self._parse_and_save()  # Let it raise if still fails
 
-        tables = []
-        current_cols = None
-        current_rows = []
+    async def _download_gz(self) -> None:
+        self.io_helper.logger.info("Downloading AS2Org data from CAIDA...")
 
-        with gzip.open(gz_file, 'rt') as f:
+        url = (
+            f"https://publicdata.caida.org/datasets/as-organizations/versions/"
+            f"{self.date_str}.as-org2info.v0.txt.gz"
+        )
+
+        async with aiohttp.ClientSession() as session:
+            async with request_with_retry(
+                session, "GET", url,
+                attempt_timeout=30.0,
+                max_attempts=3,
+                log_helper=self.io_helper._log_helper,
+            ) as resp:
+                resp.raise_for_status()
+                content = await resp.read()
+
+                with atomic_write(self._gz_path) as f:
+                    f.write(content)
+
+                self.io_helper.logger.info(f"Downloaded {self._gz_path.name}")
+
+    def _parse_and_save(self) -> None:
+        org_id_rows: list[dict[str, str]] = []
+        aut_rows: list[dict[str, str]] = []
+        current_table: str | None = None
+        current_cols: list[str] | None = None
+
+        with gzip.open(self._gz_path, 'rt') as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
 
                 if line.startswith('# format:'):
-                    # Whenever we see a new format line, flush the existing table first
-                    flush_table()
                     format_str = line.split(':', 1)[1].strip()
                     current_cols = format_str.split('|')
-                    current_rows = []
+                    # Determine table by first column
+                    current_table = 'org_id' if current_cols[0] == 'org_id' else 'aut'
                 elif line.startswith('#'):
-                    # Other comment lines
                     continue
                 else:
-                    # Normal data line
                     if current_cols:
                         fields = line.split('|')
-                        current_rows.append(fields)
-                    # If no current_cols, it means we haven't hit the first # format yet
+                        row = dict(zip(current_cols, fields))
+                        if current_table == 'org_id':
+                            org_id_rows.append(row)
+                        else:
+                            aut_rows.append(row)
 
-        # Flush the last table
-        flush_table()
+        if not org_id_rows or not aut_rows:
+            raise ValueError(
+                f"Expected both org_id and aut tables, "
+                f"but parsing failed for {self._gz_path.name}"
+            )
 
-        if len(tables) != 2:
-            errormsg = f"Expected exactly 2 tables, but found {len(tables)} in {gz_file.name}"
-            self.io_helper.logger.error(errormsg)
-            raise ValueError(errormsg)
+        self.io_helper.logger.info(
+            f"Parsed {len(aut_rows):,} ASNs and {len(org_id_rows):,} orgs"
+        )
 
-        # Unpack the two tables
-        org_id_cols, org_id_data = tables[0]
-        aut_cols, aut_data = tables[1]
+        # Convert to Arrow tables to register in DuckDB
+        org_id_table = pa.Table.from_pylist(org_id_rows)
+        aut_table = pa.Table.from_pylist(aut_rows)
 
-        df_org_id = pd.DataFrame(org_id_data, columns=org_id_cols)
-        df_aut = pd.DataFrame(aut_data, columns=aut_cols)
+        tmp_path = path_temp_suffix(self._parquet_path)
+        con = duckdb.connect()
+        try:
+            con.register('org_id_data', org_id_table)
+            con.register('aut_data', aut_table)
+            con.execute(f"""
+                COPY (
+                    SELECT
+                        CAST(a.aut AS INTEGER) AS aut,
+                        TRY_STRPTIME(a.changed, '%Y%m%d')::DATE AS changed,
+                        a.aut_name,
+                        a.org_id,
+                        a.opaque_id,
+                        a.source,
+                        o.org_name,
+                        o.country
+                    FROM aut_data a
+                    LEFT JOIN org_id_data o ON a.org_id = o.org_id
+                ) TO '{tmp_path}' (FORMAT PARQUET)
+            """)
+            tmp_path.rename(self._parquet_path)
+        except Exception:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        finally:
+            con.close()
 
-        return df_org_id, df_aut
+        self.io_helper.logger.info(f"Wrote {self._parquet_path.name} to disk.")
+
+    @lru_cache(maxsize=10_000)
+    def _cached_lookup(self, asn: int) -> tuple[str | None, str | None]:
+        result = duckdb.query(f"""
+            SELECT aut_name, org_name
+            FROM read_parquet('{self._parquet_path}')
+            WHERE aut = {asn}
+            LIMIT 1
+        """).fetchone()
+
+        if result is None:
+            return None, None
+        return result[0], result[1]
 
     def lookup(
         self,
@@ -164,21 +243,11 @@ class CaidaAsOrgInfoUtil:
                 Tuple containing the autonomous system name and organization name.
                 One or both may be None if not found.
         """
+        return self._cached_lookup(asn)
 
-        aut_str = str(asn)
-        if aut_str not in self.df_aut.index:
-            return None, None
-
-        row_aut = self.df_aut.loc[aut_str]
-        aut_name = row_aut['aut_name']
-        org_id = row_aut['org_id']
-        if org_id not in self.df_org_id.index:
-            return aut_name, None
-
-        row_org_id = self.df_org_id.loc[org_id]
-        org_name = row_org_id['org_name']
-
-        return aut_name, org_name
+    def clear_cache(self) -> None:
+        """Clear the LRU cache for lookup results."""
+        self._cached_lookup.cache_clear()
 
     def annotate_df(
         self,
@@ -207,17 +276,38 @@ class CaidaAsOrgInfoUtil:
             pandas.DataFrame:
                 Annotated DataFrame with new columns for autonomous system and organization names.
         """
+        con = duckdb.connect()
+        try:
+            con.register('input_df', df)
+            result = con.execute(f"""
+                SELECT d.*, j.aut_name AS {as_name_col}, j.org_name AS {org_name_col}
+                FROM input_df d
+                LEFT JOIN read_parquet('{self._parquet_path}') j
+                    ON CAST(d.{asn_col} AS INTEGER) = j.aut
+            """).df()
+        finally:
+            con.close()
+        return result
 
-        name_map = {}
-        org_map = {}
+    @property
+    def df_aut(self) -> pd.DataFrame:
+        """Backward-compatible property returning `aut` DataFrame."""
+        if self._df_aut is None:
+            self._df_aut = duckdb.query(f"""
+                SELECT aut, changed, aut_name, org_id, opaque_id, source
+                FROM read_parquet('{self._parquet_path}')
+            """).df()
+            self._df_aut.set_index('aut', inplace=True)
+        return self._df_aut
 
-        unique_asns = df[asn_col].dropna().unique()
-        for asn in unique_asns:
-            name, org = self.lookup(asn)
-            name_map[asn] = name if name else pd.NA
-            org_map[asn] = org if org else pd.NA
-
-        df[as_name_col] = df[asn_col].map(name_map).astype('string')
-        df[org_name_col] = df[asn_col].map(org_map).astype('string')
-
-        return df
+    @property
+    def df_org_id(self) -> pd.DataFrame:
+        """Backward-compatible property returning `org_id` DataFrame."""
+        if self._df_org_id is None:
+            self._df_org_id = duckdb.query(f"""
+                SELECT DISTINCT org_id, org_name, country
+                FROM read_parquet('{self._parquet_path}')
+                WHERE org_id IS NOT NULL
+            """).df()
+            self._df_org_id.set_index('org_id', inplace=True)
+        return self._df_org_id

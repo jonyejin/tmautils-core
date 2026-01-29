@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: MPL-2.0
 # Copyright (c) 2026 Sulyab Thottungal Valapu
 
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Iterator, Optional, TYPE_CHECKING
 from pathlib import Path
 from logging import Logger
 from dataclasses import dataclass, field
 from enum import StrEnum
+from contextlib import contextmanager
+from io import BufferedWriter, TextIOWrapper
 
 from .log import LogConfig, LogHelper, get_logger_from_helper
 
@@ -808,3 +810,56 @@ class IOHelper:
                 "Attempt to get worker logging config when no logger is set up."
             )
         return self._log_helper.get_worker_config()
+
+
+def path_temp_suffix(path: Path) -> Path:
+    """Return the provided path with a `.tmp` suffix added."""
+    return path.with_suffix(path.suffix + '.tmp')
+
+
+@contextmanager
+def atomic_write(
+    path: Path,
+    mode: str = 'wb',
+) -> Iterator[BufferedWriter | TextIOWrapper]:
+    """
+    Context manager for atomic file writes using temp file + rename.
+    If the caller raises an exception during the write,
+    the temp file is deleted and the original file (if any) remains unchanged.
+
+    Args:
+        path: Destination file path.
+        mode: File mode. Default is 'wb'.
+
+    Yields:
+        File handle to write to.
+
+    Raises:
+        Exception: Re-raises any exception after cleaning up temp file.
+
+    Example:
+        ```python
+        # Binary write
+        with atomic_write(output_path) as f:
+            f.write(downloaded_bytes)
+
+        # Text write
+        with atomic_write(config_path, mode='w') as f:
+            json.dump(data, f)
+
+        # Streaming write
+        with atomic_write(large_file) as f:
+            for chunk in chunks:
+                f.write(chunk)
+        ```
+    """
+
+    tmp_path = path_temp_suffix(path)
+    try:
+        with open(tmp_path, mode) as f:
+            yield f
+        tmp_path.rename(path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
