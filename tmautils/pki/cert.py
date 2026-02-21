@@ -32,6 +32,10 @@ def create_ssl_context(
     *,
     verify: bool = True,
     use_certifi: bool = True,
+    cafile: str | Path | None = None,
+    capath: str | Path | None = None,
+    check_hostname: bool | None = None,
+    min_tls_version: ssl.TLSVersion | None = None,
 ) -> ssl.SSLContext:
     """
     Create a reusable SSL context for certificate fetching.
@@ -43,18 +47,54 @@ def create_ssl_context(
             If False, the system's default CA bundle is used.
             Ignored if `verify` is False.
             Default is True.
+        cafile: Path to a CA certificate file (PEM format).
+            If provided, overrides use_certifi.
+        capath: Path to a directory of CA certificates.
+            If provided, overrides use_certifi.
+        check_hostname: Whether to verify the server's hostname matches
+            the certificate. Default (None) follows the verify setting.
+            Set to False to verify the cert chain but allow hostname mismatch.
+        min_tls_version: Minimum TLS version to accept.
+            Use ssl.TLSVersion.TLSv1 or TLSv1_1 for legacy servers.
+            Default is None (use OpenSSL defaults, typically TLS 1.2+).
 
     Returns:
         An `ssl.SSLContext` configured for TLS client connections.
+
+    Example:
+        # For legacy server requiring TLS 1.0:
+        ctx = create_ssl_context(min_tls_version=ssl.TLSVersion.TLSv1)
+
+        # Verify chain but ignore hostname mismatch:
+        ctx = create_ssl_context(verify=True, check_hostname=False)
+
+        # Custom CA bundle:
+        ctx = create_ssl_context(cafile="/path/to/custom-ca.pem")
     """
     if verify:
         # default context sets CERT_REQUIRED and check_hostname=True
-        cafile = certifi.where() if use_certifi else None
-        ctx = ssl.create_default_context(cafile=cafile)
+        if cafile or capath:
+            ctx = ssl.create_default_context(
+                cafile=str(cafile) if cafile else None,
+                capath=str(capath) if capath else None,
+            )
+        elif use_certifi:
+            ctx = ssl.create_default_context(cafile=certifi.where())
+        else:
+            ctx = ssl.create_default_context()
     else:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+
+    # Override check_hostname if explicitly specified
+    if check_hostname is not None:
+        ctx.check_hostname = check_hostname
+
+    # Set minimum TLS version if specified
+    if min_tls_version is not None:
+        ctx.minimum_version = min_tls_version
+
     return ctx
 
 
