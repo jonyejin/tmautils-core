@@ -1,4 +1,5 @@
 from .cert import (
+    create_ssl_context,
     get_cert,
     get_cert_sync,
     get_cert_chain,
@@ -21,6 +22,7 @@ from .types import (
 from .revocation import RevocationChecker
 
 __all__ = [
+    'create_ssl_context',
     'get_cert',
     'get_cert_sync',
     'get_cert_chain',

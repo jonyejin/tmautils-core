@@ -28,7 +28,25 @@ from ._crypto import get_cache_key, parse_cert_lrucached
 from .types import ExtensionMissingError
 
 
-def _build_ctx(*, verify: bool, use_certifi: bool):
+def create_ssl_context(
+    *,
+    verify: bool = True,
+    use_certifi: bool = True,
+) -> ssl.SSLContext:
+    """
+    Create a reusable SSL context for certificate fetching.
+
+    Args:
+        verify: Whether to verify the server's TLS certificate.
+            Default is True.
+        use_certifi: Whether to use the `certifi` CA bundle for verification.
+            If False, the system's default CA bundle is used.
+            Ignored if `verify` is False.
+            Default is True.
+
+    Returns:
+        An `ssl.SSLContext` configured for TLS client connections.
+    """
     if verify:
         # default context sets CERT_REQUIRED and check_hostname=True
         cafile = certifi.where() if use_certifi else None
@@ -45,16 +63,14 @@ def _get_cert_leaf_or_chain(
     port: int,
     sni: Optional[str],
     timeout: float,
-    verify: bool,
-    use_certifi: bool,
+    ssl_context: ssl.SSLContext,
     chain: bool,
 ):
     connect_host = str(host)
     server_hostname = str(sni) if sni is not None else connect_host
-    ctx = _build_ctx(verify=verify, use_certifi=use_certifi)
 
     with socket.create_connection((connect_host, port), timeout=timeout) as sock:
-        with ctx.wrap_socket(sock, server_hostname=server_hostname) as sslsock:
+        with ssl_context.wrap_socket(sock, server_hostname=server_hostname) as sslsock:
             if chain:
                 der_list = sslsock.get_verified_chain()  # works for verify=False too
                 return [
@@ -71,6 +87,7 @@ def get_cert_sync(
     *,
     sni: Optional[str] = None,
     timeout: float = 8.0,
+    ssl_context: ssl.SSLContext | None = None,
     verify: bool = True,
     use_certifi: bool = True,
 ):
@@ -93,23 +110,30 @@ def get_cert_sync(
         timeout:
             Connection timeout in seconds. Default is 8.0 seconds.
 
+        ssl_context:
+            A pre-configured SSL context to use for the connection.
+            If provided, `verify` and `use_certifi` are ignored.
+
         verify:
             Whether to verify the server's TLS certificate. Default is True.
+            Ignored if `ssl_context` is provided.
 
         use_certifi:
             Whether to use the `certifi` CA bundle for verification. Default is True.
             If False, the system's default CA bundle is used.
-            Ignored if `verify` is False.
+            Ignored if `verify` is False or `ssl_context` is provided.
 
     Returns:
         An `x509.Certificate` object representing the server's TLS certificate.
     """
+    ctx = ssl_context if ssl_context is not None else create_ssl_context(
+        verify=verify, use_certifi=use_certifi
+    )
 
     return _get_cert_leaf_or_chain(
         host=host, port=port, sni=sni,
         timeout=timeout,
-        verify=verify,
-        use_certifi=use_certifi,
+        ssl_context=ctx,
         chain=False,
     )
 
@@ -120,6 +144,7 @@ def get_cert_chain_sync(
     *,
     sni: Optional[str] = None,
     timeout: float = 8.0,
+    ssl_context: ssl.SSLContext | None = None,
     verify: bool = True,
     use_certifi: bool = True,
 ) -> list[x509.Certificate]:
@@ -142,23 +167,30 @@ def get_cert_chain_sync(
         timeout:
             Connection timeout in seconds. Default is 8.0 seconds.
 
+        ssl_context:
+            A pre-configured SSL context to use for the connection.
+            If provided, `verify` and `use_certifi` are ignored.
+
         verify:
             Whether to verify the server's TLS certificate. Default is True.
+            Ignored if `ssl_context` is provided.
 
         use_certifi:
             Whether to use the `certifi` CA bundle for verification. Default is True.
             If False, the system's default CA bundle is used.
-            Ignored if `verify` is False.
+            Ignored if `verify` is False or `ssl_context` is provided.
 
     Returns:
         A list of `x509.Certificate` objects representing the server's TLS certificate chain.
     """
+    ctx = ssl_context if ssl_context is not None else create_ssl_context(
+        verify=verify, use_certifi=use_certifi
+    )
 
     return _get_cert_leaf_or_chain(
         host=host, port=port, sni=sni,
         timeout=timeout,
-        verify=verify,
-        use_certifi=use_certifi,
+        ssl_context=ctx,
         chain=True,
     )
 
@@ -169,13 +201,11 @@ async def _get_cert_leaf_or_chain_async(
     sni: Optional[str],
     timeout: float,
     ssl_handshake_timeout: float,
-    verify: bool,
-    use_certifi: bool,
+    ssl_context: ssl.SSLContext,
     chain: bool,
 ):
     connect_host = str(host)
     server_hostname = str(sni) if sni is not None else connect_host
-    ctx = _build_ctx(verify=verify, use_certifi=use_certifi)
 
     writer = None
     try:
@@ -184,7 +214,7 @@ async def _get_cert_leaf_or_chain_async(
                 _, writer = await asyncio.open_connection(
                     connect_host,
                     port,
-                    ssl=ctx,
+                    ssl=ssl_context,
                     server_hostname=server_hostname,
                     ssl_handshake_timeout=ssl_handshake_timeout,
                 )
@@ -221,6 +251,7 @@ async def get_cert(
     sni: Optional[str] = None,
     timeout: float = 8.0,
     ssl_handshake_timeout: float = 5.0,
+    ssl_context: ssl.SSLContext | None = None,
     verify: bool = True,
     use_certifi: bool = True,
 ):
@@ -246,24 +277,31 @@ async def get_cert(
         ssl_handshake_timeout:
             Timeout for the SSL/TLS handshake in seconds. Default is 5.0 seconds.
 
+        ssl_context:
+            A pre-configured SSL context to use for the connection.
+            If provided, `verify` and `use_certifi` are ignored.
+
         verify:
             Whether to verify the server's TLS certificate. Default is True.
+            Ignored if `ssl_context` is provided.
 
         use_certifi:
             Whether to use the `certifi` CA bundle for verification. Default is True.
             If False, the system's default CA bundle is used.
-            Ignored if `verify` is False.
+            Ignored if `verify` is False or `ssl_context` is provided.
 
     Returns:
         An `x509.Certificate` object representing the server's TLS certificate.
     """
+    ctx = ssl_context if ssl_context is not None else create_ssl_context(
+        verify=verify, use_certifi=use_certifi
+    )
 
     return await _get_cert_leaf_or_chain_async(
         host=host, port=port, sni=sni,
         timeout=timeout,
         ssl_handshake_timeout=ssl_handshake_timeout,
-        verify=verify,
-        use_certifi=use_certifi,
+        ssl_context=ctx,
         chain=False,
     )
 
@@ -275,6 +313,7 @@ async def get_cert_chain(
     sni: Optional[str] = None,
     timeout: float = 8.0,
     ssl_handshake_timeout: float = 5.0,
+    ssl_context: ssl.SSLContext | None = None,
     verify: bool = True,
     use_certifi: bool = True,
 ) -> list[x509.Certificate]:
@@ -300,24 +339,31 @@ async def get_cert_chain(
         ssl_handshake_timeout:
             Timeout for the SSL/TLS handshake in seconds. Default is 5.0 seconds.
 
+        ssl_context:
+            A pre-configured SSL context to use for the connection.
+            If provided, `verify` and `use_certifi` are ignored.
+
         verify:
             Whether to verify the server's TLS certificate. Default is True.
+            Ignored if `ssl_context` is provided.
 
         use_certifi:
             Whether to use the `certifi` CA bundle for verification. Default is True.
             If False, the system's default CA bundle is used.
-            Ignored if `verify` is False.
+            Ignored if `verify` is False or `ssl_context` is provided.
 
     Returns:
         A list of `x509.Certificate` objects representing the server's TLS certificate chain.
     """
+    ctx = ssl_context if ssl_context is not None else create_ssl_context(
+        verify=verify, use_certifi=use_certifi
+    )
 
     return await _get_cert_leaf_or_chain_async(
         host=host, port=port, sni=sni,
         timeout=timeout,
         ssl_handshake_timeout=ssl_handshake_timeout,
-        verify=verify,
-        use_certifi=use_certifi,
+        ssl_context=ctx,
         chain=True,
     )
 
