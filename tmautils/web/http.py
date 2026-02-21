@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # Copyright (c) 2026 Sulyab Thottungal Valapu
 
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import Any, AsyncIterator, Callable
 import asyncio
 from contextlib import asynccontextmanager, AbstractAsyncContextManager
 from datetime import datetime, timezone
@@ -51,13 +51,19 @@ def _get_acquire_func(
 
 
 class _RetryableHTTPStatus(aiohttp.ClientError):
-    def __init__(self, status: int, retry_after: Optional[float] = None):
+    def __init__(
+        self,
+        status: int,
+        retry_after: float | None = None,
+        is_rate_limited: bool = False,
+    ):
         super().__init__(f"Retryable HTTP {status}")
         self.status = status
         self.retry_after = retry_after
+        self.is_rate_limited = is_rate_limited
 
 
-def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+def _parse_retry_after(value: str | None) -> float | None:
     if not value:
         return None
 
@@ -79,20 +85,41 @@ def _parse_retry_after(value: Optional[str]) -> Optional[float]:
 
 
 class _WaitRetryAfterOrRandomExp:
-    def __init__(self, multiplier: float = 1.0, max_: float = 60.0):
-        self._exp = wait_random_exponential(
-            multiplier=multiplier, max=max_
+    def __init__(
+        self,
+        # Retryable error params
+        retryable_error_multiplier: float = 1.0,
+        retryable_error_min: float = 1.0,
+        retryable_error_max: float = 60.0,
+        # Rate limited params
+        rate_limited_multiplier: float = 2.0,
+        rate_limited_min: float = 5.0,
+        rate_limited_max: float = 60.0,
+    ):
+        self._retryable_error_wait = wait_random_exponential(
+            multiplier=retryable_error_multiplier,
+            min=retryable_error_min,
+            max=retryable_error_max,
+        )
+        self._rate_limited_wait = wait_random_exponential(
+            multiplier=rate_limited_multiplier,
+            min=rate_limited_min,
+            max=rate_limited_max,
         )
 
     def __call__(self, retry_state) -> float:
-        # If retry_after is available, use that
         if retry_state.outcome and retry_state.outcome.failed:
             exc = retry_state.outcome.exception()
-            if isinstance(exc, _RetryableHTTPStatus) and exc.retry_after is not None:
-                return exc.retry_after
+            if isinstance(exc, _RetryableHTTPStatus):
+                # If retry_after is available, use that
+                if exc.retry_after is not None:
+                    return exc.retry_after
+                # If rate limited, use rate limited wait strategy
+                if exc.is_rate_limited:
+                    return self._rate_limited_wait(retry_state)
 
-        # Otherwise, use exponential backoff with jitter
-        return self._exp(retry_state)
+        # Default to retryable error wait strategy
+        return self._retryable_error_wait(retry_state)
 
 
 @asynccontextmanager
@@ -106,12 +133,19 @@ async def request_with_retry(
     json: Any = None,
     attempt_timeout: float = 10.0,
     max_attempts: int = 3,
-    retry_statuses: Optional[frozenset[int]] = None,
-    retry_multiplier: float = 0.5,
-    retry_max_wait: float = 30.0,
+    retryable_error_statuses: frozenset[int] | None = None,
+    rate_limited_statuses: frozenset[int] = frozenset({429}),
+    # Retryable error wait params
+    retryable_error_min_wait: float = 1.0,
+    retryable_error_multiplier: float = 1.0,
+    retryable_error_max_wait: float = 60.0,
+    # Rate limited wait params
+    rate_limited_min_wait: float = 5.0,
+    rate_limited_multiplier: float = 2.0,
+    rate_limited_max_wait: float = 60.0,
     respect_retry_after: bool = True,
     max_retry_after: float = 60.0,
-    log_helper: Optional[LogHelper] = None,
+    log_helper: LogHelper | None = None,
     **request_kwargs,
 ) -> AsyncIterator[aiohttp.ClientResponse]:
     """
@@ -152,22 +186,43 @@ async def request_with_retry(
             Maximum number of attempts (including the initial attempt).
             Default is 3 attempts.
 
-        retry_statuses:
-            Set of HTTP status codes that should trigger a retry.
+        retryable_error_statuses:
+            Set of HTTP status codes for transient errors that should trigger a retry.
             If None (default), uses method-specific defaults:
-            - Safe methods (GET, HEAD, OPTIONS, TRACE): {429, 500, 502, 503, 504}
-            - Unsafe methods (POST, PUT, PATCH, DELETE): {429, 503}
+            - Safe methods (GET, HEAD, OPTIONS, TRACE): {500, 502, 503, 504}
+            - Unsafe methods (POST, PUT, PATCH, DELETE): {503}
 
             Unsafe methods default to conservative retry due to idempotency concerns.
             Override with custom frozenset if your endpoint is idempotent.
 
-        retry_multiplier:
-            Multiplier for exponential backoff calculation.
-            Default is 0.5.
+        rate_limited_statuses:
+            Set of HTTP status codes indicating rate limiting.
+            These use a stricter backoff strategy than transient errors.
+            Default is {429}.
 
-        retry_max_wait:
-            Maximum wait time between retries in seconds.
-            Default is 30.0 seconds.
+        retryable_error_min_wait:
+            Minimum wait time between retries for transient errors in seconds.
+            Default is 1.0 seconds.
+
+        retryable_error_multiplier:
+            Multiplier for exponential backoff calculation for transient errors.
+            Default is 1.0.
+
+        retryable_error_max_wait:
+            Maximum wait time between retries for transient errors in seconds.
+            Default is 60.0 seconds.
+
+        rate_limited_min_wait:
+            Minimum wait time between retries for rate limited responses in seconds.
+            Default is 5.0 seconds.
+
+        rate_limited_multiplier:
+            Multiplier for exponential backoff calculation for rate limited responses.
+            Default is 2.0.
+
+        rate_limited_max_wait:
+            Maximum wait time between retries for rate limited responses in seconds.
+            Default is 60.0 seconds.
 
         respect_retry_after:
             Whether to respect the 'Retry-After' header from server responses.
@@ -243,15 +298,16 @@ async def request_with_retry(
     # Get acquire function from rate limiter
     acquire = _get_acquire_func(url, rate_limiter)
 
-    # Set method-specific default retry statuses
+    # Set method-specific default retryable error statuses
+    # (rate limited statuses handled separately)
     method = method.upper()
-    if retry_statuses is None:
+    if retryable_error_statuses is None:
         if method in {"GET", "HEAD", "OPTIONS", "TRACE"}:
             # Safe/idempotent methods - can retry more aggressively
-            retry_statuses = frozenset({429, 500, 502, 503, 504})
+            retryable_error_statuses = frozenset({500, 502, 503, 504})
         else:
             # More conservative to avoid duplicate operations
-            retry_statuses = frozenset({429, 503})
+            retryable_error_statuses = frozenset({503})
 
     logger = get_logger_from_helper(log_helper)
 
@@ -259,7 +315,12 @@ async def request_with_retry(
     retrying = AsyncRetrying(
         stop=stop_after_attempt(max_attempts),
         wait=_WaitRetryAfterOrRandomExp(
-            multiplier=retry_multiplier, max_=retry_max_wait
+            retryable_error_multiplier=retryable_error_multiplier,
+            retryable_error_min=retryable_error_min_wait,
+            retryable_error_max=retryable_error_max_wait,
+            rate_limited_multiplier=rate_limited_multiplier,
+            rate_limited_min=rate_limited_min_wait,
+            rate_limited_max=rate_limited_max_wait,
         ),
         retry=retry_if_exception_type(
             (_RetryableHTTPStatus, aiohttp.ClientError, asyncio.TimeoutError)
@@ -268,7 +329,7 @@ async def request_with_retry(
     )
 
     timeout = aiohttp.ClientTimeout(total=attempt_timeout)
-    resp: Optional[aiohttp.ClientResponse] = None
+    resp: aiohttp.ClientResponse | None = None
     async for attempt in retrying:
         with attempt:
             try:
@@ -285,7 +346,10 @@ async def request_with_retry(
                     )
 
                     # Check for retryable status
-                    if resp.status in retry_statuses:
+                    is_rate_limited = resp.status in rate_limited_statuses
+                    is_retryable_error = resp.status in retryable_error_statuses
+
+                    if is_rate_limited or is_retryable_error:
                         # Use Retry-After if applicable
                         status = resp.status
                         retry_after = None
@@ -297,8 +361,12 @@ async def request_with_retry(
                                 retry_after = min(retry_after, max_retry_after)
 
                         logger.info(
-                            "Retryable HTTP %s for %s %s (retry_after=%s)",
-                            status, method, url, retry_after
+                            "Retryable HTTP %s for %s %s (retry_after=%s, rate_limited=%s)",
+                            status, method, url, retry_after, is_rate_limited
+                        )
+                        logger.info(
+                            "Response headers: %s",
+                            dict(resp.headers)
                         )
 
                         # Release connection before retrying
@@ -306,7 +374,9 @@ async def request_with_retry(
                         resp = None
 
                         raise _RetryableHTTPStatus(
-                            status, retry_after=retry_after
+                            status,
+                            retry_after=retry_after,
+                            is_rate_limited=is_rate_limited,
                         )
 
                 # Success or non-retryable status - break out of retry loop
@@ -314,11 +384,14 @@ async def request_with_retry(
 
             except _RetryableHTTPStatus:
                 raise  # Trigger retry
-            except (aiohttp.ClientError, asyncio.TimeoutError):
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if resp is not None:
                     resp.release()
                     resp = None
-                logger.info("%s error for %s", method, url, exc_info=True)
+                logger.info(
+                    "%s error for %s %s: %s",
+                    type(e).__name__, method, url, e
+                )
                 raise
 
     # Yield response to caller outside retry mechanism
@@ -340,12 +413,19 @@ async def get_with_retry(
     rate_limiter: AsyncRateLimiter | None = None,
     attempt_timeout: float = 10.0,
     max_attempts: int = 3,
-    retry_statuses: frozenset[int] = frozenset({429, 500, 502, 503, 504}),
-    retry_multiplier: float = 0.5,
-    retry_max_wait: float = 30.0,
+    retryable_error_statuses: frozenset[int] = frozenset({500, 502, 503, 504}),
+    rate_limited_statuses: frozenset[int] = frozenset({429}),
+    # Retryable error wait params
+    retryable_error_min_wait: float = 1.0,
+    retryable_error_multiplier: float = 1.0,
+    retryable_error_max_wait: float = 60.0,
+    # Rate limited wait params
+    rate_limited_min_wait: float = 5.0,
+    rate_limited_multiplier: float = 2.0,
+    rate_limited_max_wait: float = 60.0,
     respect_retry_after: bool = True,
     max_retry_after: float = 60.0,
-    log_helper: Optional[LogHelper] = None,
+    log_helper: LogHelper | None = None,
     **request_kwargs,
 ):
     """
@@ -363,9 +443,14 @@ async def get_with_retry(
         rate_limiter=rate_limiter,
         attempt_timeout=attempt_timeout,
         max_attempts=max_attempts,
-        retry_statuses=retry_statuses,
-        retry_multiplier=retry_multiplier,
-        retry_max_wait=retry_max_wait,
+        retryable_error_statuses=retryable_error_statuses,
+        rate_limited_statuses=rate_limited_statuses,
+        retryable_error_min_wait=retryable_error_min_wait,
+        retryable_error_multiplier=retryable_error_multiplier,
+        retryable_error_max_wait=retryable_error_max_wait,
+        rate_limited_min_wait=rate_limited_min_wait,
+        rate_limited_multiplier=rate_limited_multiplier,
+        rate_limited_max_wait=rate_limited_max_wait,
         respect_retry_after=respect_retry_after,
         max_retry_after=max_retry_after,
         log_helper=log_helper,

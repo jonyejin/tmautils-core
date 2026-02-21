@@ -5,7 +5,11 @@ from datetime import datetime, timezone, timedelta
 import aiohttp
 
 from tmautils.web import get_with_retry, request_with_retry
-from tmautils.web.http import _parse_retry_after
+from tmautils.web.http import (
+    _parse_retry_after,
+    _RetryableHTTPStatus,
+    _WaitRetryAfterOrRandomExp,
+)
 
 
 def _run_async(coro):
@@ -95,7 +99,7 @@ def test_retryable_status_503_triggers_retry():
 
 def test_non_retryable_status_returned():
     """Test non-retryable status (404, 403) doesn't trigger retry"""
-    # Note: 500 and 502 are in default retry_statuses for GET, so only test non-retryable statuses
+    # Note: 500 and 502 are in default retryable_error_statuses for GET, so only test non-retryable statuses
     for status in [404, 403, 400, 401]:
         async def _test():
             mock_session = Mock()
@@ -301,7 +305,7 @@ def test_respect_retry_after_disabled():
             "http://example.com",
             max_attempts=2,
             respect_retry_after=False,
-            retry_multiplier=0.01,  # Very small for fast test
+            retryable_error_multiplier=0.01,  # Very small for fast test
         ) as resp:
             assert resp.status == 200
 
@@ -339,8 +343,8 @@ def test_max_retry_after_cap():
     _run_async(_test())
 
 
-def test_custom_retry_statuses():
-    """Test custom retry_statuses parameter"""
+def test_custom_retryable_error_statuses():
+    """Test custom retryable_error_statuses parameter"""
     async def _test():
         mock_session = Mock()
         # 404 normally not retried, but we'll configure it to retry
@@ -354,7 +358,7 @@ def test_custom_retry_statuses():
             mock_session,
             "http://example.com",
             max_attempts=2,
-            retry_statuses=frozenset({404}),
+            retryable_error_statuses=frozenset({404}),
         ) as resp:
             assert resp.status == 200
 
@@ -604,11 +608,11 @@ def test_request_with_retry_post_retries_on_503():
     _run_async(_test())
 
 
-def test_request_with_retry_custom_retry_statuses_override():
-    """Test that custom retry_statuses override method-specific defaults"""
+def test_request_with_retry_custom_retryable_error_statuses_override():
+    """Test that custom retryable_error_statuses override method-specific defaults"""
     async def _test():
         mock_session = Mock()
-        # POST with 500 and custom retry_statuses that includes 500
+        # POST with 500 and custom retryable_error_statuses that includes 500
         mock_responses = [MockResponse(500), MockResponse(200)]
         mock_session.request = AsyncMock(side_effect=mock_responses)
 
@@ -617,11 +621,11 @@ def test_request_with_retry_custom_retry_statuses_override():
             "POST",
             "http://example.com",
             max_attempts=2,
-            retry_statuses=frozenset({429, 500, 502, 503, 504})
+            retryable_error_statuses=frozenset({429, 500, 502, 503, 504})
         ) as resp:
             assert resp.status == 200
 
-        # Should have retried on 500 because of custom retry_statuses
+        # Should have retried on 500 because of custom retryable_error_statuses
         assert mock_session.request.call_count == 2
 
     _run_async(_test())
@@ -662,7 +666,7 @@ def test_post_retry_with_retry_after_header():
             "http://example.com",
             json={"test": "data"},
             max_attempts=2,
-            retry_statuses=frozenset({429, 503})
+            retryable_error_statuses=frozenset({429, 503})
         ) as resp:
             assert resp.status == 200
 
@@ -693,7 +697,7 @@ def test_post_exhausts_retries():
                 "http://example.com",
                 json={"test": "data"},
                 max_attempts=3,
-                retry_statuses=frozenset({429, 503})
+                retryable_error_statuses=frozenset({429, 503})
             ) as resp:
                 pass
 
@@ -719,7 +723,7 @@ def test_post_client_error_triggers_retry():
             "http://example.com",
             json={"test": "data"},
             max_attempts=2,
-            retry_statuses=frozenset({429, 503})
+            retryable_error_statuses=frozenset({429, 503})
         ) as resp:
             assert resp.status == 200
 
@@ -745,7 +749,7 @@ def test_post_timeout_triggers_retry():
             "http://example.com",
             json={"test": "data"},
             max_attempts=2,
-            retry_statuses=frozenset({429, 503})
+            retryable_error_statuses=frozenset({429, 503})
         ) as resp:
             assert resp.status == 200
 
@@ -789,7 +793,7 @@ def test_post_resource_cleanup_on_retry():
             "http://example.com",
             json={"test": "data"},
             max_attempts=2,
-            retry_statuses=frozenset({429, 503})
+            retryable_error_statuses=frozenset({429, 503})
         ) as resp:
             assert resp.status == 200
 
@@ -816,7 +820,7 @@ def test_request_kwargs_passed_through_for_post():
             "POST",
             "http://example.com",
             json={"test": "data"},
-            retry_statuses=frozenset({429, 503}),
+            retryable_error_statuses=frozenset({429, 503}),
             headers=headers,
             params=params
         ) as resp:
@@ -1110,6 +1114,239 @@ async def test_get_with_retry_with_rate_limiter():
         mock_session, "http://example.com", rate_limiter=limiter
     ) as resp:
         assert resp.status == 200
+
+
+# ===== Rate Limit vs Error Retry Strategy Tests =====
+
+
+def test_rate_limit_status_uses_rate_limit_wait_strategy():
+    """Test that 429 (rate limit) uses the stricter rate limit wait strategy."""
+    async def _test():
+        mock_session = Mock()
+        # First returns 429 without Retry-After, then 200
+        mock_responses = [MockResponse(429), MockResponse(200)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        start_time = asyncio.get_event_loop().time()
+        async with request_with_retry(
+            mock_session, "GET", "http://example.com",
+            max_attempts=2,
+            rate_limited_min_wait=0.2,  # Use short values for testing
+            rate_limited_multiplier=1.0,
+            rate_limited_max_wait=1.0,
+            retryable_error_min_wait=0.01,  # Error wait should be much faster
+            retryable_error_multiplier=0.01,
+            retryable_error_max_wait=0.1,
+        ) as resp:
+            assert resp.status == 200
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        # Should have waited at least rate_limited_min_wait (0.2s), not error min_wait
+        assert elapsed >= 0.2
+
+    _run_async(_test())
+
+
+def test_error_status_uses_error_wait_strategy():
+    """Test that 500 (transient error) uses the error wait strategy."""
+    async def _test():
+        mock_session = Mock()
+        # First returns 500, then 200
+        mock_responses = [MockResponse(500), MockResponse(200)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        start_time = asyncio.get_event_loop().time()
+        async with request_with_retry(
+            mock_session, "GET", "http://example.com",
+            max_attempts=2,
+            retryable_error_min_wait=0.15,
+            retryable_error_multiplier=1.0,
+            retryable_error_max_wait=1.0,
+            rate_limited_min_wait=1.0,  # Rate limit wait should be much slower
+            rate_limited_multiplier=1.0,
+            rate_limited_max_wait=2.0,
+        ) as resp:
+            assert resp.status == 200
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        # Should have waited at least retryable_error_min_wait (0.15s), but not rate_limited_min_wait (1.0s)
+        assert 0.15 <= elapsed < 0.95
+
+    _run_async(_test())
+
+
+def test_rate_limit_with_retry_after_still_respects_header():
+    """Test that 429 with Retry-After header respects the header value."""
+    async def _test():
+        mock_session = Mock()
+        # 429 with short Retry-After header
+        mock_responses = [MockResponse(429, {"Retry-After": "0.15"}), MockResponse(200)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        start_time = asyncio.get_event_loop().time()
+        async with request_with_retry(
+            mock_session, "GET", "http://example.com",
+            max_attempts=2,
+            rate_limited_min_wait=1.0,  # This should be ignored due to Retry-After
+            rate_limited_multiplier=1.0,
+            rate_limited_max_wait=2.0,
+            respect_retry_after=True,
+        ) as resp:
+            assert resp.status == 200
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        # Should have waited ~0.15s (Retry-After value), not rate_limited_min_wait
+        assert 0.15 <= elapsed < 0.5
+
+    _run_async(_test())
+
+
+def test_custom_rate_limited_statuses():
+    """Test that custom rate_limited_statuses are used correctly."""
+    async def _test():
+        mock_session = Mock()
+        # 503 normally uses error wait, but we configure it as rate limit
+        mock_responses = [MockResponse(503), MockResponse(200)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        start_time = asyncio.get_event_loop().time()
+        async with request_with_retry(
+            mock_session, "GET", "http://example.com",
+            max_attempts=2,
+            retryable_error_statuses=frozenset({500, 502}),  # 503 not in error set
+            rate_limited_statuses=frozenset({429, 503}),  # 503 is rate limit
+            retryable_error_min_wait=0.01,
+            retryable_error_multiplier=0.01,
+            retryable_error_max_wait=0.1,
+            rate_limited_min_wait=0.2,
+            rate_limited_multiplier=1.0,
+            rate_limited_max_wait=1.0,
+        ) as resp:
+            assert resp.status == 200
+
+        elapsed = asyncio.get_event_loop().time() - start_time
+        # Should have used rate limit wait (>=0.2s)
+        assert elapsed >= 0.2
+
+    _run_async(_test())
+
+
+def test_default_retryable_error_statuses_dont_include_429():
+    """Test that default retryable_error_statuses no longer include 429."""
+    async def _test():
+        mock_session = Mock()
+        # Create 3 mock responses - all 500 (to exhaust retries)
+        mock_responses = [MockResponse(500), MockResponse(500), MockResponse(500)]
+        mock_session.request = AsyncMock(side_effect=mock_responses)
+
+        # Use empty rate_limited_statuses and default retryable_error_statuses
+        # 429 should NOT be retried if rate_limited_statuses is empty
+        with pytest.raises(Exception):  # Will exhaust retries on 500
+            async with request_with_retry(
+                mock_session, "GET", "http://example.com",
+                max_attempts=3,
+                rate_limited_statuses=frozenset(),  # Disable rate limit handling
+                retryable_error_min_wait=0.01,  # Fast for testing
+                retryable_error_multiplier=0.01,
+                retryable_error_max_wait=0.1,
+                # retryable_error_statuses defaults to {500, 502, 503, 504} for GET
+            ) as resp:
+                pass
+
+        # Request should have been retried (500 is in default retryable_error_statuses)
+        assert mock_session.request.call_count == 3
+
+    _run_async(_test())
+
+
+def test_429_not_retried_if_not_in_rate_limited_statuses():
+    """Test that 429 is not retried if excluded from rate_limited_statuses."""
+    async def _test():
+        mock_session = Mock()
+        mock_response = MockResponse(429)
+        mock_session.request = AsyncMock(return_value=mock_response)
+
+        async with request_with_retry(
+            mock_session, "GET", "http://example.com",
+            max_attempts=3,
+            rate_limited_statuses=frozenset(),  # 429 not treated as rate limit
+            retryable_error_statuses=frozenset({500, 502, 503, 504}),  # 429 not in error set
+        ) as resp:
+            assert resp.status == 429  # Should return immediately, no retry
+
+        # Should only make 1 attempt (no retry)
+        assert mock_session.request.call_count == 1
+
+    _run_async(_test())
+
+
+class MockRetryState:
+    """Mock tenacity retry state for testing wait strategies."""
+    def __init__(self, exception=None):
+        self.attempt_number = 1
+        self.outcome = Mock()
+        self.outcome.failed = exception is not None
+        self.outcome.exception = Mock(return_value=exception)
+
+
+def test_wait_strategy_uses_retry_after_when_available():
+    """Test that _WaitRetryAfterOrRandomExp uses retry_after if provided."""
+    wait_strategy = _WaitRetryAfterOrRandomExp(
+        retryable_error_multiplier=1.0, retryable_error_min=1.0, retryable_error_max=60.0,
+        rate_limited_multiplier=2.0, rate_limited_min=5.0, rate_limited_max=120.0,
+    )
+
+    # Create exception with retry_after
+    exc = _RetryableHTTPStatus(429, retry_after=10.0, is_rate_limited=True)
+    retry_state = MockRetryState(exception=exc)
+
+    wait_time = wait_strategy(retry_state)
+    assert wait_time == 10.0  # Should use retry_after exactly
+
+
+def test_wait_strategy_uses_rate_limited_backoff_for_rate_limited():
+    """Test that _WaitRetryAfterOrRandomExp uses rate limited backoff for rate limited errors."""
+    wait_strategy = _WaitRetryAfterOrRandomExp(
+        retryable_error_multiplier=1.0, retryable_error_min=1.0, retryable_error_max=60.0,
+        rate_limited_multiplier=2.0, rate_limited_min=5.0, rate_limited_max=120.0,
+    )
+
+    # Create rate limit exception without retry_after
+    exc = _RetryableHTTPStatus(429, retry_after=None, is_rate_limited=True)
+    retry_state = MockRetryState(exception=exc)
+
+    wait_time = wait_strategy(retry_state)
+    # Should be in rate limit range [5.0, 120.0]
+    assert 5.0 <= wait_time <= 120.0
+
+
+def test_wait_strategy_uses_retryable_error_backoff_for_errors():
+    """Test that _WaitRetryAfterOrRandomExp uses retryable error backoff for non-rate-limited errors."""
+    wait_strategy = _WaitRetryAfterOrRandomExp(
+        retryable_error_multiplier=1.0, retryable_error_min=1.0, retryable_error_max=60.0,
+        rate_limited_multiplier=2.0, rate_limited_min=5.0, rate_limited_max=120.0,
+    )
+
+    # Create error exception (not rate limit)
+    exc = _RetryableHTTPStatus(500, retry_after=None, is_rate_limited=False)
+    retry_state = MockRetryState(exception=exc)
+
+    wait_time = wait_strategy(retry_state)
+    # Should be in error range [1.0, 60.0]
+    assert 1.0 <= wait_time <= 60.0
+
+
+def test_retryable_http_status_is_rate_limited_flag():
+    """Test that _RetryableHTTPStatus correctly stores is_rate_limited flag."""
+    exc_rate_limit = _RetryableHTTPStatus(429, retry_after=5.0, is_rate_limited=True)
+    assert exc_rate_limit.is_rate_limited is True
+    assert exc_rate_limit.status == 429
+    assert exc_rate_limit.retry_after == 5.0
+
+    exc_error = _RetryableHTTPStatus(500, retry_after=None, is_rate_limited=False)
+    assert exc_error.is_rate_limited is False
+    assert exc_error.status == 500
+    assert exc_error.retry_after is None
 
 
 if __name__ == "__main__":
