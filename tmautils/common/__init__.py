@@ -13,6 +13,8 @@ from .utils import (
     is_internal_flow,
     is_external_flow,
     is_internal_flow_or_same_v6_upper_64,
+    MAX_ASN,
+    parse_asn,
 )
 from .io import (
     import_module_attr,
@@ -54,6 +56,8 @@ __all__ = [
     "is_internal_flow",
     "is_external_flow",
     "is_internal_flow_or_same_v6_upper_64",
+    "MAX_ASN",
+    "parse_asn",
     "import_module_attr",
     "gzip_file",
     "gunzip_file",

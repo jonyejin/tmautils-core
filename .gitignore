@@ -175,3 +175,10 @@ cython_debug/
 
 # Local test data
 data/
+tests/**/
+!tests/data/
+!tests/data/**/
+*.ipynb
+
+# Local references
+ref/

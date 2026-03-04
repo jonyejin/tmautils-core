@@ -7,6 +7,9 @@ from ipaddress import ip_address, IPv4Address, IPv6Address
 
 from .types import IPAddress
 
+MAX_ASN: int = (1 << 32) - 1
+"""Maximum valid ASN per RFC 6793."""
+
 
 def maybe_apply(fn: Callable):
     """
@@ -89,3 +92,25 @@ def is_internal_flow_or_same_v6_upper_64(src_ip: IPAddress, dst_ip: IPAddress):
     if src_ip.version == 6:  # We can skip the check for dst_ip
         return src_ip.packed[:8] == dst_ip.packed[:8]
     return False
+
+
+def parse_asn(value: str | int) -> int:
+    """
+    Parse an ASN from ``'AS15169'``, ``'15169'``, or ``15169``.
+
+    Raises:
+        ValueError: If the value is not a valid ASN or is out of range.
+    """
+    if isinstance(value, int):
+        asn = value
+    else:
+        s = str(value).strip().upper()
+        if s.startswith("AS"):
+            s = s[2:]
+        try:
+            asn = int(s)
+        except ValueError:
+            raise ValueError(f"Invalid ASN: {value}")
+    if asn < 0 or asn > MAX_ASN:
+        raise ValueError(f"ASN out of range (0-{MAX_ASN}): {asn}")
+    return asn
