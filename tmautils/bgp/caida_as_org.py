@@ -4,13 +4,12 @@
 from functools import lru_cache
 from pathlib import Path
 import gzip
-import aiohttp
 import duckdb
 import pandas as pd
 import pyarrow as pa
+import requests
 
-from tmautils.common import IOHelper, run_coro_sync, atomic_write, path_temp_suffix
-from tmautils.web import request_with_retry
+from tmautils.common import IOHelper, atomic_write, path_temp_suffix
 
 
 class CaidaAsOrgInfoUtil:
@@ -77,7 +76,7 @@ class CaidaAsOrgInfoUtil:
 
         # Check if we need to download/process
         if not self._parquet_path.exists() or not self._validate_parquet():
-            run_coro_sync(self._download_and_process())
+            self._download_and_process()
         else:
             self.io_helper.logger.info(
                 f"Loaded {self._parquet_path.name} from disk."
@@ -103,10 +102,10 @@ class CaidaAsOrgInfoUtil:
             self._parquet_path.unlink(missing_ok=True)
             return False
 
-    async def _download_and_process(self) -> None:
+    def _download_and_process(self) -> None:
         # Check if we need to download
         if not self._gz_path.exists():
-            await self._download_gz()
+            self._download_gz()
 
         # Try to parse and save
         try:
@@ -117,10 +116,10 @@ class CaidaAsOrgInfoUtil:
             )
             # Delete corrupt gz and try again
             self._gz_path.unlink(missing_ok=True)
-            await self._download_gz()
+            self._download_gz()
             self._parse_and_save()  # Let it raise if still fails
 
-    async def _download_gz(self) -> None:
+    def _download_gz(self) -> None:
         self.io_helper.logger.info("Downloading AS2Org data from CAIDA...")
 
         url = (
@@ -128,20 +127,11 @@ class CaidaAsOrgInfoUtil:
             f"{self.date_str}.as-org2info.v0.txt.gz"
         )
 
-        async with aiohttp.ClientSession() as session:
-            async with request_with_retry(
-                session, "GET", url,
-                attempt_timeout=30.0,
-                max_attempts=3,
-                log_helper=self.io_helper._log_helper,
-            ) as resp:
-                resp.raise_for_status()
-                content = await resp.read()
-
-                with atomic_write(self._gz_path) as f:
-                    f.write(content)
-
-                self.io_helper.logger.info(f"Downloaded {self._gz_path.name}")
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        with atomic_write(self._gz_path) as f:
+            f.write(resp.content)
+        self.io_helper.logger.info(f"Downloaded {self._gz_path.name}")
 
     def _parse_and_save(self) -> None:
         org_id_rows: list[dict[str, str]] = []

@@ -6,14 +6,13 @@ from pathlib import Path
 import csv
 import re
 from typing import Optional
-import aiohttp
 import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
+import requests
 
-from tmautils.common import IOHelper, run_coro_sync, atomic_write, path_temp_suffix
-from tmautils.web import request_with_retry
+from tmautils.common import IOHelper, atomic_write, path_temp_suffix
 
 
 class ASdbCategoryUtil:
@@ -95,7 +94,7 @@ class ASdbCategoryUtil:
 
         # Check if we need to download/process
         if not self._parquet_path.exists() or not self._validate_parquet():
-            run_coro_sync(self._download_and_process())
+            self._download_and_process()
         else:
             self._build_category_dict()
             self.io_helper.logger.info(
@@ -121,12 +120,12 @@ class ASdbCategoryUtil:
             self._parquet_path.unlink(missing_ok=True)
             return False
 
-    async def _download_and_process(self) -> None:
+    def _download_and_process(self) -> None:
         # Download CSV files if needed
         if not self._data_csv_path.exists():
-            await self._download_file(self._data_url, self._data_csv_path)
+            self._download_file(self._data_url, self._data_csv_path)
         if not self._category_csv_path.exists():
-            await self._download_file(self._category_url, self._category_csv_path)
+            self._download_file(self._category_url, self._category_csv_path)
 
         # Build category dict
         self._build_category_dict()
@@ -139,26 +138,16 @@ class ASdbCategoryUtil:
                 f"Failed to parse CSV: {e}. Attempting re-download..."
             )
             self._data_csv_path.unlink(missing_ok=True)
-            await self._download_file(self._data_url, self._data_csv_path)
+            self._download_file(self._data_url, self._data_csv_path)
             self._parse_and_save()  # Let it raise if still fails
 
-    async def _download_file(self, url: str, dest: Path) -> None:
+    def _download_file(self, url: str, dest: Path) -> None:
         self.io_helper.logger.info(f"Downloading {url}...")
-
-        async with aiohttp.ClientSession() as session:
-            async with request_with_retry(
-                session, "GET", url,
-                attempt_timeout=30.0,
-                max_attempts=3,
-                log_helper=self.io_helper._log_helper,
-            ) as resp:
-                resp.raise_for_status()
-                content = await resp.read()
-
-                with atomic_write(dest) as f:
-                    f.write(content)
-
-                self.io_helper.logger.info(f"Downloaded {dest.name}")
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        with atomic_write(dest) as f:
+            f.write(resp.content)
+        self.io_helper.logger.info(f"Downloaded {dest.name}")
 
     def _build_category_dict(self) -> None:
         category: dict[str, list[str | None]] = {}

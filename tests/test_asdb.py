@@ -3,7 +3,7 @@
 
 import os
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -325,53 +325,37 @@ class TestASdbCategoryResilience:
 
 
 class TestASdbCategoryDownload:
-    async def test_download_on_missing_data(self, tmp_path: Path):
+    def test_download_on_missing_data(self, tmp_path: Path):
         """Test that data is downloaded when raw files don't exist."""
-        mock_data_response = AsyncMock()
-        mock_data_response.raise_for_status = lambda: None
-        mock_data_response.read = AsyncMock(
-            return_value=SAMPLE_ASDB_DATA.encode())
-
-        mock_category_response = AsyncMock()
-        mock_category_response.raise_for_status = lambda: None
-        mock_category_response.read = AsyncMock(
-            return_value=SAMPLE_CATEGORY_DATA.encode())
-
         call_count = 0
 
-        def create_mock_context():
+        def mock_get(url, **kwargs):
             nonlocal call_count
             call_count += 1
-            mock_context = AsyncMock()
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
             if call_count == 1:
-                mock_context.__aenter__.return_value = mock_data_response
+                resp.content = SAMPLE_ASDB_DATA.encode()
             else:
-                mock_context.__aenter__.return_value = mock_category_response
-            mock_context.__aexit__.return_value = None
-            return mock_context
+                resp.content = SAMPLE_CATEGORY_DATA.encode()
+            return resp
 
-        with patch('tmautils.bgp.asdb.request_with_retry', side_effect=lambda *a, **k: create_mock_context()):
-            with patch('tmautils.bgp.asdb.aiohttp.ClientSession') as mock_session_class:
-                mock_session = AsyncMock()
-                mock_session.__aenter__.return_value = mock_session
-                mock_session.__aexit__.return_value = None
-                mock_session_class.return_value = mock_session
+        with patch('tmautils.bgp.asdb.requests.get', side_effect=mock_get):
+            util = ASdbCategoryUtil(
+                year=2024,
+                month=1,
+                working_root=tmp_path,
+                setup_logging=False,
+            )
 
-                util = ASdbCategoryUtil(
-                    year=2024,
-                    month=1,
-                    working_root=tmp_path,
-                    setup_logging=False,
-                )
+            # Should have downloaded and created parquet
+            parquet_path = tmp_path / "ASdbCategoryUtil" / \
+                "processed" / "2024-01_asdb.parquet"
+            assert parquet_path.exists()
 
-                # Should have downloaded and created parquet
-                parquet_path = tmp_path / "ASdbCategoryUtil" / \
-                    "processed" / "2024-01_asdb.parquet"
-                assert parquet_path.exists()
-
-                # Lookup should work
-                result = util.get_full(12345)
-                assert len(result) > 0
+            # Lookup should work
+            result = util.get_full(12345)
+            assert len(result) > 0
 
 
 @pytest.fixture(scope="session")

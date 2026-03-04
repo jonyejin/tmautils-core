@@ -4,7 +4,7 @@
 import gzip
 import os
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 import pytest
@@ -269,66 +269,44 @@ class TestCaidaAsOrgResilience:
         gz_path.write_bytes(b"not a valid gzip file")
 
         # Mock the download
-        mock_response = AsyncMock()
-        mock_response.raise_for_status = lambda: None
-        mock_response.read = AsyncMock(
-            return_value=gzip.compress(SAMPLE_AS_ORG_DATA.encode()))
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.content = gzip.compress(SAMPLE_AS_ORG_DATA.encode())
 
-        mock_context = AsyncMock()
-        mock_context.__aenter__.return_value = mock_response
-        mock_context.__aexit__.return_value = None
+        with patch('tmautils.bgp.caida_as_org.requests.get', return_value=mock_resp):
+            # Should detect corrupt gz and re-download
+            util = CaidaAsOrgInfoUtil(
+                "2020-01-01",
+                working_root=tmp_path,
+                setup_logging=False,
+            )
 
-        with patch('tmautils.bgp.caida_as_org.request_with_retry', return_value=mock_context):
-            with patch('tmautils.bgp.caida_as_org.aiohttp.ClientSession') as mock_session_class:
-                mock_session = AsyncMock()
-                mock_session.__aenter__.return_value = mock_session
-                mock_session.__aexit__.return_value = None
-                mock_session_class.return_value = mock_session
-
-                # Should detect corrupt gz and re-download
-                util = CaidaAsOrgInfoUtil(
-                    "2020-01-01",
-                    working_root=tmp_path,
-                    setup_logging=False,
-                )
-
-                assert util.lookup(12345) == (
-                    "EXAMPLE-AS", "Example Organization")
+            assert util.lookup(12345) == (
+                "EXAMPLE-AS", "Example Organization")
 
 
 class TestCaidaAsOrgDownload:
-    async def test_download_on_missing_data(self, tmp_path: Path):
+    def test_download_on_missing_data(self, tmp_path: Path):
         """Test that data is downloaded when raw file doesn't exist."""
-        mock_response = AsyncMock()
-        mock_response.raise_for_status = lambda: None
-        mock_response.read = AsyncMock(
-            return_value=gzip.compress(SAMPLE_AS_ORG_DATA.encode()))
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.content = gzip.compress(SAMPLE_AS_ORG_DATA.encode())
 
-        mock_context = AsyncMock()
-        mock_context.__aenter__.return_value = mock_response
-        mock_context.__aexit__.return_value = None
+        with patch('tmautils.bgp.caida_as_org.requests.get', return_value=mock_resp):
+            util = CaidaAsOrgInfoUtil(
+                "2020-01-01",
+                working_root=tmp_path,
+                setup_logging=False,
+            )
 
-        with patch('tmautils.bgp.caida_as_org.request_with_retry', return_value=mock_context):
-            with patch('tmautils.bgp.caida_as_org.aiohttp.ClientSession') as mock_session_class:
-                mock_session = AsyncMock()
-                mock_session.__aenter__.return_value = mock_session
-                mock_session.__aexit__.return_value = None
-                mock_session_class.return_value = mock_session
+            # Should have downloaded and created parquet
+            parquet_path = tmp_path / "CaidaAsOrgInfoUtil" / \
+                "processed" / "2020-01-01.as-org2info.v0.parquet"
+            assert parquet_path.exists()
 
-                util = CaidaAsOrgInfoUtil(
-                    "2020-01-01",
-                    working_root=tmp_path,
-                    setup_logging=False,
-                )
-
-                # Should have downloaded and created parquet
-                parquet_path = tmp_path / "CaidaAsOrgInfoUtil" / \
-                    "processed" / "2020-01-01.as-org2info.v0.parquet"
-                assert parquet_path.exists()
-
-                # Lookup should work
-                assert util.lookup(12345) == (
-                    "EXAMPLE-AS", "Example Organization")
+            # Lookup should work
+            assert util.lookup(12345) == (
+                "EXAMPLE-AS", "Example Organization")
 
 
 @pytest.fixture(scope="session")
