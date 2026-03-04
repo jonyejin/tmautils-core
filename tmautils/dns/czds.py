@@ -21,10 +21,10 @@ class CzdsDownloadUtil:
     Utility for downloading zone files from ICANN CZDS.
 
     Zone files are stored in a daily directory structure:
-        `raw/<date>/<tld>.txt.gz`
+        `downloads/<date>/<tld>.txt.gz`
 
     Metadata about downloads is stored alongside zone files:
-        `raw/<date>/_metadata.json`
+        `downloads/<date>/_metadata.json`
 
     Re-downloads within 24 hours are prevented.
 
@@ -100,7 +100,7 @@ class CzdsDownloadUtil:
 
         self._io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
-            dirs={"raw", "logs"},
+            dirs={"downloads", "logs"},
             working_root=working_root,
             **kwargs,
         )
@@ -118,7 +118,7 @@ class CzdsDownloadUtil:
         self._metadata_lock = asyncio.Lock()
 
     def _get_date_dir(self, date_: date, create_dir: bool = True) -> Path:
-        day_dir = self._io_helper.raw / date_.isoformat()
+        day_dir = self._io_helper.downloads / date_.isoformat()
         if create_dir:
             day_dir.mkdir(parents=True, exist_ok=True)
         return day_dir
@@ -161,7 +161,7 @@ class CzdsDownloadUtil:
         now = datetime.now(timezone.utc)
         # Only need today + yesterday to cover a 24h window
         for day in (now.date(), (now - timedelta(days=1)).date()):
-            day_dir = self._io_helper.raw / day.isoformat()
+            day_dir = self._io_helper.downloads / day.isoformat()
             if not day_dir.exists():
                 continue
 
@@ -381,7 +381,7 @@ class CzdsDownloadUtil:
         """
         Download a single zone file.
 
-        Files are saved to `raw/<date>/<tld>.txt.gz`.
+        Files are saved to `downloads/<date>/<tld>.txt.gz`.
         Re-downloads within the same day are skipped.
 
         Args:
@@ -496,7 +496,7 @@ class CzdsDownloadUtil:
         """
         Download all authorized zone files in parallel.
 
-        Files are saved to `raw/<date>/<tld>.txt.gz`.
+        Files are saved to `downloads/<date>/<tld>.txt.gz`.
         Re-downloads within the same day are skipped.
 
         Returns:

@@ -345,17 +345,21 @@ async def request_with_retry(
                         **request_kwargs
                     )
 
+                    # Debug outputs
+                    status = resp.status
+                    headers = resp.headers
+                    logger.debug("Response status: %s, headers: %s", status, dict(headers))
+
                     # Check for retryable status
-                    is_rate_limited = resp.status in rate_limited_statuses
-                    is_retryable_error = resp.status in retryable_error_statuses
+                    is_rate_limited = status in rate_limited_statuses
+                    is_retryable_error = status in retryable_error_statuses
 
                     if is_rate_limited or is_retryable_error:
                         # Use Retry-After if applicable
-                        status = resp.status
                         retry_after = None
                         if respect_retry_after:
                             retry_after = _parse_retry_after(
-                                resp.headers.get("Retry-After")
+                                headers.get("Retry-After")
                             )
                             if retry_after is not None:
                                 retry_after = min(retry_after, max_retry_after)
@@ -363,10 +367,6 @@ async def request_with_retry(
                         logger.info(
                             "Retryable HTTP %s for %s %s (retry_after=%s, rate_limited=%s)",
                             status, method, url, retry_after, is_rate_limited
-                        )
-                        logger.info(
-                            "Response headers: %s",
-                            dict(resp.headers)
                         )
 
                         # Release connection before retrying
