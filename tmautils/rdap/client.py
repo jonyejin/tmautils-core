@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # Copyright (c) 2026 Sulyab Thottungal Valapu
 #
-# IANA bootstrap logic and TLD overrides adapted from whoisit
+# IANA bootstrap logic, TLD overrides and RIR fallbacks adapted from whoisit
 # (https://github.com/meeb/whoisit) by meeb.
 # Original Copyright (c) meeb, licensed under BSD 3-Clause License.
 
@@ -12,6 +12,7 @@ from pathlib import Path
 from time import time
 from typing import Any
 from urllib.parse import quote, unquote, urljoin, urlsplit
+import idna
 
 import aiohttp
 from pytricia import PyTricia
@@ -71,6 +72,20 @@ _IANA_OVERRIDES: dict[str, list[str]] = {
     "vc": ["https://rdap.identitydigital.services/rdap/"],
 }
 
+# Fallback RDAP endpoints for IP/ASN queries with no bootstrap match
+_RIR_FALLBACK_ENDPOINTS: list[str] = [
+    "https://rdap.arin.net/registry/",
+    "https://rdap.db.ripe.net/",
+    "https://rdap.apnic.net/",
+]
+
+
+def _to_alabel(domain: str) -> str:
+    try:
+        return idna.encode(domain, uts46=True).decode("ascii")
+    except idna.core.IDNAError as exc:
+        raise QueryError(f"Invalid domain name '{domain}': {exc}") from exc
+
 
 def _merge_rdap_response(base: dict, related: dict) -> None:
     """
@@ -119,6 +134,9 @@ class RdapClient:
             Default is 3.
         overrides: Apply IANA endpoint overrides for TLDs with issues.
             Default is True.
+        use_rir_fallbacks: Use RIR fallback endpoints for
+            IP/ASN queries with no bootstrap match.
+            Default is True.
         bootstrap_max_age_days: Maximum age of cached bootstrap data.
             Default is 7 days.
         follow_related: Default for following related/registration links.
@@ -146,6 +164,7 @@ class RdapClient:
         request_timeout: float = 10.0,
         max_attempts: int = 3,
         overrides: bool = True,
+        use_rir_fallbacks: bool = True,
         bootstrap_max_age_days: int = 7,
         follow_related: bool = True,
         working_root: Path | None = None,
@@ -155,6 +174,7 @@ class RdapClient:
         self._request_timeout = request_timeout
         self._max_attempts = max_attempts
         self._use_overrides = overrides
+        self._use_rir_fallbacks = use_rir_fallbacks
         self._bootstrap_max_age_days = bootstrap_max_age_days
         self._follow_related = follow_related
 
@@ -299,8 +319,13 @@ class RdapClient:
         self._parse_bootstrap_data()
         self._save_bootstrap_cache()
         self._io_helper.logger.info(
-            "Bootstrap complete: %d TLDs mapped",
+            "Bootstrap complete: %d TLDs, %d ASN ranges, %d IPv4 prefixes, "
+            "%d IPv6 prefixes, %d object-tags",
             len(self._parsed_data.get("dns", {})),
+            len(self._parsed_data.get("asn", {})),
+            len(self._parsed_data.get("ipv4", {})),
+            len(self._parsed_data.get("ipv6", {})),
+            len(self._parsed_data.get("object", {})),
         )
 
     def bootstrap_sync(self, *, force: bool = False) -> None:
@@ -427,6 +452,12 @@ class RdapClient:
         try:
             return trie[str(addr)]
         except KeyError:
+            if self._use_rir_fallbacks:
+                self._io_helper.logger.debug(
+                    "No bootstrap match for IP %s, using RIR fallbacks",
+                    address,
+                )
+                return list(_RIR_FALLBACK_ENDPOINTS)
             raise BootstrapError(
                 f"No RDAP endpoint found for IP address {address}"
             )
@@ -437,20 +468,28 @@ class RdapClient:
         for (start, end), urls in self._parsed_data.get("asn", {}).items():
             if start <= asn <= end:
                 return urls
+        if self._use_rir_fallbacks:
+            self._io_helper.logger.debug(
+                "No bootstrap match for ASN %d, using RIR fallbacks", asn
+            )
+            return list(_RIR_FALLBACK_ENDPOINTS)
         raise BootstrapError(f"No RDAP endpoint found for ASN {asn}")
 
     def _get_entity_endpoints(self, handle: str) -> list[str]:
         if not self._bootstrap_timestamp:
             raise BootstrapError("No bootstrap data is loaded")
         object_data = self._parsed_data.get("object", {})
-        parts = handle.upper().rsplit("-", 1)
-        if len(parts) == 2:
-            suffix = parts[1]
-            if endpoints := object_data.get(suffix):
+        parts = handle.upper().split("-")
+        if len(parts) >= 2:
+            # Try suffix ("ENTITY-ARIN" -> "ARIN")
+            if endpoints := object_data.get(parts[-1]):
+                return endpoints
+            # Try prefix ("ARIN-ENTITY" -> "ARIN")
+            if endpoints := object_data.get(parts[0]):
                 return endpoints
         raise BootstrapError(
             f"No RDAP endpoint found for entity handle '{handle}'. "
-            "Could not match handle suffix to any known registry."
+            "Could not match handle prefix or suffix to any known registry."
         )
 
     @staticmethod
@@ -462,7 +501,7 @@ class RdapClient:
 
     def _build_domain_url(self, domain: str) -> str:
         """Build an RDAP query URL for `domain`."""
-        domain = domain.strip()
+        domain = _to_alabel(domain.strip())
         parts = domain.split(".")
         if len(parts) < 2:
             raise QueryError(f'Failed to extract TLD from domain "{domain}"')
@@ -499,7 +538,7 @@ class RdapClient:
 
     def _build_nameserver_url(self, name: str) -> str:
         """Build an RDAP query URL for a nameserver."""
-        name = name.strip()
+        name = _to_alabel(name.strip())
         parts = name.split(".")
         if len(parts) < 2:
             raise QueryError(f'Failed to extract TLD from nameserver "{name}"')
@@ -620,12 +659,14 @@ class RdapClient:
                     if href and not link_type.startswith("text/html"):
                         related_urls.append(href)
                         try:
+                            self._io_helper.logger.debug(
+                                "Following related link: %s", href
+                            )
                             rel_raw = await self._rdap_get(session, href)
                             _merge_rdap_response(raw, rel_raw)
                         except Exception as e:
                             self._io_helper.logger.debug(
-                                "Failed to follow related link %s: %s",
-                                href, e,
+                                "Failed to follow related link %s: %s", href, e
                             )
                         break
 
@@ -640,7 +681,9 @@ class RdapClient:
         await self.bootstrap(session=session)
         follow = follow_related if follow_related is not None else self._follow_related
         url = self._build_domain_url(domain)
-        self._io_helper.logger.debug("Querying RDAP: %s -> %s", domain, url)
+        self._io_helper.logger.debug(
+            "Querying RDAP domain: %s -> %s", domain, url
+        )
 
         raw, related_urls, error, error_resp = await self._execute_query(session, url, follow)
         if error is not None:

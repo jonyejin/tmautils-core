@@ -1398,9 +1398,11 @@ class TestParseAsn:
 # ---------------------------------------------------------------------------
 
 
-def _setup_bootstrapped_client(tmp_path):
+def _setup_bootstrapped_client(tmp_path, **kwargs):
     """Create a client with mock bootstrap data loaded."""
-    c = RdapClient(working_root=tmp_path, overrides=False, setup_logging=False)
+    kwargs.setdefault("overrides", False)
+    kwargs.setdefault("setup_logging", False)
+    c = RdapClient(working_root=tmp_path, **kwargs)
     mock_raw = {
         "dns": {"services": [
             [["com", "net"], ["https://rdap.verisign.com/com/v1/"]],
@@ -1447,7 +1449,7 @@ class TestIPEndpointLookup:
         assert "https://rdap.arin.net/registry/" in endpoints
 
     def test_unknown_ip_raises(self, tmp_path):
-        c = _setup_bootstrapped_client(tmp_path)
+        c = _setup_bootstrapped_client(tmp_path, use_rir_fallbacks=False)
         with pytest.raises(BootstrapError, match="No RDAP endpoint"):
             c._get_ip_endpoints("192.168.1.1")
 
@@ -1469,7 +1471,7 @@ class TestASNEndpointLookup:
         assert "https://rdap.ripe.net/" in endpoints
 
     def test_asn_out_of_range_raises(self, tmp_path):
-        c = _setup_bootstrapped_client(tmp_path)
+        c = _setup_bootstrapped_client(tmp_path, use_rir_fallbacks=False)
         with pytest.raises(BootstrapError, match="No RDAP endpoint"):
             c._get_asn_endpoints(999999999)
 
@@ -1547,6 +1549,105 @@ class TestBuildNameserverUrl:
         c = _setup_bootstrapped_client(tmp_path)
         with pytest.raises(QueryError, match="Failed to extract TLD"):
             c._build_nameserver_url("noperiod")
+
+
+# ---------------------------------------------------------------------------
+# Unit Tests: Fallback endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestIPFallbackEndpoints:
+    def test_unknown_ip_returns_fallbacks(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        endpoints = c._get_ip_endpoints("192.168.1.1")
+        assert len(endpoints) == 3
+        assert "https://rdap.arin.net/registry/" in endpoints
+        assert "https://rdap.apnic.net/" in endpoints
+
+    def test_unknown_ipv6_returns_fallbacks(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        endpoints = c._get_ip_endpoints("fc00::1")
+        assert len(endpoints) == 3
+        assert "https://rdap.arin.net/registry/" in endpoints
+
+    def test_fallback_disabled_raises(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path, use_rir_fallbacks=False)
+        with pytest.raises(BootstrapError):
+            c._get_ip_endpoints("192.168.1.1")
+
+    def test_known_ip_still_returns_exact(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        endpoints = c._get_ip_endpoints("8.8.8.8")
+        assert endpoints == ["https://rdap.arin.net/registry/"]
+
+
+class TestASNFallbackEndpoints:
+    def test_unknown_asn_returns_fallbacks(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        endpoints = c._get_asn_endpoints(999999999)
+        assert len(endpoints) == 3
+        assert "https://rdap.arin.net/registry/" in endpoints
+
+    def test_fallback_disabled_raises(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path, use_rir_fallbacks=False)
+        with pytest.raises(BootstrapError):
+            c._get_asn_endpoints(999999999)
+
+    def test_known_asn_still_returns_exact(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        endpoints = c._get_asn_endpoints(15169)
+        assert endpoints == ["https://rdap.arin.net/registry/"]
+
+
+# ---------------------------------------------------------------------------
+# Unit Tests: IDN / Punycode handling
+# ---------------------------------------------------------------------------
+
+
+class TestIDNHandling:
+    def test_ascii_domain_unchanged(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        url = c._build_domain_url("example.com")
+        assert "domain/example.com" in url
+
+    def test_unicode_domain_converted(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        url = c._build_domain_url("münchen.com")
+        assert "xn--mnchen-3ya.com" in url
+        assert "münchen" not in url
+
+    def test_unicode_nameserver_converted(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        url = c._build_nameserver_url("ns1.münchen.com")
+        assert "xn--mnchen-3ya.com" in url
+
+    def test_invalid_domain_raises(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        with pytest.raises(QueryError, match="Invalid domain name"):
+            c._build_domain_url("-.invalid.")
+
+    def test_already_punycode_unchanged(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        url = c._build_domain_url("xn--mnchen-3ya.com")
+        assert "xn--mnchen-3ya.com" in url
+
+
+# ---------------------------------------------------------------------------
+# Unit Tests: Entity handle prefix matching
+# ---------------------------------------------------------------------------
+
+
+class TestEntityPrefixMatching:
+    def test_prefix_match(self, tmp_path):
+        """Prefix matching (new behavior)."""
+        c = _setup_bootstrapped_client(tmp_path)
+        endpoints = c._get_entity_endpoints("ARIN-GOGL")
+        assert "https://rdap.arin.net/registry/" in endpoints
+
+    def test_prefix_ripe(self, tmp_path):
+        c = _setup_bootstrapped_client(tmp_path)
+        endpoints = c._get_entity_endpoints("RIPE-NCC-HM-MNT")
+        assert "https://rdap.db.ripe.net/" in endpoints
 
 
 # ---------------------------------------------------------------------------

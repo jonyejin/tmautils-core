@@ -3,6 +3,7 @@
     - [Quick Start](#quick-start)
         - [What's Included](#whats-included)
             - [`tmautils.bgp`](#tmautilsbgp)
+            - [`tmautils.rdap`](#tmautilsrdap)
             - [`tmautils.dns`](#tmautilsdns)
             - [`tmautils.enrich_ip`](#tmautilsenrich_ip)
             - [`tmautils.pki`](#tmautilspki)
@@ -57,8 +58,13 @@ result = await checker.check_cert_chain(cert) # using RevocationChecker's API
 | Utility / Function                                         | What it does                                    |
 | ---------------------------------------------------------- | ----------------------------------------------- |
 | [`PyasnUtil`](./tmautils/bgp/pyasn.py#L17)                 | IP to ASN lookups (wraps `pyasn`)               |
-| [`ASdbCategoryUtil`](./tmautils/bgp/asdb.py#L13)           | AS categorization using Stanford ASdb           |
-| [`CaidaAsOrgInfoUtil`](./tmautils/bgp/caida_as_org.py#L12) | AS to Organization mapping using CAIDA's AS2Org |
+| [`ASdbCategoryUtil`](./tmautils/bgp/asdb.py#L18)           | AS categorization using Stanford ASdb           |
+| [`CaidaAsOrgInfoUtil`](./tmautils/bgp/caida_as_org.py#L15) | AS to Organization mapping using CAIDA's AS2Org |
+
+#### `tmautils.rdap`
+| Utility / Function                             | What it does                                                   |
+| ---------------------------------------------- | -------------------------------------------------------------- |
+| [`RdapClient`](./tmautils/rdap/client.py#L123) | RDAP queries for domains, IPs, ASNs, entities, and nameservers |
 
 #### `tmautils.dns`
 | Utility / Function                                           | What it does                             |
@@ -81,10 +87,10 @@ result = await checker.check_cert_chain(cert) # using RevocationChecker's API
 | Utility / Function                                      | What it does                               |
 | ------------------------------------------------------- | ------------------------------------------ |
 | [`RevocationChecker`](./tmautils/pki/revocation.py#L36) | Check certificate revocation (OCSP/CRL)    |
-| [`get_cert()`](./tmautils/pki/cert.py#L211)             | Fetch TLS certificate from a server        |
-| [`get_cert_chain()`](./tmautils/pki/cert.py#L265)       | Fetch full certificate chain from a server |
-| [`fetch_issuer_cert()`](./tmautils/pki/cert.py#L372)    | Fetch issuer certificate via AIA extension |
-| [`fetch_issuer_chain()`](./tmautils/pki/cert.py#L508)   | Build certificate chain from leaf to root  |
+| [`get_cert()`](./tmautils/pki/cert.py#L287)             | Fetch TLS certificate from a server        |
+| [`get_cert_chain()`](./tmautils/pki/cert.py#L349)       | Fetch full certificate chain from a server |
+| [`fetch_issuer_cert()`](./tmautils/pki/cert.py#L464)    | Fetch issuer certificate via AIA extension |
+| [`fetch_issuer_chain()`](./tmautils/pki/cert.py#L607)   | Build certificate chain from leaf to root  |
 
 #### `tmautils.web`
 | Utility / Function                                        | What it does                             |
@@ -92,7 +98,7 @@ result = await checker.check_cert_chain(cert) # using RevocationChecker's API
 | [`TrancoTopListUtil`](./tmautils/web/tranco.py#L17)       | Download and query Tranco top sites list |
 | [`PeriodicTrancoCrawlUtil`](./tmautils/web/tranco.py#L63) | Periodic crawling of Tranco-listed sites |
 | [`OpenWpmCrawlUtil`](./tmautils/web/openwpm.py#L20)       | Web crawling using OpenWPM               |
-| [`request_with_retry()`](./tmautils/web/http.py#L66)      | HTTP requests with retry and backoff     |
+| [`request_with_retry()`](./tmautils/web/http.py#L126)     | HTTP requests with retry and backoff     |
 
 #### `tmautils.db`
 `tmautils.db` primarily contains database-interfacing used by other submodules, but some exports may be useful for writing custom user code.
@@ -113,18 +119,20 @@ result = await checker.check_cert_chain(cert) # using RevocationChecker's API
 
 | Utility / Function                                                                                             | What it does                                                |
 | -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| [`IOHelper`](./tmautils/common/io.py#L258)                                                                     | Directory structure and logging for utilities               |
+| [`IOHelper`](./tmautils/common/io.py#L260)                                                                     | Directory structure and logging for utilities               |
 | [`LogHelper`](./tmautils/common/log.py#L174)                                                                   | Logging configuration                                       |
 | [`get_logger_from_helper()`](./tmautils/common/log.py#L405)                                                    | Get the configured or no-op logger from LogHelper           |
-| [`AsyncRateLimiter`](./tmautils/common/asyncutils.py#L24)                                                      | Rate limiter with concurrency and throughput limits         |
-| [`run_coro_sync()`](./tmautils/common/asyncutils.py#L151)                                                      | Run async code from sync context                            |
-| [`import_module_attr()`](./tmautils/common/io.py#L74)                                                          | Dynamically import an attribute from a module               |
-| [`gzip_file()`](./tmautils/common/io.py#L109), [`gunzip_file()`](./tmautils/common/io.py#L186)                 | Compress/decompress a file with gzip                        |
-| [`maybe_apply()`](./tmautils/common/utils.py#L11)                                                              | Decorator to apply a function on an input without failing   |
-| [`try_convert_ip()`](./tmautils/common/utils.py#L26)                                                           | Try to convert an IP address string to an IP address object |
-| [`is_ipv4()`](./tmautils/common/utils.py#L55), [`is_ipv6()`](./tmautils/common/utils.py#L63)                   | Check if string is valid IPv4/IPv6 address                  |
-| [`is_internal_flow()`](./tmautils/common/utils.py#L71), [`is_external_flow()`](./tmautils/common/utils.py#L75) | Check if IP flow is internal/external                       |
-| [`is_internal_flow_or_same_v6_upper_64()`](./tmautils/common/utils.py#L79)                                     | Check if flow is internal or same /64 prefix                |
+| [`AsyncRateLimiter`](./tmautils/common/asyncutils.py#L21)                                                      | Rate limiter with concurrency and throughput limits         |
+| [`run_coro_sync()`](./tmautils/common/asyncutils.py#L146)                                                      | Run async code from sync context                            |
+| [`import_module_attr()`](./tmautils/common/io.py#L76)                                                          | Dynamically import an attribute from a module               |
+| [`gzip_file()`](./tmautils/common/io.py#L111), [`gunzip_file()`](./tmautils/common/io.py#L188)                 | Compress/decompress a file with gzip                        |
+| [`parse_asn()`](./tmautils/common/utils.py#L97)                                                                | Parse ASN from string or int (handles "AS" prefix)          |
+| [`MAX_ASN`](./tmautils/common/utils.py#L10)                                                                    | Maximum valid ASN value (2^32 - 1)                          |
+| [`maybe_apply()`](./tmautils/common/utils.py#L14)                                                              | Decorator to apply a function on an input without failing   |
+| [`try_convert_ip()`](./tmautils/common/utils.py#L29)                                                           | Try to convert an IP address string to an IP address object |
+| [`is_ipv4()`](./tmautils/common/utils.py#L58), [`is_ipv6()`](./tmautils/common/utils.py#L66)                   | Check if string is valid IPv4/IPv6 address                  |
+| [`is_internal_flow()`](./tmautils/common/utils.py#L74), [`is_external_flow()`](./tmautils/common/utils.py#L78) | Check if IP flow is internal/external                       |
+| [`is_internal_flow_or_same_v6_upper_64()`](./tmautils/common/utils.py#L82)                                     | Check if flow is internal or same /64 prefix                |
 
 ### Writing Your First Program
 As you've probably noticed by now, there is no "one way" to use `tmautils`: what utility/function you use will be driven by your use case, and the options supported vary by individual utilities. However, I have tried to include useful documentation with each utility/function.

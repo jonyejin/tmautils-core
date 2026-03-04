@@ -348,7 +348,11 @@ async def request_with_retry(
                     # Debug outputs
                     status = resp.status
                     headers = resp.headers
-                    logger.debug("Response status: %s, headers: %s", status, dict(headers))
+                    logger.debug(
+                        "%s %s [attempt %d] returned HTTP %d; headers=%s",
+                        method, url, attempt.retry_state.attempt_number,
+                        status, dict(headers),
+                    )
 
                     # Check for retryable status
                     is_rate_limited = status in rate_limited_statuses
