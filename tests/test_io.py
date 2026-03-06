@@ -9,6 +9,8 @@ from tmautils.common import (
     DirConfig,
     IOConfig,
     IOHelper,
+    LogConfig,
+    LogHelper,
 )
 
 
@@ -343,12 +345,11 @@ class TestLogging:
         # logs dir should not exist
         assert not (tmp_path / "TestUtil" / "logs").exists()
 
-    def test_log_helper_raises_when_no_logger(self, tmp_path: Path):
-        """log_helper property raises when logging is disabled."""
+    def test_log_helper_returns_none_when_no_logger(self, tmp_path: Path):
+        """log_helper property returns None when logging is disabled."""
         io = IOHelper("TestUtil", working_root=tmp_path, setup_logging=False)
 
-        with pytest.raises(RuntimeError, match="No LogHelper"):
-            _ = io.log_helper
+        assert io.log_helper is None
 
     def test_get_worker_logging_config(self, tmp_path: Path):
         """get_worker_logging_config returns a worker config."""
@@ -364,6 +365,48 @@ class TestLogging:
 
         with pytest.raises(RuntimeError, match="no logger is set up"):
             io.get_worker_logging_config()
+
+
+class TestBringYourOwnLogHelper:
+    """Tests for injecting an external LogHelper."""
+
+    def test_ioconfig_with_log_helper(self, tmp_path: Path):
+        """IOHelper uses the provided LogHelper from IOConfig."""
+        lh = LogHelper(LogConfig(name="External", file_level=None))
+        config = IOConfig(log_helper=lh, logs=DirConfig(enabled=False))
+        io = IOHelper("TestUtil", config=config, working_root=tmp_path)
+
+        assert io.log_helper is lh
+        assert io.has_logger is True
+        # Logger should come from the injected LogHelper
+        assert io.logger is lh.logger
+
+    def test_init_with_dirs_log_helper(self, tmp_path: Path):
+        """init_with_dirs passes through log_helper kwarg."""
+        lh = LogHelper(LogConfig(name="Shared", file_level=None))
+        io = IOHelper.init_with_dirs(
+            "TestUtil",
+            dirs={"cache"},
+            working_root=tmp_path,
+            log_helper=lh,
+        )
+
+        assert io.log_helper is lh
+        assert io.logger is lh.logger
+
+    def test_log_helper_skips_internal_setup(self, tmp_path: Path):
+        """When log_helper is provided, setup_logging/logging_config are ignored."""
+        lh = LogHelper(LogConfig(name="External", file_level=None))
+        config = IOConfig(
+            log_helper=lh,
+            setup_logging=True,  # should be ignored
+            logging_config=LogConfig(name="ShouldNotBeUsed", file_level=None),
+            logs=DirConfig(enabled=False),
+        )
+        io = IOHelper("TestUtil", config=config, working_root=tmp_path)
+
+        # Should use the injected one, not create a new one from logging_config
+        assert io.log_helper is lh
 
 
 class TestCreateSymlink:

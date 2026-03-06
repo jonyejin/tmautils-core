@@ -53,7 +53,9 @@ class IOConfig:
         processed: Configuration for the `processed/` directory.
         logs: Configuration for the `logs/` directory.
         custom_dirs: Additional directories (e.g., `{"results": DirConfig()}`).
-        setup_logging: Whether to set up logging.
+        log_helper: Optional existing LogHelper to use instead of creating one.
+            When provided, `setup_logging`/`logging_config`/`logging_kwargs` are ignored.
+        setup_logging: Whether to set up logging (ignored when log_helper is set).
         logging_config: Optional LogConfig for custom logging setup.
         logging_kwargs: kwargs passed to LogConfig if logging_config is None.
     """
@@ -65,6 +67,7 @@ class IOConfig:
     logs: DirConfig = field(default_factory=DirConfig)
     custom_dirs: dict[str, DirConfig] = field(default_factory=dict)
 
+    log_helper: LogHelper | None = None
     setup_logging: bool = True
     logging_config: LogConfig | None = None
     logging_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -372,22 +375,29 @@ class IOHelper:
         self._dirs_created: set[str] = set()
         self._create_eager_dirs()
 
-        # Set up logging if requested
-        self._log_helper: LogHelper | None = None
-        _setup_logging = (
-            config.setup_logging if config is not None else setup_logging
+        # Set up logging
+        self.log_helper: LogHelper | None = None
+        _external_log_helper = (
+            config.log_helper if config is not None else None
         )
-        if _setup_logging:
-            self._setup_logging(
-                logging_config=(
-                    config.logging_config if config is not None else logging_config
-                ),
-                logging_kwargs=(
-                    config.logging_kwargs if config is not None else (
-                        logging_kwargs or {}
-                    )
-                ),
+        if _external_log_helper is not None:
+            self.log_helper = _external_log_helper
+        else:
+            _setup_logging = (
+                config.setup_logging if config is not None else setup_logging
             )
+            if _setup_logging:
+                self._setup_logging(
+                    logging_config=(
+                        config.logging_config if config is not None
+                        else logging_config
+                    ),
+                    logging_kwargs=(
+                        config.logging_kwargs if config is not None else (
+                            logging_kwargs or {}
+                        )
+                    ),
+                )
 
         self.logger.info(
             f"IOHelper initialized with top-level directory: {self.top_level_dir}"
@@ -480,6 +490,7 @@ class IOHelper:
         top_level_symlink = kwargs.pop("top_level_symlink_to", None)
 
         # Extract logging config
+        log_helper = kwargs.pop("log_helper", None)
         setup_logging = kwargs.pop("setup_logging", True)
         logging_config = kwargs.pop("logging_config", None)
         logging_kwargs = kwargs.pop("logging_kwargs", {})
@@ -508,6 +519,7 @@ class IOHelper:
                 name: DirConfig(symlink_to=symlinks.get(name))
                 for name in custom_dir_names
             },
+            log_helper=log_helper,
             setup_logging=setup_logging,
             logging_config=logging_config,
             logging_kwargs=logging_kwargs,
@@ -690,7 +702,7 @@ class IOHelper:
                 **logging_kwargs,
             )
 
-        self._log_helper = LogHelper(logging_config)
+        self.log_helper = LogHelper(logging_config)
 
     def create_symlink(
         self,
@@ -781,17 +793,7 @@ class IOHelper:
         """
         True if the instance has a logger set up.
         """
-        return self._log_helper is not None
-
-    @property
-    def log_helper(self) -> "LogHelper":
-        """
-        Get the LogHelper for the instance.
-        Raises an error if no LogHelper is set up.
-        """
-        if not self.has_logger:
-            raise RuntimeError("No LogHelper is set up for this instance.")
-        return self._log_helper
+        return self.log_helper is not None
 
     @property
     def logger(self):
@@ -799,7 +801,7 @@ class IOHelper:
         Get the logger for the instance.
         If no logger is set up, returns a no-op logger which ignores all logging calls.
         """
-        return get_logger_from_helper(self._log_helper)
+        return get_logger_from_helper(self.log_helper)
 
     def get_worker_logging_config(self):
         """
@@ -809,7 +811,7 @@ class IOHelper:
             raise RuntimeError(
                 "Attempt to get worker logging config when no logger is set up."
             )
-        return self._log_helper.get_worker_config()
+        return self.log_helper.get_worker_config()
 
 
 def path_temp_suffix(path: Path) -> Path:

@@ -1,6 +1,6 @@
 import unittest
 from pathlib import Path
-from tmautils.app import ChromePrefetchUtil
+from tmautils.enrich_ip import ChromePrefetchUtil
 
 class ChromePrefetchUtilTest(unittest.TestCase):
     def test(self):
