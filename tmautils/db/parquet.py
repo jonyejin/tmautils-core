@@ -42,21 +42,30 @@ class ParquetBackend(ArrowBackend):
         config: TableConfig,
         data: pa.Table,
     ) -> None:
-        # Prepare directory
+        # Prepare table directory
         table_dir = self.base_path / table_name
         table_dir.mkdir(parents=True, exist_ok=True)
 
-        # Generate uuid7-based filename and table name
+        # Generate uuid7-based table name (and possibly file name)
         uniq = uuid7()
-        path = table_dir / f"{uniq}.parquet"
         tname = f"t_{uniq.hex}"
 
         cur = self.duckdb_conn.cursor()
         try:
             cur.register(tname, data)
-            cur.execute(
-                f"COPY {tname} TO '{str(path)}' (FORMAT 'PARQUET')"
-            )
+            if config.partition_cols:
+                # Hive-partitioned: DuckDB creates key=value dirs automatically
+                partition_by = ", ".join(config.partition_cols)
+                cur.execute(
+                    f"COPY {tname} TO '{str(table_dir)}' "
+                    f"(FORMAT 'PARQUET', PARTITION_BY ({partition_by}), "
+                    f"FILENAME_PATTERN '{{uuidv7}}', APPEND)"
+                )
+            else:
+                path = table_dir / f"{uniq}.parquet"
+                cur.execute(
+                    f"COPY {tname} TO '{str(path)}' (FORMAT 'PARQUET')"
+                )
         finally:
             with contextlib.suppress(Exception):
                 cur.unregister(tname)

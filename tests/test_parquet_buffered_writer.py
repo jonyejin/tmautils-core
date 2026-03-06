@@ -244,5 +244,163 @@ def test_concurrency_stress_test(parquet_backend, table_configs, base_path):
     assert len(_list_parquet_files(base_path, "table_b")) > 0
 
 
+# --------------- Hive partitioning models & helpers ---------------
+
+
+class PartitionedItemModel(BaseModel):
+    k: int
+    v: str
+    year: int
+    month: int
+
+    ARROW_SCHEMA: ClassVar[pa.Schema] = pa.schema([
+        pa.field("k", pa.int64()),
+        pa.field("v", pa.string()),
+        pa.field("year", pa.int32()),
+        pa.field("month", pa.int32()),
+    ])
+
+
+def _read_hive_partition(base_path: Path, table_name: str) -> pa.Table:
+    """Read a hive-partitioned dataset using DuckDB."""
+    table_dir = base_path / table_name
+    con = duckdb.connect()
+    try:
+        return con.execute(
+            f"SELECT * FROM read_parquet('{table_dir}/**/*.parquet', hive_partitioning=true)"
+        ).fetch_arrow_table()
+    finally:
+        con.close()
+
+
+# --------------- Hive partitioning tests ---------------
+
+
+def test_hive_partitioned_write(base_path):
+    """Verify hive-partitioned writes create key=value dirs and strip partition cols."""
+    backend = ParquetBackend(base_path=base_path)
+    configs = {
+        "events": TableConfig(
+            model=PartitionedItemModel,
+            partition_cols=["year", "month"],
+        ),
+    }
+    writer = BufferedWriter(
+        backend=backend,
+        table_configs=configs,
+        row_thresh=100,
+        time_thresh_sec=60.0,
+        jitter=0.0,
+    )
+
+    for i in range(5):
+        writer.add_row("events", {"k": i, "v": "a", "year": 2026, "month": 3})
+    for i in range(5, 10):
+        writer.add_row("events", {"k": i, "v": "b", "year": 2026, "month": 4})
+
+    writer.close()
+
+    # Verify directory structure
+    assert (base_path / "events" / "year=2026" / "month=3").is_dir()
+    assert (base_path / "events" / "year=2026" / "month=4").is_dir()
+
+    # Verify parquet files exist in partition dirs
+    m3_files = list((base_path / "events" / "year=2026" / "month=3").glob("*.parquet"))
+    m4_files = list((base_path / "events" / "year=2026" / "month=4").glob("*.parquet"))
+    assert len(m3_files) >= 1
+    assert len(m4_files) >= 1
+
+    # Verify partition cols not stored in parquet files themselves
+    import pyarrow.parquet as pq
+    pf = pq.ParquetFile(m3_files[0])
+    file_schema = pf.schema_arrow
+    assert "year" not in file_schema.names
+    assert "month" not in file_schema.names
+    assert "k" in file_schema.names
+    assert "v" in file_schema.names
+
+    # Verify full read via hive partitioning
+    full = _read_hive_partition(base_path, "events")
+    assert full.num_rows == 10
+    assert "year" in full.schema.names
+    assert "month" in full.schema.names
+
+
+def test_hive_partitioned_multiple_flushes(base_path):
+    """Verify multiple flushes to the same partition coexist (APPEND works)."""
+    backend = ParquetBackend(base_path=base_path)
+    configs = {
+        "events": TableConfig(
+            model=PartitionedItemModel,
+            partition_cols=["year", "month"],
+        ),
+    }
+    writer = BufferedWriter(
+        backend=backend,
+        table_configs=configs,
+        row_thresh=5,
+        time_thresh_sec=60.0,
+        jitter=0.0,
+    )
+
+    # Two batches that exceed row_thresh, forcing separate flushes
+    for i in range(12):
+        writer.add_row("events", {"k": i, "v": "x", "year": 2026, "month": 1})
+
+    writer.close()
+
+    # Multiple parquet files in the same partition
+    partition_dir = base_path / "events" / "year=2026" / "month=1"
+    files = list(partition_dir.glob("*.parquet"))
+    assert len(files) >= 2
+
+    full = _read_hive_partition(base_path, "events")
+    assert full.num_rows == 12
+
+
+def test_mixed_partitioned_and_flat(base_path):
+    """One table with partition_cols, another without, both work correctly."""
+    backend = ParquetBackend(base_path=base_path)
+    configs = {
+        "partitioned": TableConfig(
+            model=PartitionedItemModel,
+            partition_cols=["year", "month"],
+        ),
+        "flat": TableConfig(
+            model=ItemModel,
+        ),
+    }
+    writer = BufferedWriter(
+        backend=backend,
+        table_configs=configs,
+        row_thresh=100,
+        time_thresh_sec=60.0,
+        jitter=0.0,
+    )
+
+    writer.add_row("partitioned", {"k": 1, "v": "p", "year": 2026, "month": 5})
+    writer.add_row("flat", {"k": 2, "v": "f"})
+
+    writer.close()
+
+    # Partitioned table has hive dirs
+    assert (base_path / "partitioned" / "year=2026" / "month=5").is_dir()
+
+    # Flat table has direct parquet files
+    flat_files = list((base_path / "flat").glob("*.parquet"))
+    assert len(flat_files) >= 1
+
+    assert _count_rows_in_table_dir(base_path, "flat") == 1
+
+
+def test_partition_cols_validation_fails():
+    """partition_cols referencing nonexistent fields should raise ValueError."""
+    with pytest.raises(ValueError, match="partition_cols"):
+        TableConfig(
+            model=ItemModel,
+            partition_cols=["nonexistent"],
+        )
+
+
 if __name__ == "__main__":
     pytest.main(["-vv", "-rA", os.path.abspath(__file__)])

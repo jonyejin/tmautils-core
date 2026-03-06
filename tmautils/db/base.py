@@ -41,12 +41,14 @@ class TableConfig:
     model: Type[BaseModel]
     mode: WriteMode = WriteMode.APPEND
     key_cols: Optional[List[str]] = None
+    partition_cols: Optional[List[str]] = None
 
     def __post_init__(self):
         _validate_write_mode(
             self.mode,
             model_cls=self.model,
             key_cols=self.key_cols,
+            partition_cols=self.partition_cols,
         )
 
 
@@ -163,26 +165,35 @@ def _validate_write_mode(
     table: Optional[pa.Table] = None,
     model_cls: Optional[Type[BaseModel]] = None,
     key_cols: Optional[List[str]] = None,
+    partition_cols: Optional[List[str]] = None,
 ):
-    if mode == WriteMode.APPEND:
-        # Nothing to do?
-        return
+    if table is not None:
+        fields = set(table.schema.names)
+    elif model_cls is not None:
+        fields = set(model_cls.model_fields.keys())
+    else:
+        fields = None
 
     if mode in {WriteMode.INSERT_IGNORE, WriteMode.UPSERT}:
         if not key_cols:
             raise ValueError(f"mode='{mode}' requires key_cols")
-        if table is None and model_cls is None:
+        if fields is None:
             raise ValueError(
                 f"mode='{mode}' requires either table or model_cls to validate key_cols"
             )
-
-        if table is not None:
-            fields = set(table.schema.names)
-        else:
-            fields = set(model_cls.model_fields.keys())
-
         invalid = sorted([c for c in key_cols if c not in fields])
         if invalid:
             raise ValueError(
                 f"key_cols {invalid} not present in table/model fields: {sorted(fields)}"
+            )
+
+    if partition_cols:
+        if fields is None:
+            raise ValueError(
+                "partition_cols requires either table or model_cls to validate"
+            )
+        invalid = sorted([c for c in partition_cols if c not in fields])
+        if invalid:
+            raise ValueError(
+                f"partition_cols {invalid} not present in table/model fields: {sorted(fields)}"
             )
