@@ -39,7 +39,6 @@ from .ipc import (
 )
 from .asyncutils import (
     run_coro_sync,
-    RateLimitScope,
     AsyncRateLimiter,
 )
 
@@ -78,6 +77,5 @@ __all__ = [
     "except_to_payload",
     "raise_from_payload",
     "run_coro_sync",
-    "RateLimitScope",
     "AsyncRateLimiter",
 ]

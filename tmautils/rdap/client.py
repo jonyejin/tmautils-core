@@ -126,12 +126,15 @@ class RdapClient:
 
     Args:
         rate_limiter: Rate limiter for RDAP requests.
-            Use ``RateLimitScope.PER_KEY`` for per-server rate limiting.
+            Limits are applied per-host (per RDAP server).
             If None, no rate limiting is applied.
         request_timeout: Timeout per HTTP request attempt in seconds.
             Default is 10 seconds.
         max_attempts: Maximum attempts for retry, including the original attempt.
             Default is 3.
+        proxy: HTTP/SOCKS proxy URL for all RDAP requests
+            (e.g. `http://user:pass@proxy.example.com:8080`).
+            Passed through to :func:`aiohttp.ClientSession.request`.
         overrides: Apply IANA endpoint overrides for TLDs with issues.
             Default is True.
         use_rir_fallbacks: Use RIR fallback endpoints for
@@ -141,6 +144,12 @@ class RdapClient:
             Default is 7 days.
         follow_related: Default for following related/registration links.
             Default is True.
+        retryable_error_statuses: HTTP status codes that trigger a retry.
+            If None, uses the :meth:`request_with_retry` defaults (500, 502, 503, 504).
+        close_connection: Close the underlying connection after each request
+            instead of returning it to the pool.
+            Useful with rotating proxies to ensure a new exit IP per request.
+            Default is False.
         working_root: Base directory where the namespace directory will be created.
             If None, the current working directory will be used.
         **kwargs: Additional arguments passed to IOHelper.
@@ -163,20 +172,26 @@ class RdapClient:
         rate_limiter: AsyncRateLimiter | None = None,
         request_timeout: float = 10.0,
         max_attempts: int = 3,
+        proxy: str | None = None,
         overrides: bool = True,
         use_rir_fallbacks: bool = True,
         bootstrap_max_age_days: int = 7,
         follow_related: bool = True,
+        retryable_error_statuses: frozenset[int] | None = None,
+        close_connection: bool = False,
         working_root: Path | None = None,
         **kwargs: Any,
     ) -> None:
         self._rate_limiter = rate_limiter or AsyncRateLimiter()
         self._request_timeout = request_timeout
         self._max_attempts = max_attempts
+        self._proxy = proxy
         self._use_overrides = overrides
         self._use_rir_fallbacks = use_rir_fallbacks
         self._bootstrap_max_age_days = bootstrap_max_age_days
         self._follow_related = follow_related
+        self._retryable_error_statuses = retryable_error_statuses
+        self._close_connection = close_connection
 
         self._io_helper = IOHelper.init_with_dirs(
             self.__class__.__name__,
@@ -292,7 +307,8 @@ class RdapClient:
                 url,
                 attempt_timeout=self._request_timeout,
                 max_attempts=self._max_attempts,
-                log_helper=self._io_helper._log_helper,
+                log_helper=self._io_helper.log_helper,
+                proxy=self._proxy,
             ) as resp:
                 if resp.status != 200:
                     raise BootstrapError(
@@ -566,6 +582,9 @@ class RdapClient:
     async def _rdap_get(
         self, session: aiohttp.ClientSession, url: str,
     ) -> dict:
+        retry_kwargs: dict = {}
+        if self._retryable_error_statuses is not None:
+            retry_kwargs["retryable_error_statuses"] = self._retryable_error_statuses
         async with request_with_retry(
             session,
             "GET",
@@ -573,8 +592,11 @@ class RdapClient:
             rate_limiter=self._rate_limiter,
             attempt_timeout=self._request_timeout,
             max_attempts=self._max_attempts,
-            log_helper=self._io_helper._log_helper,
+            close_connection=self._close_connection,
+            log_helper=self._io_helper.log_helper,
             headers={"Accept": self._RDAP_ACCEPT},
+            proxy=self._proxy,
+            **retry_kwargs,
         ) as resp:
             text = await resp.text()
             return self._process_response(resp, url, text)

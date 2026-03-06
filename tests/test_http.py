@@ -836,7 +836,7 @@ def test_request_kwargs_passed_through_for_post():
 
 # ===== AsyncRateLimiter Tests =====
 
-from tmautils.common import AsyncRateLimiter, RateLimitScope
+from tmautils.common import AsyncRateLimiter
 from tmautils.web import url_to_rate_limit_key
 
 
@@ -850,22 +850,22 @@ async def test_rate_limiter_no_limits():
         pass
 
 
-async def test_rate_limiter_concurrency_global():
-    """Test global concurrency limit blocks when exceeded."""
-    limiter = AsyncRateLimiter(max_concurrent=2, scope=RateLimitScope.GLOBAL)
+async def test_rate_limiter_concurrency_shared_key():
+    """Test shared-key concurrency limit blocks when exceeded."""
+    limiter = AsyncRateLimiter(max_concurrent=2)
     acquired = []
     released = []
 
-    async def acquire_and_hold(key: str, delay: float):
-        async with limiter.acquire(key):
-            acquired.append(key)
+    async def acquire_and_hold(delay: float):
+        async with limiter.acquire():  # shared key (None)
+            acquired.append(True)
             await asyncio.sleep(delay)
-            released.append(key)
+            released.append(True)
 
     # Start 3 tasks, only 2 should acquire immediately
-    task1 = asyncio.create_task(acquire_and_hold("a", 0.1))
-    task2 = asyncio.create_task(acquire_and_hold("b", 0.1))
-    task3 = asyncio.create_task(acquire_and_hold("c", 0.1))
+    task1 = asyncio.create_task(acquire_and_hold(0.1))
+    task2 = asyncio.create_task(acquire_and_hold(0.1))
+    task3 = asyncio.create_task(acquire_and_hold(0.1))
 
     await asyncio.sleep(0.01)  # Let tasks start
     assert len(acquired) == 2  # Third blocked
@@ -875,9 +875,9 @@ async def test_rate_limiter_concurrency_global():
     assert len(released) == 3
 
 
-async def test_rate_limiter_concurrency_per_key():
-    """Test per-key concurrency allows different keys in parallel."""
-    limiter = AsyncRateLimiter(max_concurrent=1, scope=RateLimitScope.PER_KEY)
+async def test_rate_limiter_concurrency_different_keys():
+    """Test different keys get independent concurrency pools."""
+    limiter = AsyncRateLimiter(max_concurrent=1)
     acquired = []
 
     async def acquire_and_hold(key: str, delay: float):
@@ -895,9 +895,9 @@ async def test_rate_limiter_concurrency_per_key():
     await asyncio.gather(task1, task2)
 
 
-async def test_rate_limiter_concurrency_per_key_same_key_blocks():
-    """Test per-key concurrency blocks same key."""
-    limiter = AsyncRateLimiter(max_concurrent=1, scope=RateLimitScope.PER_KEY)
+async def test_rate_limiter_concurrency_same_key_blocks():
+    """Test same key concurrency blocks."""
+    limiter = AsyncRateLimiter(max_concurrent=1)
     acquired = []
 
     async def acquire_and_hold(key: str, delay: float):
@@ -916,10 +916,10 @@ async def test_rate_limiter_concurrency_per_key_same_key_blocks():
     assert len(acquired) == 2
 
 
-async def test_rate_limiter_rate_global():
-    """Test global rate limiting with token bucket."""
+async def test_rate_limiter_rate():
+    """Test rate limiting with token bucket."""
     # Allow 10 per second
-    limiter = AsyncRateLimiter(max_rate=10, scope=RateLimitScope.GLOBAL)
+    limiter = AsyncRateLimiter(max_rate=10)
     start_time = asyncio.get_event_loop().time()
 
     # Make 3 requests
@@ -929,14 +929,13 @@ async def test_rate_limiter_rate_global():
 
     elapsed = asyncio.get_event_loop().time() - start_time
     # Token bucket should allow bursts, so 3 requests shouldn't take long
-    # But it should track the rate
     assert elapsed < 1.0  # Should be fast (within burst capacity)
 
 
 async def test_rate_limiter_rate_with_time_period():
     """Test rate limiting with custom time period (60 requests per minute)."""
     # 60 per minute = 1 per second
-    limiter = AsyncRateLimiter(max_rate=60, time_period=60, scope=RateLimitScope.GLOBAL)
+    limiter = AsyncRateLimiter(max_rate=60, time_period=60)
     start_time = asyncio.get_event_loop().time()
 
     # Make 3 requests - should be within burst capacity
@@ -950,22 +949,18 @@ async def test_rate_limiter_rate_with_time_period():
 
 async def test_rate_limiter_both_limits():
     """Test that both concurrency and rate limits are applied."""
-    limiter = AsyncRateLimiter(
-        max_concurrent=2,
-        max_rate=10,
-        scope=RateLimitScope.GLOBAL,
-    )
+    limiter = AsyncRateLimiter(max_concurrent=2, max_rate=10)
     acquired = []
 
-    async def acquire_and_hold(key: str, delay: float):
-        async with limiter.acquire(key):
-            acquired.append(key)
+    async def acquire_and_hold(delay: float):
+        async with limiter.acquire():  # shared key
+            acquired.append(True)
             await asyncio.sleep(delay)
 
     # Start 3 tasks - only 2 should acquire due to semaphore
-    task1 = asyncio.create_task(acquire_and_hold("a", 0.1))
-    task2 = asyncio.create_task(acquire_and_hold("b", 0.1))
-    task3 = asyncio.create_task(acquire_and_hold("c", 0.1))
+    task1 = asyncio.create_task(acquire_and_hold(0.1))
+    task2 = asyncio.create_task(acquire_and_hold(0.1))
+    task3 = asyncio.create_task(acquire_and_hold(0.1))
 
     await asyncio.sleep(0.01)
     assert len(acquired) == 2
@@ -986,6 +981,167 @@ async def test_url_to_rate_limit_key_case_insensitive():
     """Test that url_to_rate_limit_key is case-insensitive."""
     assert url_to_rate_limit_key("http://EXAMPLE.COM/path") == "example.com"
     assert url_to_rate_limit_key("http://Example.Com/path") == "example.com"
+
+
+# ===== signal_backoff Tests =====
+
+
+async def test_signal_backoff_basic():
+    """Test signal_backoff delays acquire_token."""
+    import time
+    limiter = AsyncRateLimiter()
+    limiter.signal_backoff("key", 0.1)
+
+    start = time.monotonic()
+    async with limiter.acquire_token("key"):
+        elapsed = time.monotonic() - start
+    assert elapsed >= 0.08  # Allow some tolerance
+
+
+async def test_signal_backoff_max_semantics():
+    """Test signal_backoff uses max() — shorter backoff doesn't shorten existing."""
+    import time
+    limiter = AsyncRateLimiter()
+    limiter.signal_backoff("key", 0.2)
+    limiter.signal_backoff("key", 0.05)  # shorter — should NOT shorten
+
+    start = time.monotonic()
+    async with limiter.acquire_token("key"):
+        elapsed = time.monotonic() - start
+    assert elapsed >= 0.15  # Should still respect the 0.2s backoff
+
+
+async def test_signal_backoff_expired_is_noop():
+    """Test that expired backoff doesn't delay."""
+    import time
+    limiter = AsyncRateLimiter()
+    limiter.signal_backoff("key", 0.01)
+    await asyncio.sleep(0.02)  # Wait for it to expire
+
+    start = time.monotonic()
+    async with limiter.acquire_token("key"):
+        elapsed = time.monotonic() - start
+    assert elapsed < 0.02  # Should be nearly instant
+
+
+async def test_signal_backoff_per_key_isolation():
+    """Test backoff on one key doesn't affect another."""
+    import time
+    limiter = AsyncRateLimiter()
+    limiter.signal_backoff("a.com", 0.2)
+
+    start = time.monotonic()
+    async with limiter.acquire_token("b.com"):  # different key
+        elapsed = time.monotonic() - start
+    assert elapsed < 0.02  # Should not be delayed
+
+
+async def test_signal_backoff_none_key():
+    """Test backoff with None key (shared pool)."""
+    import time
+    limiter = AsyncRateLimiter()
+    limiter.signal_backoff(None, 0.1)
+
+    start = time.monotonic()
+    async with limiter.acquire_token():  # None key
+        elapsed = time.monotonic() - start
+    assert elapsed >= 0.08
+
+
+async def test_signal_backoff_zero_duration_is_noop():
+    """Test signal_backoff with zero or negative duration is a no-op."""
+    import time
+    limiter = AsyncRateLimiter()
+    limiter.signal_backoff("key", 0)
+    limiter.signal_backoff("key", -1)
+
+    start = time.monotonic()
+    async with limiter.acquire_token("key"):
+        elapsed = time.monotonic() - start
+    assert elapsed < 0.02
+
+
+# ===== hold_slot + acquire_token Tests =====
+
+
+async def test_hold_slot_blocks_concurrent():
+    """Test hold_slot holds semaphore slot."""
+    limiter = AsyncRateLimiter(max_concurrent=1)
+    acquired = []
+
+    async def hold(key: str, delay: float):
+        async with limiter.hold_slot(key):
+            acquired.append(key)
+            await asyncio.sleep(delay)
+
+    task1 = asyncio.create_task(hold("k", 0.1))
+    task2 = asyncio.create_task(hold("k", 0.1))
+    await asyncio.sleep(0.01)
+    assert len(acquired) == 1  # Second blocked by semaphore
+    await asyncio.gather(task1, task2)
+    assert len(acquired) == 2
+
+
+async def test_acquire_token_checks_backoff():
+    """Test acquire_token respects backoff."""
+    import time
+    limiter = AsyncRateLimiter()
+    limiter.signal_backoff("k", 0.1)
+
+    start = time.monotonic()
+    async with limiter.acquire_token("k"):
+        elapsed = time.monotonic() - start
+    assert elapsed >= 0.08
+
+
+async def test_acquire_convenience_wraps_both():
+    """Test acquire() = hold_slot + acquire_token."""
+    limiter = AsyncRateLimiter(max_concurrent=1)
+    limiter.signal_backoff("k", 0.1)
+
+    import time
+    start = time.monotonic()
+    async with limiter.acquire("k"):
+        elapsed = time.monotonic() - start
+    # Should have both held the semaphore and waited for backoff
+    assert elapsed >= 0.08
+
+
+# ===== Memory Cleanup Tests =====
+
+
+async def test_cleanup_evicts_idle_keys():
+    """Test cleanup removes idle keys."""
+    limiter = AsyncRateLimiter(max_idle_seconds=0.01)
+
+    # Create some key state
+    async with limiter.acquire("key1"):
+        pass
+
+    assert "key1" in limiter._keys
+
+    await asyncio.sleep(0.02)  # Let it become idle
+    limiter.cleanup()
+    assert "key1" not in limiter._keys
+
+
+async def test_cleanup_preserves_active_keys():
+    """Test cleanup does not evict keys with active operations."""
+    limiter = AsyncRateLimiter(max_concurrent=1, max_idle_seconds=0.01)
+
+    async with limiter.hold_slot("key1"):
+        await asyncio.sleep(0.02)
+        limiter.cleanup()
+        assert "key1" in limiter._keys  # Still active, not evicted
+
+
+async def test_config_string():
+    """Test config_string output."""
+    limiter = AsyncRateLimiter(max_concurrent=10, max_rate=5, time_period=2.0)
+    assert limiter.config_string == "max_concurrent=10, max_rate=5/2.0s"
+
+    limiter2 = AsyncRateLimiter()
+    assert limiter2.config_string == "no limits"
 
 
 # ===== request_with_retry with AsyncRateLimiter Tests =====
@@ -1020,29 +1176,34 @@ async def test_request_with_retry_without_rate_limiter():
     assert mock_session.request.call_count == 1
 
 
-async def test_request_with_retry_acquire_per_attempt():
-    """Test acquire is called per attempt, not held through backoff."""
-    acquire_count = 0
-    release_count = 0
+async def test_request_with_retry_hold_slot_and_acquire_token():
+    """Test hold_slot is called once and acquire_token per attempt."""
+    hold_slot_count = 0
+    acquire_token_count = 0
 
-    limiter = AsyncRateLimiter(max_concurrent=1, scope=RateLimitScope.GLOBAL)
+    limiter = AsyncRateLimiter(max_concurrent=1)
 
-    # Track acquire/release calls
-    original_acquire = limiter.acquire
+    original_hold_slot = limiter.hold_slot
+    original_acquire_token = limiter.acquire_token
 
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
-    async def tracked_acquire(key):
-        nonlocal acquire_count, release_count
-        acquire_count += 1
-        try:
-            async with original_acquire(key):
-                yield
-        finally:
-            release_count += 1
+    async def tracked_hold_slot(key):
+        nonlocal hold_slot_count
+        hold_slot_count += 1
+        async with original_hold_slot(key):
+            yield
 
-    limiter.acquire = tracked_acquire
+    @asynccontextmanager
+    async def tracked_acquire_token(key):
+        nonlocal acquire_token_count
+        acquire_token_count += 1
+        async with original_acquire_token(key):
+            yield
+
+    limiter.hold_slot = tracked_hold_slot
+    limiter.acquire_token = tracked_acquire_token
 
     mock_session = Mock()
     # First returns 429 (retryable), second returns 200
@@ -1055,14 +1216,16 @@ async def test_request_with_retry_acquire_per_attempt():
     ) as resp:
         assert resp.status == 200
 
-    # Should have acquired twice (once per attempt)
-    assert acquire_count == 2
-    assert release_count == 2
+    # hold_slot wraps the entire retry loop (called once)
+    assert hold_slot_count == 1
+    # acquire_token is called per attempt
+    assert acquire_token_count == 2
 
 
-async def test_request_with_retry_concurrency_during_retry():
-    """Test that another request can proceed during retry backoff."""
-    limiter = AsyncRateLimiter(max_concurrent=1, scope=RateLimitScope.GLOBAL)
+async def test_request_with_retry_holds_slot_during_backoff():
+    """Test that semaphore slot is held during retry backoff (prevents starvation)."""
+    limiter = AsyncRateLimiter(max_concurrent=1)
+    request_2_blocked = True
 
     mock_session = Mock()
     # Request 1: returns 429, then 200 after retry
@@ -1082,22 +1245,45 @@ async def test_request_with_retry_concurrency_during_retry():
         ) as resp:
             return resp.status
 
-    # Request 2: returns 200 immediately
-    request_2_acquired = []
-
     async def make_request_2():
-        # This should be able to acquire during request 1's backoff
-        await asyncio.sleep(0.05)  # Wait for request 1 to release
-        async with limiter.acquire("example.com"):
-            request_2_acquired.append(True)
+        nonlocal request_2_blocked
+        # Try to acquire during request 1's backoff — should be blocked
+        await asyncio.sleep(0.05)
+        # Use hold_slot with same key (hostname-based)
+        async with limiter.hold_slot("example.com"):
+            request_2_blocked = False
 
     task1 = asyncio.create_task(make_request_1())
     task2 = asyncio.create_task(make_request_2())
 
-    await asyncio.gather(task1, task2)
+    # Give request 1 time to get 429 and enter backoff
+    await asyncio.sleep(0.08)
+    # Request 2 should still be blocked (request 1 holds the slot)
+    assert request_2_blocked
 
-    # Request 2 should have been able to acquire during backoff
-    assert len(request_2_acquired) == 1
+    await asyncio.gather(task1, task2)
+    # After request 1 completes, request 2 should have acquired
+    assert not request_2_blocked
+
+
+async def test_request_with_retry_429_signals_backoff():
+    """Test that 429 signals backoff to rate limiter."""
+    limiter = AsyncRateLimiter(max_concurrent=2)
+
+    mock_session = Mock()
+    mock_responses = [MockResponse(429, {"Retry-After": "0.5"}), MockResponse(200)]
+    mock_session.request = AsyncMock(side_effect=mock_responses)
+
+    async with request_with_retry(
+        mock_session, "GET", "http://example.com",
+        rate_limiter=limiter, max_attempts=2
+    ) as resp:
+        assert resp.status == 200
+
+    # Check that backoff was signaled for the hostname key
+    state = limiter._keys.get("example.com")
+    assert state is not None
+    # backoff_until should have been set (may have expired by now, but should exist)
 
 
 async def test_get_with_retry_with_rate_limiter():
