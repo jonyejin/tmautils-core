@@ -22,7 +22,7 @@ from tmautils.common import (
     get_logger_from_helper,
     AsyncRateLimiter,
 )
-from tmautils.web import request_with_retry
+from tmautils.web import request_with_retry, RetryConfig
 
 from ._crypto import get_cache_key, parse_cert_lrucached
 from .types import ExtensionMissingError
@@ -467,7 +467,7 @@ async def fetch_issuer_cert(
     cache_dir: Path | None = None,
     session: aiohttp.ClientSession | None = None,
     timeout: float = 10.0,
-    max_attempts: int = 3,
+    retry_config: RetryConfig | None = None,
     rate_limiter: AsyncRateLimiter | None = None,
     log_helper: LogHelper | None = None,
 ) -> x509.Certificate:
@@ -479,7 +479,7 @@ async def fetch_issuer_cert(
         cache_dir: Directory to cache downloaded certs (Optional)
         session: Existing aiohttp session (creates one if not provided)
         timeout: Request timeout in seconds
-        max_attempts: Retry attempts for failed downloads
+        retry_config: Retry behavior configuration. If None, uses default RetryConfig().
         rate_limiter: Optional AsyncRateLimiter for HTTP request rate limiting
         log_helper: Optional LogHelper for logging
 
@@ -546,8 +546,8 @@ async def fetch_issuer_cert(
             "GET",
             issuer_url,
             rate_limiter=rate_limiter,
+            retry_config=retry_config,
             attempt_timeout=timeout,
-            max_attempts=max_attempts,
             log_helper=log_helper,
         ) as resp:
             resp.raise_for_status()
@@ -586,7 +586,7 @@ def fetch_issuer_cert_sync(
     *,
     cache_dir: Path | None = None,
     timeout: float = 10.0,
-    max_attempts: int = 3,
+    retry_config: RetryConfig | None = None,
     log_helper: LogHelper | None = None,
 ) -> x509.Certificate:
     """
@@ -599,7 +599,7 @@ def fetch_issuer_cert_sync(
         cache_dir=cache_dir,
         session=None,
         timeout=timeout,
-        max_attempts=max_attempts,
+        retry_config=retry_config,
         log_helper=log_helper,
     ))
 
@@ -611,7 +611,7 @@ async def fetch_issuer_chain(
     cache_dir: Path | None = None,
     session: aiohttp.ClientSession | None = None,
     timeout: float = 10.0,
-    max_attempts: int = 3,
+    retry_config: RetryConfig | None = None,
     rate_limiter: AsyncRateLimiter | None = None,
     log_helper: LogHelper | None = None,
 ) -> list[x509.Certificate]:
@@ -628,7 +628,7 @@ async def fetch_issuer_chain(
         cache_dir: Directory to cache downloaded certs (Optional)
         session: Existing aiohttp session (creates one if not provided)
         timeout: Request timeout per fetch
-        max_attempts: Retry attempts per download
+        retry_config: Retry behavior configuration. If None, uses default RetryConfig().
         rate_limiter: Optional AsyncRateLimiter for HTTP request rate limiting
         log_helper: Optional LogHelper for logging
 
@@ -682,7 +682,7 @@ async def fetch_issuer_chain(
                     cache_dir=cache_dir,
                     session=session,
                     timeout=timeout,
-                    max_attempts=max_attempts,
+                    retry_config=retry_config,
                     rate_limiter=rate_limiter,
                     log_helper=log_helper,
                 )
@@ -742,7 +742,7 @@ def fetch_issuer_chain_sync(
     max_depth: int = 10,
     cache_dir: Path | None = None,
     timeout: float = 10.0,
-    max_attempts: int = 3,
+    retry_config: RetryConfig | None = None,
     log_helper: LogHelper | None = None,
 ) -> list[x509.Certificate]:
     """
@@ -756,6 +756,6 @@ def fetch_issuer_chain_sync(
         cache_dir=cache_dir,
         session=None,
         timeout=timeout,
-        max_attempts=max_attempts,
+        retry_config=retry_config,
         log_helper=log_helper,
     ))

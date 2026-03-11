@@ -24,7 +24,7 @@ from cryptography.x509.oid import ExtensionOID, CRLEntryExtensionOID
 from cryptography.hazmat.primitives import serialization
 
 from tmautils.common import LogHelper, get_logger_from_helper, AsyncRateLimiter
-from tmautils.web import request_with_retry
+from tmautils.web import request_with_retry, RetryConfig
 
 from .types import (
     RevocationStatus,
@@ -73,14 +73,14 @@ class CRLHelper:
         crl_cache_dir: Path,
         issuer_cache_dir: Path,
         request_timeout: float = 10.0,
-        max_attempts: int = 3,
+        retry_config: RetryConfig | None = None,
         log_helper: LogHelper | None = None,
     ):
         self._rate_limiter = rate_limiter
         self._crl_cache_dir = crl_cache_dir
         self._issuer_cache_dir = issuer_cache_dir
         self._request_timeout = request_timeout
-        self._max_attempts = max_attempts
+        self._retry_config = retry_config or RetryConfig()
         self._log_helper = log_helper
         self._logger = get_logger_from_helper(log_helper)
 
@@ -286,8 +286,8 @@ class CRLHelper:
                 "GET",
                 url,
                 rate_limiter=self._rate_limiter,
+                retry_config=self._retry_config,
                 attempt_timeout=self._request_timeout,
-                max_attempts=self._max_attempts,
                 log_helper=self._log_helper,
             ) as resp:
                 resp.raise_for_status()
@@ -400,8 +400,8 @@ class CRLHelper:
                 async with request_with_retry(
                     session, "GET", signer_url,
                     rate_limiter=self._rate_limiter,
+                    retry_config=self._retry_config,
                     attempt_timeout=self._request_timeout,
-                    max_attempts=self._max_attempts,
                     log_helper=self._log_helper,
                 ) as resp:
                     resp.raise_for_status()

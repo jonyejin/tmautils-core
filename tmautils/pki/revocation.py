@@ -18,6 +18,7 @@ import aiohttp
 import cryptography.x509 as x509
 
 from tmautils.common import IOHelper, run_coro_sync, AsyncRateLimiter
+from tmautils.web import RetryConfig
 
 from .types import (
     RevocationStatus,
@@ -40,8 +41,8 @@ class RevocationChecker:
     Args:
         request_timeout: Timeout for each HTTP request attempt in seconds.
             Default is 10.0 seconds.
-        max_attempts: Maximum number of retry attempts for HTTP requests.
-            Default is 3.
+        retry_config: Retry behavior configuration. If None, uses default RetryConfig().
+            See :class:`RetryConfig` for available options.
         rate_limiter:
             Optional AsyncRateLimiter for controlling HTTP request concurrency and rate.
             If None, a default AsyncRateLimiter with no limits is used.
@@ -84,14 +85,14 @@ class RevocationChecker:
         self,
         *,
         request_timeout: float = 10.0,
-        max_attempts: int = 3,
+        retry_config: RetryConfig | None = None,
         rate_limiter: AsyncRateLimiter | None = None,
         working_root: Path | None = None,
         **kwargs: Any,
     ):
         # Store configuration
         self._request_timeout = request_timeout
-        self._max_attempts = max_attempts
+        self._retry_config = retry_config or RetryConfig()
         self._rate_limiter = rate_limiter or AsyncRateLimiter()
 
         # Initialize IOHelper
@@ -112,7 +113,7 @@ class RevocationChecker:
         self._ocsp_helper = OCSPHelper(
             self._rate_limiter,
             request_timeout=request_timeout,
-            max_attempts=max_attempts,
+            retry_config=self._retry_config,
             log_helper=self._io_helper.log_helper,
         )
 
@@ -121,14 +122,14 @@ class RevocationChecker:
             crl_cache_dir=self._crl_cache_dir,
             issuer_cache_dir=self._issuer_cache_dir,
             request_timeout=request_timeout,
-            max_attempts=max_attempts,
+            retry_config=self._retry_config,
             log_helper=self._io_helper.log_helper,
         )
 
         self._io_helper.logger.info(
             "RevocationChecker initialized: "
-            "request_timeout=%ds, max_attempts=%d, rate limiting: %s",
-            request_timeout, max_attempts, self._rate_limiter.config_string,
+            "request_timeout=%ds, retry_config=%s, rate limiting: %s",
+            request_timeout, self._retry_config, self._rate_limiter.config_string,
         )
 
     async def check_cert(
@@ -201,7 +202,7 @@ class RevocationChecker:
                     cache_dir=self._issuer_cache_dir,
                     session=session,
                     timeout=self._request_timeout,
-                    max_attempts=self._max_attempts,
+                    retry_config=self._retry_config,
                     rate_limiter=self._rate_limiter,
                     log_helper=self._io_helper.log_helper,
                 )
@@ -391,7 +392,7 @@ class RevocationChecker:
                     cache_dir=self._issuer_cache_dir,
                     session=session,
                     timeout=self._request_timeout,
-                    max_attempts=self._max_attempts,
+                    retry_config=self._retry_config,
                     rate_limiter=self._rate_limiter,
                     log_helper=self._io_helper.log_helper,
                 )

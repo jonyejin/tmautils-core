@@ -13,6 +13,7 @@ from .types import (
     OpenWpmSiteCrawlResult,
 )
 from .http import (
+    RetryConfig,
     request_with_retry,
     get_with_retry,
     url_to_rate_limit_key,
@@ -29,6 +30,7 @@ __all__ = [
     "UsedDnsRecord",
     "CompletedHttpRequest",
     "OpenWpmSiteCrawlResult",
+    "RetryConfig",
     "request_with_retry",
     "get_with_retry",
     "url_to_rate_limit_key",

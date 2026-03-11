@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MPL-2.0
 # Copyright (c) 2026 Sulyab Thottungal Valapu
 
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable
 import asyncio
 from contextlib import asynccontextmanager, AbstractAsyncContextManager
@@ -22,6 +23,64 @@ from tmautils.common import (
     get_logger_from_helper,
     AsyncRateLimiter,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class RetryConfig:
+    """Configuration for retry behavior in request_with_retry.
+
+    Statuses are split into two categories with different retry strategies:
+
+    - ``retryable_error_statuses``: Transient server errors.
+      Only the individual request retries with exponential backoff
+      (configured via `retryable_error_min_wait`, `retryable_error_multiplier`
+      and `retryable_error_max_wait`.)
+      Other concurrent requests to the same host are NOT slowed down.
+
+    - ``rate_limited_statuses``: Rate limiting signals. The individual request
+      retries with a stricter backoff strategy (configured via `rate_limited_min_wait`,
+      `rate_limited_multiplier` and `rate_limited_max_wait`),
+      AND when a ``rate_limiter`` is provided, all other concurrent requests
+      to the same host are signaled to back off via ``signal_backoff()``.
+      Also respects the ``Retry-After`` header by default.
+
+    If a server uses a non-standard status code (e.g. 403) as a rate
+    limiting signal, move it from ``retryable_error_statuses`` to
+    ``rate_limited_statuses`` to get cross-request backoff::
+
+        RetryConfig(rate_limited_statuses=frozenset({429, 403}))
+
+    Args:
+        max_attempts: Maximum number of attempts (including the initial attempt).
+        retryable_error_statuses: HTTP status codes for transient errors that
+            should trigger a retry. If None, ``request_with_retry`` applies
+            method-specific defaults:
+            safe methods (GET, HEAD, OPTIONS, TRACE) retry on {500, 502, 503, 504},
+            unsafe methods (POST, PUT, PATCH, DELETE) retry only on {503}.
+        rate_limited_statuses: HTTP status codes indicating rate limiting.
+            Triggers stricter backoff and cross-request backoff signaling
+            when a `rate_limiter` is provided.
+        retryable_error_min_wait: Minimum wait between retries for transient errors (seconds).
+        retryable_error_multiplier: Multiplier for exponential backoff on transient errors.
+        retryable_error_max_wait: Maximum wait between retries for transient errors (seconds).
+        rate_limited_min_wait: Minimum wait between retries for rate limited responses (seconds).
+        rate_limited_multiplier: Multiplier for exponential backoff on rate limited responses.
+        rate_limited_max_wait: Maximum wait between retries for rate limited responses (seconds).
+        respect_retry_after: Whether to respect the Retry-After header from server responses.
+        max_retry_after: Maximum wait time to respect from Retry-After header (seconds).
+    """
+
+    max_attempts: int = 3
+    retryable_error_statuses: frozenset[int] | None = None
+    rate_limited_statuses: frozenset[int] = frozenset({429})
+    retryable_error_min_wait: float = 1.0
+    retryable_error_multiplier: float = 1.0
+    retryable_error_max_wait: float = 60.0
+    rate_limited_min_wait: float = 5.0
+    rate_limited_multiplier: float = 2.0
+    rate_limited_max_wait: float = 60.0
+    respect_retry_after: bool = True
+    max_retry_after: float = 60.0
 
 
 def url_to_rate_limit_key(url: str) -> str:
@@ -156,19 +215,7 @@ async def request_with_retry(
     json: Any = None,
     attempt_timeout: float = 10.0,
     close_connection: bool = False,
-    max_attempts: int = 3,
-    retryable_error_statuses: frozenset[int] | None = None,
-    rate_limited_statuses: frozenset[int] = frozenset({429}),
-    # Retryable error wait params
-    retryable_error_min_wait: float = 1.0,
-    retryable_error_multiplier: float = 1.0,
-    retryable_error_max_wait: float = 60.0,
-    # Rate limited wait params
-    rate_limited_min_wait: float = 5.0,
-    rate_limited_multiplier: float = 2.0,
-    rate_limited_max_wait: float = 60.0,
-    respect_retry_after: bool = True,
-    max_retry_after: float = 60.0,
+    retry_config: RetryConfig | None = None,
     log_helper: LogHelper | None = None,
     **request_kwargs,
 ) -> AsyncIterator[aiohttp.ClientResponse]:
@@ -188,8 +235,8 @@ async def request_with_retry(
 
         rate_limiter:
             Optional AsyncRateLimiter for rate limiting.
-            When provided, rate limits are acquired per-attempt
-            and released during retry backoffs.
+            When provided, a semaphore slot is held across all retry attempts
+            and rate tokens are acquired per attempt.
 
         data:
             Request body data.
@@ -211,55 +258,9 @@ async def request_with_retry(
             instead of returning it to the connection pool.
             Default is False.
 
-        max_attempts:
-            Maximum number of attempts (including the initial attempt).
-            Default is 3 attempts.
-
-        retryable_error_statuses:
-            Set of HTTP status codes for transient errors that should trigger a retry.
-            If None (default), uses method-specific defaults:
-            - Safe methods (GET, HEAD, OPTIONS, TRACE): {500, 502, 503, 504}
-            - Unsafe methods (POST, PUT, PATCH, DELETE): {503}
-
-            Unsafe methods default to conservative retry due to idempotency concerns.
-            Override with custom frozenset if your endpoint is idempotent.
-
-        rate_limited_statuses:
-            Set of HTTP status codes indicating rate limiting.
-            These use a stricter backoff strategy than transient errors.
-            Default is {429}.
-
-        retryable_error_min_wait:
-            Minimum wait time between retries for transient errors in seconds.
-            Default is 1.0 seconds.
-
-        retryable_error_multiplier:
-            Multiplier for exponential backoff calculation for transient errors.
-            Default is 1.0.
-
-        retryable_error_max_wait:
-            Maximum wait time between retries for transient errors in seconds.
-            Default is 60.0 seconds.
-
-        rate_limited_min_wait:
-            Minimum wait time between retries for rate limited responses in seconds.
-            Default is 5.0 seconds.
-
-        rate_limited_multiplier:
-            Multiplier for exponential backoff calculation for rate limited responses.
-            Default is 2.0.
-
-        rate_limited_max_wait:
-            Maximum wait time between retries for rate limited responses in seconds.
-            Default is 60.0 seconds.
-
-        respect_retry_after:
-            Whether to respect the 'Retry-After' header from server responses.
-            Default is True.
-
-        max_retry_after:
-            Maximum wait time to respect from 'Retry-After' header in seconds.
-            Default is 60.0 seconds.
+        retry_config:
+            Retry behavior configuration. If None, uses default RetryConfig().
+            See :class:`RetryConfig` for available options.
 
         log_helper:
             Optional LogHelper for logging.
@@ -298,31 +299,20 @@ async def request_with_retry(
                 data = await resp.json()
         ```
 
-        HEAD request:
+        Custom retry configuration:
         ```python
-        async with request_with_retry(session, "HEAD", url) as resp:
-            content_length = resp.headers.get("Content-Length")
-        ```
-
-        POST request with JSON:
-        ```python
+        cfg = RetryConfig(max_attempts=5, rate_limited_min_wait=10.0)
         async with request_with_retry(
-            session, "POST", url, json={"key": "value"}
+            session, "POST", url, json=payload, retry_config=cfg
         ) as resp:
             result = await resp.json()
-        ```
-
-        POST request with data:
-        ```python
-        async with request_with_retry(
-            session, "POST", url, data=b"raw bytes"
-        ) as resp:
-            result = await resp.text()
         ```
     """
     # Validate parameters
     if data is not None and json is not None:
         raise ValueError("Cannot specify both 'data' and 'json' parameters")
+
+    cfg = retry_config or RetryConfig()
 
     # Get rate limiter functions and key
     hold_slot, acquire_token, rl_key = _get_acquire_info(url, rate_limiter)
@@ -330,6 +320,7 @@ async def request_with_retry(
     # Set method-specific default retryable error statuses
     # (rate limited statuses handled separately)
     method = method.upper()
+    retryable_error_statuses = cfg.retryable_error_statuses
     if retryable_error_statuses is None:
         if method in {"GET", "HEAD", "OPTIONS", "TRACE"}:
             # Safe/idempotent methods - can retry more aggressively
@@ -342,14 +333,14 @@ async def request_with_retry(
 
     # Retry config
     retrying = AsyncRetrying(
-        stop=stop_after_attempt(max_attempts),
+        stop=stop_after_attempt(cfg.max_attempts),
         wait=_WaitRetryAfterOrRandomExp(
-            retryable_error_multiplier=retryable_error_multiplier,
-            retryable_error_min=retryable_error_min_wait,
-            retryable_error_max=retryable_error_max_wait,
-            rate_limited_multiplier=rate_limited_multiplier,
-            rate_limited_min=rate_limited_min_wait,
-            rate_limited_max=rate_limited_max_wait,
+            retryable_error_multiplier=cfg.retryable_error_multiplier,
+            retryable_error_min=cfg.retryable_error_min_wait,
+            retryable_error_max=cfg.retryable_error_max_wait,
+            rate_limited_multiplier=cfg.rate_limited_multiplier,
+            rate_limited_min=cfg.rate_limited_min_wait,
+            rate_limited_max=cfg.rate_limited_max_wait,
         ),
         retry=retry_if_exception_type(
             (_RetryableHTTPStatus, aiohttp.ClientError, asyncio.TimeoutError)
@@ -386,33 +377,52 @@ async def request_with_retry(
                         )
 
                         # Check for retryable status
-                        is_rate_limited = status in rate_limited_statuses
+                        is_rate_limited = status in cfg.rate_limited_statuses
                         is_retryable_error = status in retryable_error_statuses
 
                         if is_rate_limited or is_retryable_error:
                             # Use Retry-After if applicable
-                            retry_after = None
-                            if respect_retry_after:
+                            retry_after = eff_retry_after = None
+                            if cfg.respect_retry_after:
                                 retry_after = _parse_retry_after(
                                     headers.get("Retry-After")
                                 )
                                 if retry_after is not None:
-                                    retry_after = min(
-                                        retry_after, max_retry_after
+                                    eff_retry_after = min(
+                                        retry_after, cfg.max_retry_after
                                     )
 
                             logger.info(
-                                "Retryable HTTP %s for %s %s (retry_after=%s, rate_limited=%s)",
-                                status, method, url, retry_after, is_rate_limited
+                                "Retryable HTTP %s for %s %s "
+                                "(retry_after=%s, eff_retry_after=%s, "
+                                "is_rate_limited=%s, is_retryable_error=%s)",
+                                status, method, url,
+                                retry_after, eff_retry_after,
+                                is_rate_limited, is_retryable_error
                             )
 
                             # Release connection before retrying
                             resp.release() if not close_connection else resp.close()
                             resp = None
 
+                            if is_rate_limited and rate_limiter is not None:
+                                # Signal backoff immediately on a rate-limited status.
+                                # This covers max_attempts=1 and last-attempt 429s
+                                # where tenacity's before_sleep won't fire,
+                                # causing other requests to immediately go through
+                                # even though the server is telling us to slow down.
+                                # This backoff could be extended (but not shortened)
+                                # by tenacity based on its retry wait computation.
+                                backoff_duration = (
+                                    eff_retry_after or cfg.rate_limited_min_wait
+                                )
+                                rate_limiter.signal_backoff(
+                                    rl_key, backoff_duration
+                                )
+
                             raise _RetryableHTTPStatus(
                                 status,
-                                retry_after=retry_after,
+                                retry_after=eff_retry_after,
                                 is_rate_limited=is_rate_limited,
                             )
 
@@ -442,29 +452,22 @@ async def request_with_retry(
             resp.release() if not close_connection else resp.close()
 
 
+_GET_DEFAULT_RETRY_CONFIG = RetryConfig(
+    retryable_error_statuses=frozenset({500, 502, 503, 504}),
+)
+
+
 @asynccontextmanager
 async def get_with_retry(
     session: aiohttp.ClientSession,
     url: str,
     *,
     rate_limiter: AsyncRateLimiter | None = None,
+    retry_config: RetryConfig | None = None,
     attempt_timeout: float = 10.0,
-    max_attempts: int = 3,
-    retryable_error_statuses: frozenset[int] = frozenset({500, 502, 503, 504}),
-    rate_limited_statuses: frozenset[int] = frozenset({429}),
-    # Retryable error wait params
-    retryable_error_min_wait: float = 1.0,
-    retryable_error_multiplier: float = 1.0,
-    retryable_error_max_wait: float = 60.0,
-    # Rate limited wait params
-    rate_limited_min_wait: float = 5.0,
-    rate_limited_multiplier: float = 2.0,
-    rate_limited_max_wait: float = 60.0,
-    respect_retry_after: bool = True,
-    max_retry_after: float = 60.0,
     log_helper: LogHelper | None = None,
     **request_kwargs,
-):
+) -> AsyncIterator[aiohttp.ClientResponse]:
     """
     Asynchronous HTTP GET with retry mechanism.
 
@@ -478,18 +481,8 @@ async def get_with_retry(
         method="GET",
         url=url,
         rate_limiter=rate_limiter,
+        retry_config=retry_config or _GET_DEFAULT_RETRY_CONFIG,
         attempt_timeout=attempt_timeout,
-        max_attempts=max_attempts,
-        retryable_error_statuses=retryable_error_statuses,
-        rate_limited_statuses=rate_limited_statuses,
-        retryable_error_min_wait=retryable_error_min_wait,
-        retryable_error_multiplier=retryable_error_multiplier,
-        retryable_error_max_wait=retryable_error_max_wait,
-        rate_limited_min_wait=rate_limited_min_wait,
-        rate_limited_multiplier=rate_limited_multiplier,
-        rate_limited_max_wait=rate_limited_max_wait,
-        respect_retry_after=respect_retry_after,
-        max_retry_after=max_retry_after,
         log_helper=log_helper,
         **request_kwargs,
     ) as resp:

@@ -25,7 +25,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from tmautils.common import LogHelper, get_logger_from_helper, AsyncRateLimiter
-from tmautils.web import request_with_retry
+from tmautils.web import request_with_retry, RetryConfig
 
 from .types import (
     RevocationStatus,
@@ -49,14 +49,14 @@ class OCSPHelper:
         rate_limiter: AsyncRateLimiter,
         *,
         request_timeout: float = 10.0,
-        max_attempts: int = 3,
+        retry_config: RetryConfig | None = None,
         default_ttl: datetime.timedelta = datetime.timedelta(hours=6),
         max_cache_size: int = 1024,
         log_helper: LogHelper | None = None,
     ):
         self._rate_limiter = rate_limiter
         self._request_timeout = request_timeout
-        self._max_attempts = max_attempts
+        self._retry_config = retry_config or RetryConfig()
         self._default_ttl = default_ttl
         self._max_cache_size = max_cache_size
         self._log_helper = log_helper
@@ -250,8 +250,8 @@ class OCSPHelper:
                 data=req_bytes,
                 headers={"Content-Type": "application/ocsp-request"},
                 rate_limiter=self._rate_limiter,
+                retry_config=self._retry_config,
                 attempt_timeout=self._request_timeout,
-                max_attempts=self._max_attempts,
                 log_helper=self._log_helper,
             ) as resp:
                 resp.raise_for_status()

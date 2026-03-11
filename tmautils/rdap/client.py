@@ -5,6 +5,7 @@
 # (https://github.com/meeb/whoisit) by meeb.
 # Original Copyright (c) meeb, licensed under BSD 3-Clause License.
 
+import asyncio
 import json
 import random
 from ipaddress import ip_address
@@ -18,6 +19,7 @@ import aiohttp
 from pytricia import PyTricia
 
 from tmautils.common import AsyncRateLimiter, IOHelper, parse_asn, run_coro_sync
+from tmautils.web import RetryConfig
 from tmautils.web.http import request_with_retry
 
 from ._parser import (
@@ -36,7 +38,6 @@ from .types import (
     ErrorResponse,
     IPNetworkQueryResult,
     NameserverQueryResult,
-    ParseError,
     QueryError,
     RateLimitedError,
     RemoteServerError,
@@ -87,37 +88,77 @@ def _to_alabel(domain: str) -> str:
         raise QueryError(f"Invalid domain name '{domain}': {exc}") from exc
 
 
+# RDAP list-of-dict keys and the field used to deduplicate when merging
+# a related response into the primary response.
+_LIST_DEDUP_KEYS: dict[str, str] = {
+    "events": "eventAction",
+    "notices": "title",
+    "remarks": "title",
+    "links": "href",
+    "entities": "handle",
+    "nameservers": "ldhName",
+    "publicIds": "identifier",
+}
+
+# RDAP keys that are plain string lists; merged as order-preserving set unions.
+_STRING_LIST_KEYS: frozenset[str] = frozenset({"status", "rdapConformance"})
+
+
 def _merge_rdap_response(base: dict, related: dict) -> None:
     """
     Merge a related RDAP response into *base*, modifying it in place.
 
-    Events are deduplicated by ``eventAction``; notices/remarks by
-    ``title``.
-    Dict values are merged recursively; scalar values in
-    `related` overwrite `base` only when truthy.
+    List-type keys with known dedup keys (events, links, entities, etc.)
+    are merged and deduplicated. String-list keys (status, rdapConformance)
+    are merged as set unions. Dict values are merged recursively; scalar
+    values in `related` overwrite `base` only when truthy.
     """
     for key, value in related.items():
+        # Nested dicts (e.g. secureDNS): recurse
         if key in base and isinstance(base[key], dict) and isinstance(value, dict):
             _merge_rdap_response(base[key], value)
-        elif key == "events" and isinstance(value, list):
+        # Plain string lists (status, rdapConformance): order-preserving set union
+        elif key in _STRING_LIST_KEYS and isinstance(value, list):
             existing = base.get(key) or []
-            base[key] = _merge_dedup_lists(existing, value, key="eventAction")
-        elif key in {"notices", "remarks"} and isinstance(value, list):
+            base[key] = list(dict.fromkeys(existing + value))
+        # List-of-dict keys (events, links, entities, etc.): merge and deduplicate
+        elif key in _LIST_DEDUP_KEYS and isinstance(value, list):
             existing = base.get(key) or []
-            base[key] = _merge_dedup_lists(existing, value, key="title")
+            base[key] = _merge_dedup_lists(
+                existing, value, key=_LIST_DEDUP_KEYS[key]
+            )
+        # Unknown list keys: concatenate to avoid silent data loss
+        elif isinstance(value, list) and isinstance(base.get(key), list):
+            base[key] = base[key] + value
+        # Scalars: related overwrites base only when truthy
         elif value:
             base[key] = value
 
 
 def _merge_dedup_lists(
-    l1: list[dict], l2: list[dict], *, key: str = "title",
-) -> list[dict]:
-    merged = {item.get(key): item for item in l1 if key in item}
-    for item in l2:
+    l1: list, l2: list, *, key: str = "title",
+) -> list:
+    merged: dict[str, dict] = {}
+    no_key: list = []
+    for item in l1:
+        if not isinstance(item, dict):
+            no_key.append(item)
+            continue
         k = item.get(key)
         if k is not None:
             merged[k] = item
-    return list(merged.values())
+        else:
+            no_key.append(item)
+    for item in l2:
+        if not isinstance(item, dict):
+            no_key.append(item)
+            continue
+        k = item.get(key)
+        if k is not None:
+            merged[k] = item
+        else:
+            no_key.append(item)
+    return list(merged.values()) + no_key
 
 
 class RdapClient:
@@ -130,8 +171,8 @@ class RdapClient:
             If None, no rate limiting is applied.
         request_timeout: Timeout per HTTP request attempt in seconds.
             Default is 10 seconds.
-        max_attempts: Maximum attempts for retry, including the original attempt.
-            Default is 3.
+        retry_config: Retry configuration for RDAP queries.
+            If None, uses default :class:`RetryConfig`.
         proxy: HTTP/SOCKS proxy URL for all RDAP requests
             (e.g. `http://user:pass@proxy.example.com:8080`).
             Passed through to :func:`aiohttp.ClientSession.request`.
@@ -144,8 +185,14 @@ class RdapClient:
             Default is 7 days.
         follow_related: Default for following related/registration links.
             Default is True.
-        retryable_error_statuses: HTTP status codes that trigger a retry.
-            If None, uses the :meth:`request_with_retry` defaults (500, 502, 503, 504).
+        related_retry_config: Retry configuration for related/registration link queries.
+            If None, uses the same config as `retry_config`.
+            Unused if `follow_related` is False.
+        related_timeout: Wall-clock timeout in seconds for related/registration link queries.
+            Covers the entire query including rate limiter wait time, retries, and backoff.
+            If None, no timeout is applied.
+            Unused if `follow_related` is False.
+            Default is None.
         close_connection: Close the underlying connection after each request
             instead of returning it to the pool.
             Useful with rotating proxies to ensure a new exit IP per request.
@@ -171,26 +218,28 @@ class RdapClient:
         *,
         rate_limiter: AsyncRateLimiter | None = None,
         request_timeout: float = 10.0,
-        max_attempts: int = 3,
+        retry_config: RetryConfig | None = None,
         proxy: str | None = None,
         overrides: bool = True,
         use_rir_fallbacks: bool = True,
         bootstrap_max_age_days: int = 7,
         follow_related: bool = True,
-        retryable_error_statuses: frozenset[int] | None = None,
+        related_retry_config: RetryConfig | None = None,
+        related_timeout: float | None = None,
         close_connection: bool = False,
         working_root: Path | None = None,
         **kwargs: Any,
     ) -> None:
         self._rate_limiter = rate_limiter or AsyncRateLimiter()
         self._request_timeout = request_timeout
-        self._max_attempts = max_attempts
+        self._retry_config = retry_config or RetryConfig()
         self._proxy = proxy
         self._use_overrides = overrides
         self._use_rir_fallbacks = use_rir_fallbacks
         self._bootstrap_max_age_days = bootstrap_max_age_days
         self._follow_related = follow_related
-        self._retryable_error_statuses = retryable_error_statuses
+        self._related_retry_config = related_retry_config or self._retry_config
+        self._related_timeout = related_timeout or self._request_timeout
         self._close_connection = close_connection
 
         self._io_helper = IOHelper.init_with_dirs(
@@ -211,9 +260,8 @@ class RdapClient:
         self._try_load_cached_bootstrap()
 
         self._io_helper.logger.info(
-            "RdapClient initialized: timeout=%ds, max_attempts=%d",
-            request_timeout,
-            max_attempts,
+            "RdapClient initialized: request_timeout=%ds, retry_config=%s",
+            request_timeout, self._retry_config,
         )
 
     def _needs_bootstrap(self) -> bool:
@@ -306,7 +354,7 @@ class RdapClient:
                 "GET",
                 url,
                 attempt_timeout=self._request_timeout,
-                max_attempts=self._max_attempts,
+                retry_config=self._retry_config,
                 log_helper=self._io_helper.log_helper,
                 proxy=self._proxy,
             ) as resp:
@@ -580,26 +628,34 @@ class RdapClient:
         return unquote(urljoin(resource, quote(str(value))))
 
     async def _rdap_get(
-        self, session: aiohttp.ClientSession, url: str,
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        retry_config: RetryConfig | None = None,
     ) -> dict:
-        retry_kwargs: dict = {}
-        if self._retryable_error_statuses is not None:
-            retry_kwargs["retryable_error_statuses"] = self._retryable_error_statuses
-        async with request_with_retry(
-            session,
-            "GET",
-            url,
-            rate_limiter=self._rate_limiter,
-            attempt_timeout=self._request_timeout,
-            max_attempts=self._max_attempts,
-            close_connection=self._close_connection,
-            log_helper=self._io_helper.log_helper,
-            headers={"Accept": self._RDAP_ACCEPT},
-            proxy=self._proxy,
-            **retry_kwargs,
-        ) as resp:
-            text = await resp.text()
-            return self._process_response(resp, url, text)
+        try:
+            async with request_with_retry(
+                session,
+                "GET",
+                url,
+                rate_limiter=self._rate_limiter,
+                attempt_timeout=self._request_timeout,
+                retry_config=retry_config or self._retry_config,
+                close_connection=self._close_connection,
+                log_helper=self._io_helper.log_helper,
+                headers={"Accept": self._RDAP_ACCEPT},
+                proxy=self._proxy,
+            ) as resp:
+                text = await resp.text()
+                return self._process_response(resp, url, text)
+        except QueryError:
+            # Already wrapped by _process_response
+            raise
+        except Exception as exc:
+            # Wrap in QueryError
+            raise QueryError(
+                f"RDAP GET {url} failed: {exc}",
+            ) from exc
 
     @staticmethod
     def _process_response(
@@ -639,12 +695,18 @@ class RdapClient:
             )
 
         try:
-            return json.loads(text)
+            data = json.loads(text)
         except (TypeError, ValueError) as e:
             raise QueryError(
                 f"Failed to parse RDAP response as JSON: {e}",
                 response=text,
             ) from e
+        if not isinstance(data, dict):
+            raise QueryError(
+                f"RDAP response is not a JSON object (got {type(data).__name__})",
+                response=text,
+            )
+        return data
 
     @staticmethod
     def _try_parse_error_body(text: str) -> ErrorResponse | None:
@@ -663,34 +725,47 @@ class RdapClient:
         url: str,
         follow_related: bool,
     ) -> tuple[dict | None, list[str], QueryError | None, ErrorResponse | None]:
-
         try:
             raw = await self._rdap_get(session, url)
         except QueryError as exc:
             error_resp = self._try_parse_error_body(exc.response)
             return None, [], exc, error_resp
 
-        # Follow at most one related/registration link for richer data.
+        # Collect all related/registration URLs from the original response.
         related_urls: list[str] = []
         if follow_related:
             for link in raw.get("links", []):
+                if not isinstance(link, dict):
+                    continue
                 rel = link.get("rel", "")
                 if rel in ("related", "registration"):
                     href = link.get("href", "")
-                    link_type = link.get("type", "")
+                    link_type = link.get("type") or ""
                     if href and not link_type.startswith("text/html"):
                         related_urls.append(href)
-                        try:
-                            self._io_helper.logger.debug(
-                                "Following related link: %s", href
-                            )
-                            rel_raw = await self._rdap_get(session, href)
-                            _merge_rdap_response(raw, rel_raw)
-                        except Exception as e:
-                            self._io_helper.logger.debug(
-                                "Failed to follow related link %s: %s", href, e
-                            )
-                        break
+
+            # Follow the first one for richer data.
+            if related_urls:
+                try:
+                    href = related_urls[0]
+                    self._io_helper.logger.debug(
+                        "Following related link: %s", href
+                    )
+                    coro = self._rdap_get(
+                        session, href, self._related_retry_config,
+                    )
+                    if self._related_timeout is not None:
+                        rel_raw = await asyncio.wait_for(
+                            coro, timeout=self._related_timeout,
+                        )
+                    else:
+                        rel_raw = await coro
+                    if isinstance(rel_raw, dict):
+                        _merge_rdap_response(raw, rel_raw)
+                except Exception as e:
+                    self._io_helper.logger.debug(
+                        "Failed to follow related link %s: %s", href, e
+                    )
 
         return raw, related_urls, None, None
 
@@ -707,7 +782,16 @@ class RdapClient:
             "Querying RDAP domain: %s -> %s", domain, url
         )
 
-        raw, related_urls, error, error_resp = await self._execute_query(session, url, follow)
+        try:
+            raw, related_urls, error, error_resp = await self._execute_query(
+                session, url, follow
+            )
+        except Exception as exc:
+            return DomainQueryResult(
+                domain=domain,
+                primary_url=url,
+                error=QueryError(f"Unexpected error querying {domain}: {exc}"),
+            )
         if error is not None:
             return DomainQueryResult(
                 domain=domain,
@@ -719,7 +803,7 @@ class RdapClient:
         parsed = None
         try:
             parsed = parse_domain_response(raw)
-        except ParseError as exc:
+        except Exception as exc:
             self._io_helper.logger.warning(
                 "Failed to parse RDAP response for %s: %s", domain, exc
             )
@@ -745,7 +829,18 @@ class RdapClient:
             "Querying RDAP IP: %s -> %s", address, url
         )
 
-        raw, related_urls, error, error_resp = await self._execute_query(session, url, follow)
+        try:
+            raw, related_urls, error, error_resp = await self._execute_query(
+                session, url, follow
+            )
+        except Exception as exc:
+            return IPNetworkQueryResult(
+                query=address,
+                primary_url=url,
+                error=QueryError(
+                    f"Unexpected error querying {address}: {exc}"
+                ),
+            )
         if error is not None:
             return IPNetworkQueryResult(
                 query=address,
@@ -757,7 +852,7 @@ class RdapClient:
         parsed = None
         try:
             parsed = parse_ip_network_response(raw)
-        except ParseError as exc:
+        except Exception as exc:
             self._io_helper.logger.warning(
                 "Failed to parse RDAP IP response for %s: %s", address, exc
             )
@@ -781,7 +876,16 @@ class RdapClient:
         url = self._build_autnum_url(asn)
         self._io_helper.logger.debug("Querying RDAP ASN: %d -> %s", asn, url)
 
-        raw, related_urls, error, error_resp = await self._execute_query(session, url, follow)
+        try:
+            raw, related_urls, error, error_resp = await self._execute_query(
+                session, url, follow
+            )
+        except Exception as exc:
+            return AutnumQueryResult(
+                asn=asn,
+                primary_url=url,
+                error=QueryError(f"Unexpected error querying AS {asn}: {exc}"),
+            )
         if error is not None:
             return AutnumQueryResult(
                 asn=asn,
@@ -793,7 +897,7 @@ class RdapClient:
         parsed = None
         try:
             parsed = parse_autnum_response(raw)
-        except ParseError as exc:
+        except Exception as exc:
             self._io_helper.logger.warning(
                 "Failed to parse RDAP autnum response for AS%d: %s", asn, exc
             )
@@ -819,7 +923,17 @@ class RdapClient:
             "Querying RDAP entity: %s -> %s", handle, url
         )
 
-        raw, related_urls, error, error_resp = await self._execute_query(session, url, follow)
+        try:
+            raw, related_urls, error, error_resp = await self._execute_query(
+                session, url, follow
+            )
+        except Exception as exc:
+            return EntityQueryResult(
+                handle=handle,
+                primary_url=url,
+                error=QueryError(
+                    f"Unexpected error querying entity {handle}: {exc}"),
+            )
         if error is not None:
             return EntityQueryResult(
                 handle=handle,
@@ -831,7 +945,7 @@ class RdapClient:
         parsed = None
         try:
             parsed = parse_entity_response(raw)
-        except ParseError as exc:
+        except Exception as exc:
             self._io_helper.logger.warning(
                 "Failed to parse RDAP entity response for %s: %s", handle, exc
             )
@@ -857,7 +971,17 @@ class RdapClient:
             "Querying RDAP nameserver: %s -> %s", name, url
         )
 
-        raw, related_urls, error, error_resp = await self._execute_query(session, url, follow)
+        try:
+            raw, related_urls, error, error_resp = await self._execute_query(
+                session, url, follow
+            )
+        except Exception as exc:
+            return NameserverQueryResult(
+                nameserver=name,
+                primary_url=url,
+                error=QueryError(
+                    f"Unexpected error querying nameserver {name}: {exc}"),
+            )
         if error is not None:
             return NameserverQueryResult(
                 nameserver=name,
@@ -869,7 +993,7 @@ class RdapClient:
         parsed = None
         try:
             parsed = parse_nameserver_response(raw)
-        except ParseError as exc:
+        except Exception as exc:
             self._io_helper.logger.warning(
                 "Failed to parse RDAP nameserver response for %s: %s", name, exc
             )
