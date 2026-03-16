@@ -74,7 +74,7 @@ class DuckDbInetLpmIndex:
         trie6 = PyTricia(128)
 
         # Stream Arrow record batches from DuckDB
-        for batch in rel.fetch_record_batch():
+        for batch in rel.to_arrow_reader():
             networks = batch[network_col].to_pylist()
             value_lists = [batch[c].to_pylist() for c in value_cols]
 

@@ -268,7 +268,7 @@ def _read_hive_partition(base_path: Path, table_name: str) -> pa.Table:
     try:
         return con.execute(
             f"SELECT * FROM read_parquet('{table_dir}/**/*.parquet', hive_partitioning=true)"
-        ).fetch_arrow_table()
+        ).to_arrow_table()
     finally:
         con.close()
 

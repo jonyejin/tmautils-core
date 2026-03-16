@@ -40,7 +40,7 @@ This project is licensed under [MPL-2.0](LICENSE) (Mozilla Public License 2.0).
 
 What this means in practice:
 - If you modify an existing file, your modifications must remain MPL-2.0.
-- You can license new files however you want. (But I won't merge them into `tmautils-core` unless they are MPL-2.0.)
+- You can license new files however you want. (But I won't merge them unless they are MPL-2.0.)
 - You can use this code alongside code under other licenses.
 
 ## Contributing
