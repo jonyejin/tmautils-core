@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock, Mock
 from datetime import datetime, timezone, timedelta
 import aiohttp
 
-from tmautils.web import get_with_retry, request_with_retry, RetryConfig
-from tmautils.web.http import (
+from tmautils.core import get_with_retry, request_with_retry, RetryConfig
+from tmautils.core.http import (
     _parse_retry_after,
     _RetryableHTTPStatus,
     _WaitRetryAfterOrRandomExp,
@@ -855,8 +855,8 @@ def test_request_kwargs_passed_through_for_post():
 
 # ===== AsyncRateLimiter Tests =====
 
-from tmautils.common import AsyncRateLimiter
-from tmautils.web import url_to_rate_limit_key
+from tmautils.core import AsyncRateLimiter
+from tmautils.core import url_to_rate_limit_key
 
 
 async def test_rate_limiter_no_limits():
@@ -1333,7 +1333,7 @@ async def test_request_with_retry_429_max_attempts_1_signals_backoff():
 
 async def test_get_with_retry_with_rate_limiter():
     """Test get_with_retry works with rate_limiter parameter."""
-    from tmautils.web import get_with_retry
+    from tmautils.core import get_with_retry
 
     limiter = AsyncRateLimiter(max_concurrent=10)
 

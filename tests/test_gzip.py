@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tmautils.common import gzip_file, gunzip_file
+from tmautils.core import gzip_file, gunzip_file
 
 
 def write_sample(path: Path, content: bytes):

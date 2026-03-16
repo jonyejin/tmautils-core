@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tmautils.common import (
+from tmautils.core import (
     DirCreationMode,
     DirConfig,
     IOConfig,

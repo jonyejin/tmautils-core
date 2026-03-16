@@ -4,7 +4,6 @@ import os
 
 import pytest
 import duckdb
-import pandas as pd
 
 from tmautils.db import DuckDbInetLpmIndex
 
@@ -108,21 +107,11 @@ def test_duckdb_inet_lpm_index_with_inet_to_varchar_cast():
             SELECT '2001:db8::1'  AS ip
         ) t
         ORDER BY ip;
-    """).df()
+    """).fetchall()
 
     # Check SQL results line up with Python lookups
     result_map = {}
-    for _, row in df.iterrows():
-        ip = row["ip"]
-        is_proxy = row["is_proxy"]
-        proxy_type = row["proxy_type"]
-
-        # Normalize pandas NA to plain None for easier assertions
-        if pd.isna(is_proxy):
-            is_proxy = None
-        if pd.isna(proxy_type):
-            proxy_type = None
-
+    for ip, is_proxy, proxy_type in df:
         result_map[ip] = (is_proxy, proxy_type)
 
     assert result_map["1.1.1.1"] == (True, "tor")
