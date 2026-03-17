@@ -32,6 +32,9 @@ dependencies = [
     "aiolimiter (>=1.1.0,<2.0.0)",
 ]
 
+[project.urls]
+Repository = "https://github.com/sulyabtv/tmautils-core"
+
 [project.optional-dependencies]
 dev = [
     "pytest (>=9.0.0,<10.0.0)",
