@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 import duckdb
 
-from tmautils.core import IOHelper
 from tmautils.db import DuckDbInetLpmIndex
 
 
@@ -125,17 +124,6 @@ def test_duckdb_inet_lpm_index_with_inet_to_varchar_cast():
 
 
 @pytest.fixture
-def io(tmp_path):
-    """IOHelper with processed dir under tmp_path."""
-    return IOHelper.init_with_dirs(
-        "test_lpm",
-        dirs={"processed"},
-        working_root=tmp_path,
-        setup_logging=False,
-    )
-
-
-@pytest.fixture
 def sample_index():
     """Build a small LPM index for save/load tests."""
     con = duckdb.connect(database=":memory:")
@@ -154,44 +142,33 @@ def sample_index():
     )
 
 
-def test_save_and_load_auto_name(sample_index, io):
-    sample_index.save(io)
+def test_save_and_load_round_trip(sample_index, tmp_path):
+    path = tmp_path / "index.msgpack"
+    sample_index.save(path)
 
-    loaded = DuckDbInetLpmIndex.load(
-        io, value_cols=("is_proxy", "proxy_type"),
-    )
+    loaded = DuckDbInetLpmIndex.load(path)
 
     assert loaded.lookup("1.1.1.1") == (True, "tor")
     assert loaded.lookup("1.1.1.42") == (True, "vpn")
     assert loaded.lookup("2001:db8::1") == (True, "ipv6-proxy")
     assert loaded.lookup("9.9.9.9") is None
     assert loaded.value_cols == ("is_proxy", "proxy_type")
-    # verify the auto-generated filename
-    assert (io.processed / "DuckDbInetLpmIndex_is_proxy_proxy_type.pkl").exists()
 
 
-def test_save_and_load_explicit_name(sample_index, io):
-    sample_index.save(io, "custom.pkl")
-
-    loaded = DuckDbInetLpmIndex.load(io, "custom.pkl")
-
-    assert loaded.lookup("1.1.1.1") == (True, "tor")
-    assert loaded.lookup("2001:db8::1") == (True, "ipv6-proxy")
-
-
-def test_load_file_not_found(io):
+def test_load_file_not_found(tmp_path):
     with pytest.raises(FileNotFoundError):
-        DuckDbInetLpmIndex.load(io, "nonexistent.pkl")
+        DuckDbInetLpmIndex.load(tmp_path / "nonexistent.msgpack")
 
 
-def test_load_corrupt_file(io):
-    (io.processed / "corrupt.pkl").write_bytes(b"not a pickle")
+def test_load_corrupt_file(tmp_path):
+    bad = tmp_path / "corrupt.msgpack"
+    bad.write_bytes(b"not valid msgpack")
     with pytest.raises(Exception):
-        DuckDbInetLpmIndex.load(io, "corrupt.pkl")
+        DuckDbInetLpmIndex.load(bad)
 
 
-def test_save_freezes_but_lookups_work(sample_index, io):
-    sample_index.save(io)
+def test_save_lookups_still_work(sample_index, tmp_path):
+    sample_index.save(tmp_path / "index.msgpack")
 
     assert sample_index.lookup("1.1.1.1") == (True, "tor")
     assert sample_index.lookup("2001:db8::1") == (True, "ipv6-proxy")

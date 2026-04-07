@@ -3,12 +3,13 @@
 
 from typing import Any, Dict, Optional, Tuple
 from dataclasses import dataclass
-import pickle
+from pathlib import Path
+import msgpack
 import duckdb
 from pytricia import PyTricia
 from ipaddress import ip_network
 
-from tmautils.core import IPAddress, IOHelper
+from tmautils.core import IPAddress
 
 @dataclass
 class DuckDbInetLpmIndex:
@@ -36,25 +37,16 @@ class DuckDbInetLpmIndex:
         )
 
         # Save to disk for fast reload later
-        idx.save(io_helper)
+        idx.save(Path("index.msgpack"))
 
         # Load from disk (skips CSV parsing / ip_network overhead)
-        idx = DuckDbInetLpmIndex.load(
-            io_helper, value_cols=["is_proxy", "proxy_type"],
-        )
+        idx = DuckDbInetLpmIndex.load(Path("index.msgpack"))
     ```
     """
 
     trie4: PyTricia
     trie6: PyTricia
     value_cols: tuple[str, ...]
-
-    @classmethod
-    def _resolve_cache_name(cls, value_cols: Tuple[str, ...], name: str | None) -> str:
-        if name is not None:
-            return name
-        parts = ["DuckDbInetLpmIndex", *value_cols]
-        return "_".join(parts) + ".pkl"
 
     @classmethod
     def from_relation(
@@ -108,48 +100,43 @@ class DuckDbInetLpmIndex:
 
         return cls(trie4=trie4, trie6=trie6, value_cols=value_cols)
 
-    def save(self, io: IOHelper, name: str | None = None) -> None:
+    def save(self, path: Path) -> None:
         """Save the index to disk for fast reload later.
 
-        Writes to ``io.processed / name``.
-        If *name* is omitted, a name is derived from the value columns
-        (e.g. ``DuckDbInetLpmIndex_is_proxy_proxy_type.pkl``).
-        Freezes the tries in-place (making them read-only).
-        Lookups on this instance continue to work after saving.
+        Serializes trie contents using msgpack (no arbitrary code execution
+        on load, unlike pickle).
         """
-        self.trie4.freeze()
-        self.trie6.freeze()
+        def _dump_trie(trie: PyTricia) -> dict:
+            keys = list(trie.keys())
+            values = [list(trie[k]) for k in keys]
+            return {"keys": keys, "values": values}
+
         payload = {
-            "trie4": self.trie4,
-            "trie6": self.trie6,
-            "value_cols": self.value_cols,
+            "trie4": _dump_trie(self.trie4),
+            "trie6": _dump_trie(self.trie6),
+            "value_cols": list(self.value_cols),
         }
-        resolved = self._resolve_cache_name(self.value_cols, name)
-        path = io.processed / resolved
-        path.write_bytes(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
+        path.write_bytes(msgpack.packb(payload, use_bin_type=True))
 
     @classmethod
-    def load(
-        cls,
-        io: IOHelper,
-        name: str | None = None,
-        value_cols: Tuple[str, ...] = (),
-    ) -> "DuckDbInetLpmIndex":
+    def load(cls, path: Path) -> "DuckDbInetLpmIndex":
         """Load a previously saved index from disk.
 
-        Reads from ``io.processed / name``.
-        If *name* is omitted, it is derived from *value_cols*
-        (same logic as ``save()``).
-        The loaded tries remain frozen (read-only). Call ``trie.thaw()``
-        manually if mutation is needed.
+        Deserializes msgpack data and rebuilds the PyTricia tries.
         """
-        resolved = cls._resolve_cache_name(value_cols, name)
-        path = io.processed / resolved
-        payload = pickle.loads(path.read_bytes())
+        payload = msgpack.unpackb(path.read_bytes(), raw=False)
+        value_cols = tuple(payload["value_cols"])
+
+        def _load_trie(data: dict, max_prefix: int) -> PyTricia:
+            trie = PyTricia(max_prefix)
+            for key, val in zip(data["keys"], data["values"]):
+                trie[key] = tuple(val)
+            return trie
+
         return cls(
-            trie4=payload["trie4"],
-            trie6=payload["trie6"],
-            value_cols=payload["value_cols"],
+            trie4=_load_trie(payload["trie4"], 32),
+            trie6=_load_trie(payload["trie6"], 128),
+            value_cols=value_cols,
         )
 
     def lookup(self, ip: IPAddress | str | None) -> Optional[Tuple[Any, ...]]:
