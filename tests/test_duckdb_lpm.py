@@ -143,32 +143,34 @@ def sample_index():
 
 
 def test_save_and_load_round_trip(sample_index, tmp_path):
-    path = tmp_path / "index.msgpack"
-    sample_index.save(path)
+    sample_index.save(tmp_path)
 
-    loaded = DuckDbInetLpmIndex.load(path)
+    loaded = DuckDbInetLpmIndex.load(
+        tmp_path, value_cols=("is_proxy", "proxy_type"),
+    )
 
     assert loaded.lookup("1.1.1.1") == (True, "tor")
     assert loaded.lookup("1.1.1.42") == (True, "vpn")
     assert loaded.lookup("2001:db8::1") == (True, "ipv6-proxy")
     assert loaded.lookup("9.9.9.9") is None
     assert loaded.value_cols == ("is_proxy", "proxy_type")
+    assert (tmp_path / "DuckDbInetLpmIndex_is_proxy_proxy_type.msgpack").exists()
 
 
 def test_load_file_not_found(tmp_path):
     with pytest.raises(FileNotFoundError):
-        DuckDbInetLpmIndex.load(tmp_path / "nonexistent.msgpack")
+        DuckDbInetLpmIndex.load(tmp_path, value_cols=("nonexistent",))
 
 
 def test_load_corrupt_file(tmp_path):
-    bad = tmp_path / "corrupt.msgpack"
+    bad = tmp_path / "DuckDbInetLpmIndex_bad.msgpack"
     bad.write_bytes(b"not valid msgpack")
     with pytest.raises(Exception):
-        DuckDbInetLpmIndex.load(bad)
+        DuckDbInetLpmIndex.load(tmp_path, value_cols=("bad",))
 
 
 def test_save_lookups_still_work(sample_index, tmp_path):
-    sample_index.save(tmp_path / "index.msgpack")
+    sample_index.save(tmp_path)
 
     assert sample_index.lookup("1.1.1.1") == (True, "tor")
     assert sample_index.lookup("2001:db8::1") == (True, "ipv6-proxy")
