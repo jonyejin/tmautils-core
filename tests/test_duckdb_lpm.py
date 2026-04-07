@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 import duckdb
 
+from tmautils.core import IOHelper
 from tmautils.db import DuckDbInetLpmIndex
 
 
@@ -120,6 +122,81 @@ def test_duckdb_inet_lpm_index_with_inet_to_varchar_cast():
     assert result_map["3.3.3.3"] == (False, None)
     assert result_map["9.9.9.9"] == (None, None)
     assert result_map["2001:db8::1"] == (True, "ipv6-proxy")
+
+
+@pytest.fixture
+def io(tmp_path):
+    """IOHelper with processed dir under tmp_path."""
+    return IOHelper.init_with_dirs(
+        "test_lpm",
+        dirs={"processed"},
+        working_root=tmp_path,
+        setup_logging=False,
+    )
+
+
+@pytest.fixture
+def sample_index():
+    """Build a small LPM index for save/load tests."""
+    con = duckdb.connect(database=":memory:")
+    con.execute("""
+        CREATE TABLE nets (network INET, is_proxy BOOLEAN, proxy_type VARCHAR);
+        INSERT INTO nets VALUES
+            ('1.1.1.0/24',    TRUE,  'vpn'),
+            ('1.1.1.1/32',    TRUE,  'tor'),
+            ('2001:db8::/32', TRUE,  'ipv6-proxy');
+    """)
+    rel = con.execute("""
+        SELECT network::VARCHAR AS network, is_proxy, proxy_type FROM nets
+    """)
+    return DuckDbInetLpmIndex.from_relation(
+        rel, network_col="network", value_cols=("is_proxy", "proxy_type"),
+    )
+
+
+def test_save_and_load_auto_name(sample_index, io):
+    sample_index.save(io)
+
+    loaded = DuckDbInetLpmIndex.load(
+        io, value_cols=("is_proxy", "proxy_type"),
+    )
+
+    assert loaded.lookup("1.1.1.1") == (True, "tor")
+    assert loaded.lookup("1.1.1.42") == (True, "vpn")
+    assert loaded.lookup("2001:db8::1") == (True, "ipv6-proxy")
+    assert loaded.lookup("9.9.9.9") is None
+    assert loaded.value_cols == ("is_proxy", "proxy_type")
+    # verify the auto-generated filename
+    assert (io.processed / "DuckDbInetLpmIndex_is_proxy_proxy_type.pkl").exists()
+
+
+def test_save_and_load_explicit_name(sample_index, io):
+    sample_index.save(io, "custom.pkl")
+
+    loaded = DuckDbInetLpmIndex.load(io, "custom.pkl")
+
+    assert loaded.lookup("1.1.1.1") == (True, "tor")
+    assert loaded.lookup("2001:db8::1") == (True, "ipv6-proxy")
+
+
+def test_load_file_not_found(io):
+    with pytest.raises(FileNotFoundError):
+        DuckDbInetLpmIndex.load(io, "nonexistent.pkl")
+
+
+def test_load_corrupt_file(io):
+    (io.processed / "corrupt.pkl").write_bytes(b"not a pickle")
+    with pytest.raises(Exception):
+        DuckDbInetLpmIndex.load(io, "corrupt.pkl")
+
+
+def test_save_freezes_but_lookups_work(sample_index, io):
+    sample_index.save(io)
+
+    assert sample_index.lookup("1.1.1.1") == (True, "tor")
+    assert sample_index.lookup("2001:db8::1") == (True, "ipv6-proxy")
+    assert sample_index.lookup("9.9.9.9") is None
+
 
 
 if __name__ == "__main__":

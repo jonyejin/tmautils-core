@@ -3,11 +3,12 @@
 
 from typing import Any, Dict, Optional, Tuple
 from dataclasses import dataclass
+import pickle
 import duckdb
 from pytricia import PyTricia
 from ipaddress import ip_network
 
-from tmautils.core import IPAddress
+from tmautils.core import IPAddress, IOHelper
 
 @dataclass
 class DuckDbInetLpmIndex:
@@ -33,12 +34,27 @@ class DuckDbInetLpmIndex:
             network_col="network",
             value_cols=["is_proxy", "proxy_type"],
         )
+
+        # Save to disk for fast reload later
+        idx.save(io_helper)
+
+        # Load from disk (skips CSV parsing / ip_network overhead)
+        idx = DuckDbInetLpmIndex.load(
+            io_helper, value_cols=["is_proxy", "proxy_type"],
+        )
     ```
     """
 
     trie4: PyTricia
     trie6: PyTricia
     value_cols: tuple[str, ...]
+
+    @classmethod
+    def _resolve_cache_name(cls, value_cols: Tuple[str, ...], name: str | None) -> str:
+        if name is not None:
+            return name
+        parts = ["DuckDbInetLpmIndex", *value_cols]
+        return "_".join(parts) + ".pkl"
 
     @classmethod
     def from_relation(
@@ -91,6 +107,50 @@ class DuckDbInetLpmIndex:
                 trie[str(net)] = values
 
         return cls(trie4=trie4, trie6=trie6, value_cols=value_cols)
+
+    def save(self, io: IOHelper, name: str | None = None) -> None:
+        """Save the index to disk for fast reload later.
+
+        Writes to ``io.processed / name``.
+        If *name* is omitted, a name is derived from the value columns
+        (e.g. ``DuckDbInetLpmIndex_is_proxy_proxy_type.pkl``).
+        Freezes the tries in-place (making them read-only).
+        Lookups on this instance continue to work after saving.
+        """
+        self.trie4.freeze()
+        self.trie6.freeze()
+        payload = {
+            "trie4": self.trie4,
+            "trie6": self.trie6,
+            "value_cols": self.value_cols,
+        }
+        resolved = self._resolve_cache_name(self.value_cols, name)
+        path = io.processed / resolved
+        path.write_bytes(pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL))
+
+    @classmethod
+    def load(
+        cls,
+        io: IOHelper,
+        name: str | None = None,
+        value_cols: Tuple[str, ...] = (),
+    ) -> "DuckDbInetLpmIndex":
+        """Load a previously saved index from disk.
+
+        Reads from ``io.processed / name``.
+        If *name* is omitted, it is derived from *value_cols*
+        (same logic as ``save()``).
+        The loaded tries remain frozen (read-only). Call ``trie.thaw()``
+        manually if mutation is needed.
+        """
+        resolved = cls._resolve_cache_name(value_cols, name)
+        path = io.processed / resolved
+        payload = pickle.loads(path.read_bytes())
+        return cls(
+            trie4=payload["trie4"],
+            trie6=payload["trie6"],
+            value_cols=payload["value_cols"],
+        )
 
     def lookup(self, ip: IPAddress | str | None) -> Optional[Tuple[Any, ...]]:
         """
